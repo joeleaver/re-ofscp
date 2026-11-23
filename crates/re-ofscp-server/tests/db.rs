@@ -279,7 +279,7 @@ async fn an_unwritable_ledger_fails_closed() {
 #[tokio::test]
 async fn a_cancelled_query_does_not_poison_the_next_write() {
     use std::future::Future;
-    use std::task::{Context, Poll, Waker};
+    use std::task::{Context, Waker};
     let server = RhypeServer::start();
     let mut cfg = DbConfig::new(server.tcp_addr());
     cfg.pool_size = 1;
@@ -291,7 +291,7 @@ async fn a_cancelled_query_does_not_poison_the_next_write() {
         let mut cx = Context::from_waker(Waker::noop());
         // Start it, then abandon it.
         for _ in 0..3 {
-            if let Poll::Ready(_) = fut.as_mut().poll(&mut cx) {
+            if fut.as_mut().poll(&mut cx).is_ready() {
                 break;
             }
         }
