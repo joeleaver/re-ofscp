@@ -371,7 +371,19 @@ pub async fn render(State(base): State<ProblemBase>, mut res: Response) -> Respo
         }
     }
     // Keep every header the original carried (CORS, Allow, Vary, caching,
-    // WWW-Authenticate, …); only the status, content type and body change.
+    // WWW-Authenticate, …) except those describing the body being replaced;
+    // only the status, content type and body change.
+    for name in [
+        header::CONTENT_ENCODING,
+        header::CONTENT_RANGE,
+        header::CONTENT_DISPOSITION,
+        header::CONTENT_LANGUAGE,
+        header::ETAG,
+        header::LAST_MODIFIED,
+        header::TRANSFER_ENCODING,
+    ] {
+        parts.headers.remove(name);
+    }
     parts.status = problem.status();
     parts.headers.insert(
         header::CONTENT_TYPE,

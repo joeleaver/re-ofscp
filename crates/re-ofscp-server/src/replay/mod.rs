@@ -168,6 +168,9 @@ struct Inner {
     /// previous caller already swept and so miss an entry that is gone
     /// (§4.5 "Restarts": expiry is measured on one clock).
     high_water: i64,
+    /// Whether a clock regression is currently being reported (so the
+    /// warning is logged once per episode, not once per request).
+    regressed: bool,
 }
 
 /// Heap payload: ordered by address only, so the heap never compares
@@ -194,6 +197,23 @@ impl Ord for ArcByAddr {
 impl Inner {
     /// Move the store's clock to `max(now, high_water)`, sweep, and return it.
     fn advance(&mut self, now: i64) -> i64 {
+        // A reading well behind the high-water mark means the wall clock was
+        // stepped back (or had jumped forward and was corrected). Until real
+        // time catches up, timestamps valid on the corrected clock are
+        // refused as expired, which fails closed but needs an operator's eye.
+        let lag = self.high_water - now;
+        if lag > CLOCK_REGRESSION_ALERT_SECS && !self.regressed {
+            self.regressed = true;
+            tracing::warn!(
+                lag_secs = lag,
+                "server clock is behind the replay store's clock; signed requests \
+                 timestamped before the store's clock minus the skew are refused \
+                 until real time catches up"
+            );
+        } else if lag <= 0 && self.regressed {
+            self.regressed = false;
+            tracing::info!("server clock has caught up with the replay store's clock");
+        }
         self.high_water = self.high_water.max(now);
         let now = self.high_water;
         self.sweep(now);
@@ -264,6 +284,10 @@ pub fn registrable_group(authority: &str) -> String {
     }
     psl::domain_str(host).unwrap_or(host).to_owned()
 }
+
+/// How far behind the replay store's clock a reading may fall before it is
+/// reported as a clock regression.
+const CLOCK_REGRESSION_ALERT_SECS: i64 = 5;
 
 fn secs_until(at: i64, now: i64) -> u64 {
     u64::try_from(at - now).unwrap_or(1).max(1)

@@ -224,6 +224,10 @@ async fn converted_errors_keep_status_and_headers() {
                     .insert("access-control-allow-origin", HeaderValue::from_static("*"));
                 r.headers_mut()
                     .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+                r.headers_mut()
+                    .insert(header::ETAG, HeaderValue::from_static("\"v1\""));
+                r.headers_mut()
+                    .insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
                 r
             }),
         )
@@ -245,6 +249,9 @@ async fn converted_errors_keep_status_and_headers() {
     assert_eq!(res.status(), StatusCode::GONE);
     assert_eq!(res.headers()["access-control-allow-origin"], "*");
     assert_eq!(res.headers()[header::CACHE_CONTROL], "no-store");
+    // Headers that described the replaced body are gone.
+    assert!(!res.headers().contains_key(header::ETAG));
+    assert!(!res.headers().contains_key(header::CONTENT_ENCODING));
     assert_eq!(
         res.headers()[header::CONTENT_TYPE],
         "application/problem+json"

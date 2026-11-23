@@ -82,9 +82,14 @@ surface:
   - **Tests:** `slow_copy_cannot_record_with_a_stale_clock`,
     `a_stale_reading_cannot_resurrect_a_swept_nonce` and
     `a_wall_clock_stepped_back_does_not_reopen_nonces`.
-  - **Cost:** if the clock steps *forward* and then back, timestamps valid
-    on the corrected clock may be refused as expired until it catches up.
-    That fails closed.
+  - **Cost:** if the wall clock jumps *forward* (an NTP step, or a VM
+    resuming) and is then corrected, the store's clock stays ahead. Until
+    real time catches up, every signed request timestamped before the
+    store's clock minus the skew gets `401` Expired. That fails closed, but
+    it's an outage, so the store logs a `WARN` once per episode when a
+    reading is more than 5 s behind, and an `INFO` when the clock catches
+    up. An independent review ran a fuzz test (600 000 random check/record
+    operations, with the clock jumping ±650 s) and found no double accept.
 - **Host check:** step 2 compares the request's `Host` (never a forwarding
   header) with `DOMAIN`. The spec requires it, but security doesn't depend
   on it, because the canonical string always uses `DOMAIN`. It does assume
