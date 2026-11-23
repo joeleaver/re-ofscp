@@ -22,8 +22,8 @@ A separate Claude session, the **OFSCP oracle**, owns the OFSCP spec. It always 
 
 **How:** find the oracle's current session, then message it.
 - **Find it:** call `mcp__ccd_session_mgmt__list_sessions` with a modest limit (about 20). Archived sessions are left out by default; don't pass `include_archived`.
-  1. Prefer a session whose `cwd` is exactly `/home/joe/dev/ofscp` and whose title contains "OFSCP oracle".
-  2. Failing that, any session whose `cwd` is exactly `/home/joe/dev/ofscp`, skipping ones that have a `startedBy` (those are the oracle's own helpers). If several match, take the most recently active.
+  1. Prefer a session whose `cwd` is exactly `/home/joe/dev/ofscp` and whose title contains "OFSCP oracle". If several match, take the most recently active.
+  2. Failing that, any session whose `cwd` is exactly `/home/joe/dev/ofscp`, again the most recently active. (Don't filter on `startedBy`: the oracle is often started by the previous oracle, so it has one too.)
   3. Don't pick a session in a worktree under `~/dev/ofscp` (for example `.claude/worktrees/...`). Those are short-lived spec-PR workers, not the oracle.
   4. If nothing matches, raise the limit and try once more.
 - **Idle is fine:** the oracle usually shows `isRunning: false` between questions. A non-archived match is the oracle whether or not it is running; message it anyway.
