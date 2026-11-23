@@ -11,10 +11,18 @@ Three facts shape the data layer:
 1. **No bind parameters.** Values travel inside the query text, so any value
    that came from a request is an injection risk unless it is escaped
    correctly every single time.
-2. **No multi-statement transactions.** Atomicity comes from single
-   operations. A `create` on a `@unique` field is an atomic
-   "insert if absent", and a violation comes back as
-   `engine error: unique constraint violated: Type.field = value`.
+2. **No multi-statement transactions, and no compare-and-set.**
+   - **What is atomic:** a `create` on a `@unique` field is an atomic
+     "insert if absent", and a violation comes back as
+     `engine error: unique constraint violated: Type.field = value`.
+   - **What isn't:** a filtered `update` or `delete` doesn't apply its
+     condition atomically. The filter selects ids first, then each id is
+     written in its own transaction without re-checking the filter, and
+     queries run in parallel (`rhypedb-query` executor at c73cc88).
+   - **Consequence:** `T.filter(.x <= n).update(...)` can modify, or delete, a
+     row that no longer matches by the time it is written. Code that needs a
+     real conditional write has to serialize the competing paths itself, or
+     rely on a `@unique` create.
 3. **One connection serializes its queries,** and after an I/O error the
    client refuses further use (`Closed`). Reconnecting is the caller's job.
 

@@ -133,7 +133,13 @@ The spec says a provider SHOULD persist the store, and we do
   - **Which clock:** expiries are judged by the store's clock (what
     `record` returns), not a raw wall-clock reading.
 - **The clock only goes up.** The persisted clock is raised by a conditional
-  update (`high_water < X`), so it can never be lowered.
+  update (`high_water < X`). Within one process it is never lowered, because
+  purges run one at a time.
+- **Purges and overwrites are serialized.** rhypedb's filtered writes aren't
+  compare-and-set (see 0003), so purge batches and the expired-row overwrite
+  are serialized by an in-process lock. Otherwise a purge could delete a row
+  that was just overwritten with a live nonce. A review found this by
+  running 8 concurrent re-persists against a purge.
 
 ## Consequences
 
@@ -142,7 +148,8 @@ The spec says a provider SHOULD persist the store, and we do
   warm-up only applies when the ledger can't be read.
 - **Each signed request costs one write.** That's a rhypedb write on
   loopback, done after verification, so only authenticated requests pay it.
-- **Single instance only.** The in-memory store is still the source of
-  atomicity, so this design doesn't extend to several server processes
-  sharing one database. Scaling out would make the ledger's `@unique` create
+- **Single instance only.** The in-memory store and the purge lock are
+  still the source of atomicity, so this design doesn't extend to several
+  server processes sharing one database, and that includes two processes
+  briefly overlapping during a deploy. Scaling out would make the ledger's `@unique` create
   the atomic step, with the memory store as a cache in front of it.

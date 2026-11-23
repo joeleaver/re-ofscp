@@ -162,6 +162,14 @@ impl NonceLedger for NoLedger {
 pub struct RhypeLedger {
     db: Arc<Db>,
     page: u64,
+    /// rhypedb's filtered `update`/`delete` is not compare-and-set: the
+    /// filter selects ids, then each id is written in its own transaction
+    /// without re-checking the filter, and queries run in parallel. A purge
+    /// batch could therefore delete a row that `persist` had just overwritten
+    /// with a live nonce. Purge batches hold this exclusively; the overwrite
+    /// path holds it shared (docs/decisions/0003). In-process only: two
+    /// processes sharing one ledger are not supported (decision 0001).
+    purge_gate: Arc<tokio::sync::RwLock<()>>,
 }
 
 /// Rows read per page when restoring.
@@ -218,6 +226,7 @@ impl RhypeLedger {
         Self {
             db,
             page: page.max(1),
+            purge_gate: Arc::new(tokio::sync::RwLock::new(())),
         }
     }
 
@@ -255,9 +264,10 @@ impl RhypeLedger {
         }
     }
 
-    /// Persist the replay clock as at least `clock` (never lowering it). The
-    /// raise is one conditional update, so concurrent writers can never
-    /// lower it.
+    /// Persist the replay clock as at least `clock`. The conditional update
+    /// never lowers it within one process (purges run one at a time); rhypedb
+    /// has no compare-and-set, so two processes racing could, which is one
+    /// reason a ledger is single-process (decision 0001).
     async fn advance_clock(&self, clock: i64) -> Result<(), LedgerError> {
         for _ in 0..2 {
             let q = Ql::new("ReplayClock.filter(.name == ")
@@ -314,6 +324,8 @@ impl NonceLedger for RhypeLedger {
             // update, so there is never a moment without a row covering
             // this identity (a delete-then-create could lose it to a crash
             // or a failed create, and a restart would then reopen it).
+            // Held shared against purge batches (see `purge_gate`).
+            let _gate = self.purge_gate.read().await;
             for _ in 0..2 {
                 let q = Ql::new("ReplayNonce.filter(.key == ")
                     .str(&key)
@@ -405,6 +417,8 @@ impl NonceLedger for RhypeLedger {
             // The clock first: if it cannot be saved, delete nothing.
             self.advance_clock(clock).await?;
             for _ in 0..PURGE_MAX_BATCHES {
+                // Exclusive against the overwrite path (see `purge_gate`).
+                let _gate = self.purge_gate.write().await;
                 let q = Ql::new("ReplayNonce.filter(.expires_at <= ")
                     .unix_seconds(clock)
                     .raw(").limit(")

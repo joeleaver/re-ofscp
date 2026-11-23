@@ -362,3 +362,52 @@ async fn an_expired_unpurged_row_is_replaced_not_a_replay() {
     assert_eq!(after.len(), 1);
     assert_eq!(before[0].id, after[0].id);
 }
+
+/// A purge racing re-persists of the same (expired) nonces must not delete
+/// a row a re-persist just made live. The reviewer's reproduction lost 5 of
+/// 900 before the purge gate.
+#[tokio::test]
+async fn purge_never_deletes_a_row_just_made_live() {
+    let server = RhypeServer::start();
+    let ledger = Arc::new(RhypeLedger::new(db(&server)));
+    let count = 600;
+    for i in 0..count {
+        ledger
+            .persist(&nonce(&format!("r{i}"), "a@b.example", 1_000), 0)
+            .await
+            .unwrap();
+    }
+    let purge = {
+        let ledger = ledger.clone();
+        tokio::spawn(async move { ledger.purge(1_500).await })
+    };
+    let mut tasks = Vec::new();
+    for t in 0..8 {
+        let ledger = ledger.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut ok = Vec::new();
+            for i in (t..count).step_by(8) {
+                let n = nonce(&format!("r{i}"), "a@b.example", 2_000);
+                if ledger.persist(&n, 1_500).await.is_ok() {
+                    ok.push(format!("r{i}"));
+                }
+            }
+            ok
+        }));
+    }
+    let mut accepted = Vec::new();
+    for t in tasks {
+        accepted.extend(t.await.unwrap());
+    }
+    purge.await.unwrap().unwrap();
+    let live: std::collections::HashSet<String> = ledger
+        .load(1_500)
+        .await
+        .unwrap()
+        .nonces
+        .into_iter()
+        .map(|n| n.nonce)
+        .collect();
+    let lost: Vec<_> = accepted.iter().filter(|n| !live.contains(*n)).collect();
+    assert!(lost.is_empty(), "accepted but lost: {lost:?}");
+}
