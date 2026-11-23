@@ -21,10 +21,14 @@ pub struct Config {
     /// rhypedb binary-protocol address (`RHYPEDB_ADDR`, default `127.0.0.1:4201`,
     /// where jkbase's managed `[database]` listens inside the app VM).
     pub rhypedb_addr: String,
-    /// Replay-store bounds (spec §4.5): `REPLAY_CAPACITY` (total live nonces,
-    /// default 500 000; full → `503`), `REPLAY_PER_SIGNER` (default 6 000,
-    /// about 10 signed requests/s sustained; over → `429`) and
-    /// `REPLAY_PER_REMOTE_DOMAIN` (default 50 000; over → `429`).
+    /// Replay-store bounds (spec §4.5):
+    /// * `REPLAY_LOCAL_TOTAL` / `REPLAY_REMOTE_TOTAL`: live nonces from local
+    ///   and from remote signers (default 250 000 each; full → `503` for that
+    ///   side only);
+    /// * `REPLAY_PER_SIGNER`: per signer (default 6 000, about 10 signed
+    ///   requests/s sustained; over → `429`);
+    /// * `REPLAY_PER_REMOTE_DOMAIN`: per remote registrable domain (default
+    ///   25 000; over → `429`).
     pub replay: ReplayLimits,
 }
 
@@ -61,9 +65,10 @@ impl Config {
             })?;
         let rhypedb_addr = get("RHYPEDB_ADDR").unwrap_or_else(|| "127.0.0.1:4201".to_owned());
         let replay = ReplayLimits {
-            capacity: positive(&get, "REPLAY_CAPACITY", 500_000)?,
+            local_total: positive(&get, "REPLAY_LOCAL_TOTAL", 250_000)?,
+            remote_total: positive(&get, "REPLAY_REMOTE_TOTAL", 250_000)?,
             per_signer: positive(&get, "REPLAY_PER_SIGNER", 6_000)?,
-            per_remote_domain: positive(&get, "REPLAY_PER_REMOTE_DOMAIN", 50_000)?,
+            per_remote_domain: positive(&get, "REPLAY_PER_REMOTE_DOMAIN", 25_000)?,
         };
         Ok(Self {
             domain,
@@ -121,9 +126,10 @@ mod tests {
         assert_eq!(
             c.replay,
             ReplayLimits {
-                capacity: 500_000,
+                local_total: 250_000,
+                remote_total: 250_000,
                 per_signer: 6_000,
-                per_remote_domain: 50_000,
+                per_remote_domain: 25_000,
             }
         );
         assert_eq!(c.bind.to_string(), "0.0.0.0:8080");

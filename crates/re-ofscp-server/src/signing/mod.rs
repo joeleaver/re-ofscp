@@ -34,6 +34,12 @@ use crate::problem::Problem;
 /// whole body before any handler runs). Larger bodies get `413`.
 pub const MAX_SIGNED_BODY: usize = 1024 * 1024;
 
+/// How long the signature layer waits for a signed body to arrive. Slower
+/// bodies get `408`, so a connection cannot pin a precheck (and its memory)
+/// indefinitely. Correctness does not depend on this: the nonce is recorded
+/// against a fresh clock reading (see `Verifier::complete`).
+pub const SIGNED_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Middleware: verify signed requests, pass unsigned ones through.
 ///
 /// Steps 1–4 (headers, host, timestamp, replay) run before the body is read,
@@ -59,7 +65,13 @@ pub async fn authenticate(
         Ok(pre) => pre,
         Err(e) => return reject(&e, parts.uri.path()),
     };
-    let bytes = match to_bytes(body, MAX_SIGNED_BODY).await {
+    let read = tokio::time::timeout(SIGNED_BODY_TIMEOUT, to_bytes(body, MAX_SIGNED_BODY)).await;
+    let Ok(read) = read else {
+        return Problem::request_timeout()
+            .with_detail("the signed request body did not arrive in time")
+            .into_response();
+    };
+    let bytes = match read {
         Ok(b) => b,
         Err(e) => {
             let too_large = std::error::Error::source(&e)

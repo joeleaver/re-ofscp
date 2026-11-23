@@ -24,8 +24,8 @@ the spec now does.
   with the code verbatim (underscores included). `GET /problems/{code}`
   serves a plain-text description, as the spec says we SHOULD.
 - **Extension codes:** these are allowed when paired with their status. We
-  use one, `method_not_allowed` (405), for a known path called with the
-  wrong method.
+  use `method_not_allowed` (405), `request_timeout` (408) and
+  `unsupported_media_type` (415).
 
 ## Implementation
 
@@ -35,7 +35,12 @@ the spec now does.
   response. The `problem::render` layer, installed once on the router, then
   writes the JSON body.
 - **Unknown routes:** they return a `not_found` problem, and wrong methods
-  return `method_not_allowed`.
+  return `method_not_allowed` (keeping `Allow`).
+- **Framework errors:** the render layer also converts every *other* error
+  response into a problem, such as axum's rejections for a bad path, a
+  malformed JSON body, the wrong content type or a bad query. A 4xx keeps a
+  bounded prefix of its text as `detail`. Axum's 422 becomes 400
+  `bad_request`, and a 5xx becomes `internal_error` with no detail.
 - **Tests:** `tests/problems.rs` validates real responses against the spec's
   `problem-details.json` schema, and checks that the schema really rejects
   the old shape.

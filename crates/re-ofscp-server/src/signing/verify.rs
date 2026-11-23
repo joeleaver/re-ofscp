@@ -219,7 +219,6 @@ pub struct Precheck {
     digest: String,
     signature: String,
     signed_at: i64,
-    now: i64,
 }
 
 impl Precheck {
@@ -308,7 +307,6 @@ impl Verifier {
             digest: h.digest.to_owned(),
             signature: h.signature.to_owned(),
             signed_at,
-            now,
         };
 
         // Step 4: replay check only. Recording happens after step 7.
@@ -350,9 +348,19 @@ impl Verifier {
         }
         outcome?;
 
-        // Re-check and record atomically.
+        // Re-check and record atomically, on a fresh clock reading. Reading
+        // the body and resolving keys take time; with the precheck's clock a
+        // slow copy could sweep with a stale "now", miss a sibling's entry
+        // that a fresher sweep already expired, and record the nonce twice.
+        // A timestamp that expired meanwhile is refused (step 3 again).
+        let now = self.clock.now().unix_timestamp();
+        if (now - pre.signed_at).abs() > self.skew_secs {
+            return Err(VerifyError::Timestamp(
+                "X-OFSCP-Timestamp expired while the request was in flight",
+            ));
+        }
         self.replay
-            .record(Surface::SignedRequest, &pre.nonce_use(), pre.now)
+            .record(Surface::SignedRequest, &pre.nonce_use(), now)
             .map_err(replay_error)?;
 
         Ok(Verified {

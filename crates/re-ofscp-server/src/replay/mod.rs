@@ -14,12 +14,19 @@
 //! 4. The store is bounded. When full it refuses (`503` + `Retry-After`)
 //!    instead of evicting an unexpired entry.
 //!
-//! **Quotas.** A global bound alone would let one signer (or one hostile
-//! remote provider minting actors) fill the store and lock everyone out. So
-//! each signer, and each *remote* signer domain, may hold only a share of it;
-//! past that share its own requests get `429` while everyone else carries on.
-//! Local accounts are not grouped by domain (they all share ours); their
-//! exposure is bounded by the per-signer cap.
+//! **Pools and quotas.** A single global bound would let one signer, or one
+//! hostile provider, fill the store and lock everyone out. So:
+//! * local signers (actors of this provider) and remote signers fill two
+//!   separate pools, each bounded; a full pool gets `503` for that side only,
+//!   so remote traffic can never lock out local users or vice versa;
+//! * each signer may hold at most `per_signer` live nonces (`429` past it);
+//! * remote signers are also grouped by *registrable domain* (Public Suffix
+//!   List, port ignored), each group holding at most `per_remote_domain`
+//!   (`429` past it), so `a.evil.example`, `b.evil.example:8443`, … share one
+//!   quota. Filling the remote pool takes many separately registered domains.
+//!
+//! Local-pool exhaustion needs many local accounts; account creation is rate
+//! limited where accounts are created.
 //!
 //! **Restarts (warm-up).** The store is in memory, so a restart forgets
 //! every nonce. A request recorded just before the restart can carry a
@@ -82,11 +89,13 @@ pub struct NonceUse<'a> {
 /// Size limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReplayLimits {
-    /// Live entries in total. Past this: `503`.
-    pub capacity: usize,
+    /// Live entries from local signers. Past this: `503` for local signers.
+    pub local_total: usize,
+    /// Live entries from remote signers. Past this: `503` for remote signers.
+    pub remote_total: usize,
     /// Live entries per signer. Past this: `429` for that signer.
     pub per_signer: usize,
-    /// Live entries per remote signer domain. Past this: `429` for that domain.
+    /// Live entries per remote registrable domain. Past this: `429` for it.
     pub per_remote_domain: usize,
 }
 
@@ -120,8 +129,8 @@ struct Entry {
     key_id: Box<str>,
     nonce: Box<str>,
     signer: Arc<str>,
-    /// `None` for local signers (not grouped by domain).
-    remote_domain: Option<Arc<str>>,
+    /// The registrable-domain group of a remote signer; `None` if local.
+    remote_group: Option<Arc<str>>,
 }
 
 impl PartialEq for Entry {
@@ -145,7 +154,9 @@ struct Inner {
     /// Min-heap of expiries, for sweeping.
     expiry: BinaryHeap<Reverse<(i64, ArcByAddr)>>,
     signers: HashMap<(SignerKind, Arc<str>), Counter>,
-    domains: HashMap<Arc<str>, Counter>,
+    groups: HashMap<Arc<str>, Counter>,
+    local: Counter,
+    remote: Counter,
 }
 
 /// Heap payload: ordered by address only, so the heap never compares
@@ -187,13 +198,20 @@ impl Inner {
             {
                 self.signers.remove(&signer_key);
             }
-            if let Some(domain) = &entry.remote_domain
-                && self
-                    .domains
-                    .get_mut(domain)
-                    .is_some_and(|c| c.remove(expires))
-            {
-                self.domains.remove(domain);
+            match &entry.remote_group {
+                Some(group) => {
+                    self.remote.remove(expires);
+                    if self
+                        .groups
+                        .get_mut(group)
+                        .is_some_and(|c| c.remove(expires))
+                    {
+                        self.groups.remove(group);
+                    }
+                }
+                None => {
+                    self.local.remove(expires);
+                }
             }
         }
     }
@@ -210,8 +228,22 @@ fn probe(u: &NonceUse<'_>) -> Entry {
         key_id: u.key_id.into(),
         nonce: u.nonce.into(),
         signer: Arc::from(""),
-        remote_domain: None,
+        remote_group: None,
     }
+}
+
+/// The quota group of a remote authority: its registrable domain (eTLD+1 by
+/// the Public Suffix List), port ignored. IP literals, and hosts without a
+/// registrable domain (`localhost`, a bare public suffix), group by host.
+pub fn registrable_group(authority: &str) -> String {
+    let host = authority
+        .rsplit_once(':')
+        .map_or(authority, |(host, _port)| host);
+    // The PSL would read `10.0.0.1` as a name under the suffix `1`.
+    if host.parse::<std::net::Ipv4Addr>().is_ok() {
+        return host.to_owned();
+    }
+    psl::domain_str(host).unwrap_or(host).to_owned()
 }
 
 fn secs_until(at: i64, now: i64) -> u64 {
@@ -263,22 +295,40 @@ impl ReplayStore {
         *u.domain != *self.local_domain
     }
 
-    /// The quota error, if `u`'s signer or remote domain is at its share.
-    fn quota(&self, inner: &Inner, u: &NonceUse<'_>, now: i64) -> Result<(), ReplayError> {
-        let signer = inner.signers.get(&(u.kind, Arc::from(u.signer)));
-        if let Some(c) = signer
+    /// Refuse if `u`'s signer or remote group is over its share (`429`) or
+    /// its pool is full (`503`). `Retry-After` is the latest of the earliest
+    /// expiries among everything that refused, so retrying then can succeed.
+    fn admit(&self, inner: &Inner, u: &NonceUse<'_>, now: i64) -> Result<(), ReplayError> {
+        let mut quota_retry: Option<i64> = None;
+        let mut over = |c: &Counter| {
+            let at = c.earliest().unwrap_or(now + 1);
+            quota_retry = Some(quota_retry.map_or(at, |r| r.max(at)));
+        };
+        if let Some(c) = inner.signers.get(&(u.kind, Arc::from(u.signer)))
             && c.total() >= self.limits.per_signer
         {
-            return Err(ReplayError::RateLimited {
-                retry_after: secs_until(c.earliest().unwrap_or(now + 1), now),
-            });
+            over(c);
         }
-        if self.is_remote(u)
-            && let Some(c) = inner.domains.get(u.domain)
+        let remote = self.is_remote(u);
+        if remote
+            && let Some(c) = inner.groups.get(registrable_group(u.domain).as_str())
             && c.total() >= self.limits.per_remote_domain
         {
+            over(c);
+        }
+        if let Some(at) = quota_retry {
             return Err(ReplayError::RateLimited {
-                retry_after: secs_until(c.earliest().unwrap_or(now + 1), now),
+                retry_after: secs_until(at, now),
+            });
+        }
+        let (pool, cap) = if remote {
+            (&inner.remote, self.limits.remote_total)
+        } else {
+            (&inner.local, self.limits.local_total)
+        };
+        if pool.total() >= cap {
+            return Err(ReplayError::Full {
+                retry_after: secs_until(pool.earliest().unwrap_or(now + 1), now),
             });
         }
         Ok(())
@@ -292,10 +342,11 @@ impl ReplayStore {
         if inner.contains(u) {
             return Err(ReplayError::Replayed);
         }
-        self.quota(&inner, u, now)
+        self.admit(&inner, u, now)
     }
 
-    /// After the signature verified: atomically re-check and record.
+    /// After the signature verified: atomically re-check and record. `now`
+    /// must be a fresh clock reading (not one taken before the body arrived).
     pub fn record(&self, surface: Surface, u: &NonceUse<'_>, now: i64) -> Result<(), ReplayError> {
         self.warm_up(surface, u, now)?;
         let mut inner = self.lock();
@@ -303,24 +354,20 @@ impl ReplayStore {
         if inner.contains(u) {
             return Err(ReplayError::Replayed);
         }
-        self.quota(&inner, u, now)?;
-        if inner.entries.len() >= self.limits.capacity {
-            let earliest = inner.expiry.peek().map_or(now + 1, |Reverse((e, _))| *e);
-            return Err(ReplayError::Full {
-                retry_after: secs_until(earliest, now),
-            });
-        }
+        self.admit(&inner, u, now)?;
         // Accepted while `now <= signed_at + skew`, so gone at the second after.
         // Never earlier than one second from now (a timestamp in the past).
         let expires = (u.signed_at + self.skew_secs + 1).max(now + 1);
         let signer: Arc<str> = Arc::from(u.signer);
-        let remote_domain = self.is_remote(u).then(|| Arc::<str>::from(u.domain));
+        let remote_group = self
+            .is_remote(u)
+            .then(|| Arc::<str>::from(registrable_group(u.domain)));
         let entry = Arc::new(Entry {
             kind: u.kind,
             key_id: u.key_id.into(),
             nonce: u.nonce.into(),
             signer: signer.clone(),
-            remote_domain: remote_domain.clone(),
+            remote_group: remote_group.clone(),
         });
         inner.entries.insert(entry.clone(), expires);
         inner.expiry.push(Reverse((expires, ArcByAddr(entry))));
@@ -329,8 +376,12 @@ impl ReplayStore {
             .entry((u.kind, signer))
             .or_default()
             .add(expires);
-        if let Some(domain) = remote_domain {
-            inner.domains.entry(domain).or_default().add(expires);
+        match remote_group {
+            Some(group) => {
+                inner.remote.add(expires);
+                inner.groups.entry(group).or_default().add(expires);
+            }
+            None => inner.local.add(expires),
         }
         Ok(())
     }

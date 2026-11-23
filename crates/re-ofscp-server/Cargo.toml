@@ -33,6 +33,7 @@ base64 = { workspace = true }
 ed25519-dalek = { workspace = true }
 time = { workspace = true }
 http-body-util = { workspace = true }
+psl = { workspace = true }
 
 [dev-dependencies]
 rhypedb-schema = { workspace = true }

@@ -123,3 +123,83 @@ async fn type_urls_serve_descriptions() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(ct, "application/problem+json");
 }
+
+/// axum's own rejections (bad path encoding, JSON errors, missing content
+/// type) leave as problems too.
+#[tokio::test]
+async fn framework_rejections_become_problems() {
+    use axum::Json;
+    use axum::routing::post;
+    use re_ofscp_server::problem::{self, ProblemBase};
+    use re_ofscp_types::Authority;
+
+    #[derive(serde::Deserialize)]
+    struct Body1 {
+        #[allow(dead_code)]
+        n: u32,
+    }
+    let base = ProblemBase::new(&Authority::parse_canonical("social.example").unwrap());
+    let test_app = axum::Router::new()
+        .route("/j", post(|Json(_): Json<Body1>| async { "ok" }))
+        .layer(axum::middleware::map_response_with_state(
+            base,
+            problem::render,
+        ));
+    let validator = common::schema("problem-details.json");
+    let cases = [
+        // Malformed JSON → 400.
+        (
+            Request::post("/j")
+                .header("content-type", "application/json")
+                .body(Body::from("{"))
+                .unwrap(),
+            400,
+            "bad_request",
+        ),
+        // Well-formed but wrong shape (axum: 422) → 400.
+        (
+            Request::post("/j")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"n":"x"}"#))
+                .unwrap(),
+            400,
+            "bad_request",
+        ),
+        // No content type → 415.
+        (
+            Request::post("/j").body(Body::from("{}")).unwrap(),
+            415,
+            "unsupported_media_type",
+        ),
+    ];
+    for (req, status, code) in cases {
+        let res = test_app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status().as_u16(), status);
+        assert_eq!(
+            res.headers()[header::CONTENT_TYPE],
+            "application/problem+json"
+        );
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        common::assert_valid(&validator, &json);
+        assert_eq!(json["errorCode"], code);
+        assert!(json["detail"].as_str().is_some_and(|d| !d.is_empty()));
+    }
+
+    // And a bad path segment on the real router.
+    let (status, ct, body) = call(Request::get("/problems/%FF").body(Body::empty()).unwrap()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(ct, "application/problem+json");
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    common::assert_valid(&validator, &json);
+}
+
+#[tokio::test]
+async fn method_not_allowed_keeps_allow_header() {
+    let res = app()
+        .oneshot(Request::post("/api/health").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert!(res.headers().contains_key(header::ALLOW));
+}

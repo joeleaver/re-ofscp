@@ -32,18 +32,26 @@ surface:
   dropped the nonce in the very second a timestamp 300 s ahead was still
   valid. The independent review found that bug, and a test now pins the
   boundary.
-- **Global bound:** `REPLAY_CAPACITY`, default 500 000. When the store is
-  full the answer is `503` with `Retry-After` (time until the earliest
-  expiry). Nothing is evicted early.
-- **Quotas:** a global bound alone would let one signer, or one hostile
-  remote provider minting actors, fill the store and lock *everyone* out.
-  So each signer may hold `REPLAY_PER_SIGNER` live nonces (default 6 000,
-  about 10 signed requests/s sustained), and each *remote* signer domain
-  `REPLAY_PER_REMOTE_DOMAIN` (default 50 000). Over its share, that signer
-  gets `429 too_many_requests` with `Retry-After`, and everyone else carries
-  on. Local users aren't grouped by domain, since they all share ours; their
-  exposure is bounded by the per-signer cap and by a cap on device keys per
-  user (with accounts).
+- **Pools:** local signers (actors of this provider) and remote signers fill
+  two separate pools, `REPLAY_LOCAL_TOTAL` and `REPLAY_REMOTE_TOTAL` (default
+  250 000 each). A full pool answers `503` with `Retry-After` (time until
+  that pool's earliest expiry), but only for its own side, so remote traffic
+  can never lock out local users, or vice versa. Nothing is evicted early.
+- **Quotas:** each signer may hold `REPLAY_PER_SIGNER` live nonces (default
+  6 000, about 10 signed requests/s sustained). Remote signers are also
+  grouped by **registrable domain**, using the Public Suffix List with the
+  port ignored and IP literals grouped by address. Each group may hold
+  `REPLAY_PER_REMOTE_DOMAIN` (default 25 000). Over a quota, that signer or
+  group gets `429 too_many_requests`, and `Retry-After` points to the latest
+  of the earliest expiries among the quotas that refused.
+  - Without registrable-domain grouping, one provider could use
+    `a.evil.example`, `b.evil.example:8443` and so on as unlimited separate
+    domains. With it, filling the remote pool takes about ten separately
+    registered domains. That's a real cost, and it still can't touch local
+    users.
+  - Filling the local pool takes about 40 local accounts at full rate. The
+    defence there is rate-limited account creation, which is a requirement
+    for the accounts PR.
 - **Warm-up:** a store that began during second `T0` refuses signed HTTP
   requests timestamped **at or before** `T0 + skew`, with
   `503 service_unavailable` and `Retry-After`. "At" matters: a predecessor
@@ -53,7 +61,14 @@ surface:
   exemption can't be applied by accident.
 - **Cheap checks first:** steps 1–4 (headers, host, timestamp, replay) run
   before the body is read (`Verifier::precheck`, then `complete`), so a
-  request that fails them costs no buffering.
+  request that fails them costs no buffering. A signed body must arrive
+  within 30 s (`408 request_timeout` otherwise).
+- **Fresh clock at record time:** `complete` reads the clock again before
+  recording, refuses a timestamp that expired while the request was in
+  flight, and sweeps and records with that fresh time. Using the precheck's
+  clock let a slow copy of a request miss its sibling's already-expired
+  entry and record the same nonce twice. The second independent review
+  found this, and `slow_copy_cannot_record_with_a_stale_clock` pins it.
 - **Host check:** step 2 compares the request's `Host` (never a forwarding
   header) with `DOMAIN`. The spec requires it, but security doesn't depend
   on it, because the canonical string always uses `DOMAIN`. It does assume

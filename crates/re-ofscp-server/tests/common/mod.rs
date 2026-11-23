@@ -1,6 +1,8 @@
 //! Shared helpers for integration tests.
 #![allow(dead_code)]
 
+pub mod harness;
+
 use std::path::PathBuf;
 
 /// The sibling `ofscp` spec checkout (`OFSCP_SPEC_DIR` overrides). CI clones

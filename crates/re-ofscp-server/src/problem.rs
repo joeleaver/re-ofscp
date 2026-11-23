@@ -118,8 +118,24 @@ pub const METHOD_NOT_ALLOWED: ErrorCode = ErrorCode {
     description: "The resource exists but does not support this HTTP method.",
 };
 
+/// Extension code: the request (typically its body) did not arrive in time.
+pub const REQUEST_TIMEOUT: ErrorCode = ErrorCode {
+    code: "request_timeout",
+    status: 408,
+    title: "Request Timeout",
+    description: "The request body did not arrive in time. Re-sign with a fresh timestamp and nonce and retry.",
+};
+
+/// Extension code: the body's media type is not accepted here.
+pub const UNSUPPORTED_MEDIA_TYPE: ErrorCode = ErrorCode {
+    code: "unsupported_media_type",
+    status: 415,
+    title: "Unsupported Media Type",
+    description: "The request body's Content-Type is not accepted by this endpoint (usually application/json is required).",
+};
+
 /// Codes this provider uses beyond the registry.
-pub const EXTENSIONS: &[ErrorCode] = &[METHOD_NOT_ALLOWED];
+pub const EXTENSIONS: &[ErrorCode] = &[METHOD_NOT_ALLOWED, REQUEST_TIMEOUT, UNSUPPORTED_MEDIA_TYPE];
 
 /// Every registered code (§7.3).
 pub const REGISTRY: &[ErrorCode] = &[
@@ -176,6 +192,14 @@ impl Problem {
     /// 405 `method_not_allowed` (extension code).
     pub fn method_not_allowed() -> Self {
         Self::new(&METHOD_NOT_ALLOWED)
+    }
+    /// 408 `request_timeout` (extension code).
+    pub fn request_timeout() -> Self {
+        Self::new(&REQUEST_TIMEOUT)
+    }
+    /// 415 `unsupported_media_type` (extension code).
+    pub fn unsupported_media_type() -> Self {
+        Self::new(&UNSUPPORTED_MEDIA_TYPE)
     }
     /// 409 `conflict`.
     pub fn conflict() -> Self {
@@ -270,12 +294,71 @@ impl ProblemBase {
     }
 }
 
-/// Response layer: writes the body of every [`Problem`] response.
+/// Response layer: writes the body of every [`Problem`] response, and turns
+/// any *other* error response (axum's own extractor rejections, for example
+/// a malformed path, JSON body or query string) into a problem too, so every
+/// error leaves as `application/problem+json` (§2.6).
 /// Install with `axum::middleware::map_response_with_state`.
 pub async fn render(State(base): State<ProblemBase>, mut res: Response) -> Response {
-    let Some(problem) = res.extensions_mut().remove::<Problem>() else {
+    if let Some(problem) = res.extensions_mut().remove::<Problem>() {
+        return write_body(&base, res, &problem);
+    }
+    let status = res.status();
+    let already_problem = res
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .is_some_and(|v| v.as_bytes().starts_with(PROBLEM_CONTENT_TYPE.as_bytes()));
+    if !(status.is_client_error() || status.is_server_error()) || already_problem {
         return res;
+    }
+    let (parts, body) = res.into_parts();
+    let problem = from_status(status);
+    let problem = if status.is_client_error() {
+        // Rejection bodies are short plain-text explanations; keep a bounded
+        // prefix as the detail. 5xx bodies are never echoed.
+        let text = axum::body::to_bytes(body, 4096).await.unwrap_or_default();
+        let text = String::from_utf8_lossy(&text);
+        let text = text.trim();
+        if text.is_empty() {
+            problem
+        } else {
+            problem.with_detail(text.chars().take(300).collect::<String>())
+        }
+    } else {
+        problem
     };
+    let mut fresh = problem.clone().into_response();
+    // Keep headers that still mean something (e.g. `Allow` on a 405).
+    for name in [header::ALLOW, header::RETRY_AFTER] {
+        if let Some(v) = parts.headers.get(&name) {
+            fresh.headers_mut().insert(name, v.clone());
+        }
+    }
+    fresh.extensions_mut().remove::<Problem>();
+    write_body(&base, fresh, &problem)
+}
+
+/// The problem for a bare error status.
+fn from_status(status: StatusCode) -> Problem {
+    match status.as_u16() {
+        401 => Problem::unauthorized(),
+        403 => Problem::forbidden(),
+        404 => Problem::not_found(),
+        405 => Problem::method_not_allowed(),
+        408 => Problem::request_timeout(),
+        409 => Problem::conflict(),
+        413 => Problem::payload_too_large(),
+        415 => Problem::unsupported_media_type(),
+        // Rate limits and unavailability without a known wait: a short one.
+        429 => Problem::too_many_requests(1),
+        503 => Problem::service_unavailable(1),
+        // 400, 422 (axum's JSON data errors) and any other 4xx.
+        400..=499 => Problem::bad_request(),
+        _ => Problem::internal(),
+    }
+}
+
+fn write_body(base: &ProblemBase, mut res: Response, problem: &Problem) -> Response {
     let body = ProblemJson {
         kind: base.type_uri(problem.code()),
         title: problem.code.title,
@@ -319,6 +402,8 @@ mod tests {
             Problem::forbidden(),
             Problem::not_found(),
             Problem::method_not_allowed(),
+            Problem::request_timeout(),
+            Problem::unsupported_media_type(),
             Problem::conflict(),
             Problem::payload_too_large(),
             Problem::too_many_requests(1),

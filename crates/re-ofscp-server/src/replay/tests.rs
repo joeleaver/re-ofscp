@@ -6,10 +6,11 @@ const T: i64 = 1_000_000;
 const SKEW: i64 = 300;
 const HOME: &str = "home.example";
 
-/// Only the global bound applies.
+/// Only the pool bounds apply (each pool holds `capacity`).
 fn limits(capacity: usize) -> ReplayLimits {
     ReplayLimits {
-        capacity,
+        local_total: capacity,
+        remote_total: capacity,
         per_signer: usize::MAX,
         per_remote_domain: usize::MAX,
     }
@@ -156,9 +157,8 @@ fn expiry_order_is_by_timestamp_not_arrival() {
 #[test]
 fn one_signer_cannot_take_the_whole_store() {
     let s = warm_with(ReplayLimits {
-        capacity: 100,
         per_signer: 2,
-        per_remote_domain: 100,
+        ..limits(100)
     });
     s.record(SignedRequest, &alice("a", T), T).unwrap();
     s.record(SignedRequest, &alice("b", T + 5), T).unwrap();
@@ -174,9 +174,8 @@ fn one_signer_cannot_take_the_whole_store() {
 #[test]
 fn one_remote_domain_cannot_take_the_whole_store() {
     let s = warm_with(ReplayLimits {
-        capacity: 100,
-        per_signer: 100,
         per_remote_domain: 2,
+        ..limits(100)
     });
     // A hostile provider minting fresh actors still shares one domain quota.
     s.record(
@@ -220,9 +219,8 @@ fn one_remote_domain_cannot_take_the_whole_store() {
 #[test]
 fn quotas_free_up_as_entries_expire() {
     let s = warm_with(ReplayLimits {
-        capacity: 100,
         per_signer: 1,
-        per_remote_domain: 100,
+        ..limits(100)
     });
     s.record(SignedRequest, &alice("a", T), T).unwrap();
     assert!(s.record(SignedRequest, &alice("b", T), T).is_err());
@@ -284,4 +282,108 @@ fn concurrent_records_have_exactly_one_winner() {
         handles.into_iter().map(|h| h.join().unwrap()).sum()
     });
     assert_eq!(wins, 1);
+}
+
+#[test]
+fn registrable_groups_ignore_subdomains_and_ports() {
+    assert_eq!(registrable_group("evil.example.com"), "example.com");
+    assert_eq!(
+        registrable_group("a.b.evil.example.com:8443"),
+        "example.com"
+    );
+    assert_eq!(registrable_group("x.foo.co.uk"), "foo.co.uk");
+    // Hosts without a registrable domain group by host.
+    assert_eq!(registrable_group("localhost:8080"), "localhost");
+    assert_eq!(registrable_group("10.0.0.1"), "10.0.0.1");
+}
+
+#[test]
+fn subdomains_and_ports_of_one_domain_share_a_quota() {
+    let s = warm_with(ReplayLimits {
+        per_remote_domain: 2,
+        ..limits(100)
+    });
+    s.record(SignedRequest, &remote("u@a.evil.com", "a.evil.com", "1"), T)
+        .unwrap();
+    s.record(
+        SignedRequest,
+        &remote("u@b.evil.com:8443", "b.evil.com:8443", "2"),
+        T,
+    )
+    .unwrap();
+    assert!(matches!(
+        s.record(
+            SignedRequest,
+            &remote("u@evil.com:8444", "evil.com:8444", "3"),
+            T
+        ),
+        Err(ReplayError::RateLimited { .. })
+    ));
+}
+
+#[test]
+fn a_full_remote_pool_does_not_touch_local_users() {
+    let s = warm_with(ReplayLimits {
+        local_total: 10,
+        remote_total: 2,
+        per_signer: usize::MAX,
+        per_remote_domain: usize::MAX,
+    });
+    s.record(SignedRequest, &remote("u@one.com", "one.com", "1"), T)
+        .unwrap();
+    s.record(SignedRequest, &remote("u@two.com", "two.com", "2"), T)
+        .unwrap();
+    assert_eq!(
+        s.record(SignedRequest, &remote("u@three.com", "three.com", "3"), T),
+        Err(ReplayError::Full { retry_after: 301 })
+    );
+    assert_eq!(s.record(SignedRequest, &alice("local", T), T), Ok(()));
+}
+
+#[test]
+fn a_full_local_pool_does_not_touch_remote_users() {
+    let s = warm_with(ReplayLimits {
+        local_total: 1,
+        remote_total: 10,
+        per_signer: usize::MAX,
+        per_remote_domain: usize::MAX,
+    });
+    s.record(SignedRequest, &alice("a", T), T).unwrap();
+    assert!(matches!(
+        s.record(SignedRequest, &alice("b", T), T),
+        Err(ReplayError::Full { .. })
+    ));
+    assert_eq!(
+        s.record(SignedRequest, &remote("u@one.com", "one.com", "1"), T),
+        Ok(())
+    );
+}
+
+#[test]
+fn retry_after_on_a_domain_quota_waits_for_the_domain() {
+    // The domain is at its cap; this signer holds nothing yet. Retry-After
+    // must come from the domain's earliest expiry, not the signer's.
+    let s = warm_with(ReplayLimits {
+        per_signer: 10,
+        per_remote_domain: 2,
+        ..limits(100)
+    });
+    let mut a = remote("a@evil.com", "evil.com", "1");
+    a.signed_at = T - 200; // expires at T + 101
+    s.record(SignedRequest, &a, T).unwrap();
+    s.record(SignedRequest, &remote("b@evil.com", "evil.com", "2"), T)
+        .unwrap();
+    assert_eq!(
+        s.record(SignedRequest, &remote("c@evil.com", "evil.com", "3"), T),
+        Err(ReplayError::RateLimited { retry_after: 101 })
+    );
+    // And at that moment there is room again.
+    assert_eq!(
+        s.record(
+            SignedRequest,
+            &remote("c@evil.com", "evil.com", "3"),
+            T + 101
+        ),
+        Ok(())
+    );
 }
