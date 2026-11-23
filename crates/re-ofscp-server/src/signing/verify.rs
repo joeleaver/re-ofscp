@@ -348,17 +348,11 @@ impl Verifier {
         }
         outcome?;
 
-        // Re-check and record atomically, on a fresh clock reading. Reading
-        // the body and resolving keys take time; with the precheck's clock a
-        // slow copy could sweep with a stale "now", miss a sibling's entry
-        // that a fresher sweep already expired, and record the nonce twice.
-        // A timestamp that expired meanwhile is refused (step 3 again).
+        // Re-check and record atomically, on a fresh clock reading (reading
+        // the body and resolving keys take time). The store re-checks
+        // freshness under its lock on a clock that never runs backwards, so
+        // a slow or stale copy cannot record a nonce a sibling already used.
         let now = self.clock.now().unix_timestamp();
-        if (now - pre.signed_at).abs() > self.skew_secs {
-            return Err(VerifyError::Timestamp(
-                "X-OFSCP-Timestamp expired while the request was in flight",
-            ));
-        }
         self.replay
             .record(Surface::SignedRequest, &pre.nonce_use(), now)
             .map_err(replay_error)?;
@@ -404,6 +398,9 @@ struct SigHeaders<'a> {
 fn replay_error(e: ReplayError) -> VerifyError {
     match e {
         ReplayError::Replayed => VerifyError::Replayed,
+        ReplayError::Expired => {
+            VerifyError::Timestamp("X-OFSCP-Timestamp expired while the request was in flight")
+        }
         ReplayError::Full { retry_after } => VerifyError::StoreFull { retry_after },
         ReplayError::WarmingUp { retry_after } => VerifyError::WarmingUp { retry_after },
         ReplayError::RateLimited { retry_after } => VerifyError::RateLimited { retry_after },

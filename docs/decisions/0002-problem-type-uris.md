@@ -24,8 +24,9 @@ the spec now does.
   with the code verbatim (underscores included). `GET /problems/{code}`
   serves a plain-text description, as the spec says we SHOULD.
 - **Extension codes:** these are allowed when paired with their status. We
-  use `method_not_allowed` (405), `request_timeout` (408) and
-  `unsupported_media_type` (415).
+  use `method_not_allowed` (405), `request_timeout` (408), `gone` (410),
+  `unsupported_media_type` (415), `not_implemented` (501), `bad_gateway`
+  (502) and `gateway_timeout` (504).
 
 ## Implementation
 
@@ -38,9 +39,15 @@ the spec now does.
   return `method_not_allowed` (keeping `Allow`).
 - **Framework errors:** the render layer also converts every *other* error
   response into a problem, such as axum's rejections for a bad path, a
-  malformed JSON body, the wrong content type or a bad query. A 4xx keeps a
-  bounded prefix of its text as `detail`. Axum's 422 becomes 400
-  `bad_request`, and a 5xx becomes `internal_error` with no detail.
+  malformed JSON body, the wrong content type or a bad query. Details:
+  - **Kept:** the original status (when it has a code) and every header
+    (CORS, `Allow`, `Vary`, caching, `WWW-Authenticate`). Only the content
+    type and body change.
+  - **Detail:** a 4xx keeps a bounded prefix of its text as `detail`, read
+    with a 1 s deadline. A 5xx body is never echoed.
+  - **Status changes:** axum's 422 becomes 400 `bad_request`. Any other
+    status without a code becomes 400 or 500. No current route produces
+    one, and a new status that matters should get its own code.
 - **Tests:** `tests/problems.rs` validates real responses against the spec's
   `problem-details.json` schema, and checks that the schema really rejects
   the old shape.

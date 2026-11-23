@@ -107,8 +107,13 @@ fn nonce_lives_exactly_as_long_as_its_timestamp_is_acceptable() {
             Err(ReplayError::Replayed),
             "signed_at={signed_at}: still replayable at {last_ok}"
         );
-        assert_eq!(s.check(SignedRequest, &u, last_ok + 1), Ok(()));
+        // One second later the entry is gone, and so is the timestamp's
+        // acceptability: the store refuses it as expired.
         assert!(s.is_empty(last_ok + 1));
+        assert_eq!(
+            s.check(SignedRequest, &u, last_ok + 1),
+            Err(ReplayError::Expired)
+        );
     }
 }
 
@@ -385,5 +390,37 @@ fn retry_after_on_a_domain_quota_waits_for_the_domain() {
             T + 101
         ),
         Ok(())
+    );
+}
+
+/// The reviewer's interleaving: copy 2 read the clock at S+300 and waited for
+/// the lock while an unrelated request at S+301 swept copy 1's entry away.
+/// Copy 2 must not be accepted.
+#[test]
+fn a_stale_reading_cannot_resurrect_a_swept_nonce() {
+    let s = warm(10);
+    s.record(SignedRequest, &alice("dup", T), T).unwrap();
+    s.record(SignedRequest, &alice("other", T + 300), T + SKEW + 1)
+        .unwrap();
+    assert_eq!(
+        s.record(SignedRequest, &alice("dup", T), T + SKEW),
+        Err(ReplayError::Expired)
+    );
+    assert_eq!(
+        s.check(SignedRequest, &alice("dup", T), T + SKEW),
+        Err(ReplayError::Expired)
+    );
+}
+
+#[test]
+fn a_wall_clock_stepped_back_does_not_reopen_nonces() {
+    let s = warm(10);
+    s.record(SignedRequest, &alice("n", T), T).unwrap();
+    // Time passes beyond the nonce's life; something sweeps.
+    assert!(s.is_empty(T + SKEW + 1));
+    // NTP steps the clock back into the nonce's window.
+    assert_eq!(
+        s.record(SignedRequest, &alice("n", T), T + 10),
+        Err(ReplayError::Expired)
     );
 }

@@ -134,8 +134,48 @@ pub const UNSUPPORTED_MEDIA_TYPE: ErrorCode = ErrorCode {
     description: "The request body's Content-Type is not accepted by this endpoint (usually application/json is required).",
 };
 
+/// Extension code: the resource existed and is gone for good.
+pub const GONE: ErrorCode = ErrorCode {
+    code: "gone",
+    status: 410,
+    title: "Gone",
+    description: "The resource existed but has been removed permanently.",
+};
+
+/// Extension code: this provider does not implement the requested feature.
+pub const NOT_IMPLEMENTED: ErrorCode = ErrorCode {
+    code: "not_implemented",
+    status: 501,
+    title: "Not Implemented",
+    description: "This provider does not implement the requested feature.",
+};
+
+/// Extension code: an upstream the provider depends on answered badly.
+pub const BAD_GATEWAY: ErrorCode = ErrorCode {
+    code: "bad_gateway",
+    status: 502,
+    title: "Bad Gateway",
+    description: "An upstream service gave an invalid response.",
+};
+
+/// Extension code: an upstream the provider depends on did not answer in time.
+pub const GATEWAY_TIMEOUT: ErrorCode = ErrorCode {
+    code: "gateway_timeout",
+    status: 504,
+    title: "Gateway Timeout",
+    description: "An upstream service did not answer in time.",
+};
+
 /// Codes this provider uses beyond the registry.
-pub const EXTENSIONS: &[ErrorCode] = &[METHOD_NOT_ALLOWED, REQUEST_TIMEOUT, UNSUPPORTED_MEDIA_TYPE];
+pub const EXTENSIONS: &[ErrorCode] = &[
+    METHOD_NOT_ALLOWED,
+    REQUEST_TIMEOUT,
+    GONE,
+    UNSUPPORTED_MEDIA_TYPE,
+    NOT_IMPLEMENTED,
+    BAD_GATEWAY,
+    GATEWAY_TIMEOUT,
+];
 
 /// Every registered code (§7.3).
 pub const REGISTRY: &[ErrorCode] = &[
@@ -311,31 +351,40 @@ pub async fn render(State(base): State<ProblemBase>, mut res: Response) -> Respo
     if !(status.is_client_error() || status.is_server_error()) || already_problem {
         return res;
     }
-    let (parts, body) = res.into_parts();
-    let problem = from_status(status);
-    let problem = if status.is_client_error() {
+    let (mut parts, body) = res.into_parts();
+    let mut problem = from_status(status);
+    if status.is_client_error() {
         // Rejection bodies are short plain-text explanations; keep a bounded
-        // prefix as the detail. 5xx bodies are never echoed.
-        let text = axum::body::to_bytes(body, 4096).await.unwrap_or_default();
-        let text = String::from_utf8_lossy(&text);
-        let text = text.trim();
-        if text.is_empty() {
-            problem
-        } else {
-            problem.with_detail(text.chars().take(300).collect::<String>())
-        }
-    } else {
-        problem
-    };
-    let mut fresh = problem.clone().into_response();
-    // Keep headers that still mean something (e.g. `Allow` on a 405).
-    for name in [header::ALLOW, header::RETRY_AFTER] {
-        if let Some(v) = parts.headers.get(&name) {
-            fresh.headers_mut().insert(name, v.clone());
+        // prefix as the detail, read with a deadline so a streaming error
+        // body cannot hold the response. 5xx bodies are never echoed.
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            axum::body::to_bytes(body, 4096),
+        )
+        .await;
+        if let Ok(Ok(bytes)) = read {
+            let text = String::from_utf8_lossy(&bytes);
+            let text = text.trim();
+            if !text.is_empty() {
+                problem = problem.with_detail(text.chars().take(300).collect::<String>());
+            }
         }
     }
-    fresh.extensions_mut().remove::<Problem>();
-    write_body(&base, fresh, &problem)
+    // Keep every header the original carried (CORS, Allow, Vary, caching,
+    // WWW-Authenticate, …); only the status, content type and body change.
+    parts.status = problem.status();
+    parts.headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(PROBLEM_CONTENT_TYPE),
+    );
+    if let Some(secs) = problem.retry_after
+        && !parts.headers.contains_key(header::RETRY_AFTER)
+    {
+        parts
+            .headers
+            .insert(header::RETRY_AFTER, HeaderValue::from(secs));
+    }
+    write_body(&base, Response::from_parts(parts, Body::empty()), &problem)
 }
 
 /// The problem for a bare error status.
@@ -347,12 +396,18 @@ fn from_status(status: StatusCode) -> Problem {
         405 => Problem::method_not_allowed(),
         408 => Problem::request_timeout(),
         409 => Problem::conflict(),
+        410 => Problem::new(&GONE),
         413 => Problem::payload_too_large(),
         415 => Problem::unsupported_media_type(),
         // Rate limits and unavailability without a known wait: a short one.
         429 => Problem::too_many_requests(1),
+        501 => Problem::new(&NOT_IMPLEMENTED),
+        502 => Problem::new(&BAD_GATEWAY),
         503 => Problem::service_unavailable(1),
-        // 400, 422 (axum's JSON data errors) and any other 4xx.
+        504 => Problem::new(&GATEWAY_TIMEOUT),
+        // 400, 422 (axum's JSON data errors) and any 4xx without a code of
+        // its own become 400 `bad_request`; any other 5xx becomes 500. No
+        // current route produces one; a new status that matters gets a code.
         400..=499 => Problem::bad_request(),
         _ => Problem::internal(),
     }

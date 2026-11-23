@@ -203,3 +203,66 @@ async fn method_not_allowed_keeps_allow_header() {
     assert_eq!(res.status(), StatusCode::METHOD_NOT_ALLOWED);
     assert!(res.headers().contains_key(header::ALLOW));
 }
+
+/// Converting a bare error keeps its status where a code exists, and keeps
+/// every header (CORS, caching, auth challenges…).
+#[tokio::test]
+async fn converted_errors_keep_status_and_headers() {
+    use axum::http::HeaderValue;
+    use axum::response::IntoResponse;
+    use axum::routing::get;
+    use re_ofscp_server::problem::{self, ProblemBase};
+    use re_ofscp_types::Authority;
+
+    let base = ProblemBase::new(&Authority::parse_canonical("social.example").unwrap());
+    let test_app = axum::Router::new()
+        .route(
+            "/gone",
+            get(|| async {
+                let mut r = (StatusCode::GONE, "it left").into_response();
+                r.headers_mut()
+                    .insert("access-control-allow-origin", HeaderValue::from_static("*"));
+                r.headers_mut()
+                    .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+                r
+            }),
+        )
+        .route(
+            "/timeout",
+            get(|| async { (StatusCode::GATEWAY_TIMEOUT, "upstream secret").into_response() }),
+        )
+        .layer(axum::middleware::map_response_with_state(
+            base,
+            problem::render,
+        ));
+    let validator = common::schema("problem-details.json");
+
+    let res = test_app
+        .clone()
+        .oneshot(Request::get("/gone").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::GONE);
+    assert_eq!(res.headers()["access-control-allow-origin"], "*");
+    assert_eq!(res.headers()[header::CACHE_CONTROL], "no-store");
+    assert_eq!(
+        res.headers()[header::CONTENT_TYPE],
+        "application/problem+json"
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    common::assert_valid(&validator, &json);
+    assert_eq!(json["errorCode"], "gone");
+    assert_eq!(json["detail"], "it left");
+
+    let res = test_app
+        .oneshot(Request::get("/timeout").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::GATEWAY_TIMEOUT);
+    let json: serde_json::Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(json["errorCode"], "gateway_timeout");
+    // 5xx bodies are never echoed.
+    assert!(json.get("detail").is_none());
+}

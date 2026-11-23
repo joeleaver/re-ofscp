@@ -104,6 +104,10 @@ pub struct ReplayLimits {
 pub enum ReplayError {
     /// The *(kind, key id, nonce)* triple was already used.
     Replayed,
+    /// The timestamp is no longer acceptable on the store's clock (it expired
+    /// while the request was in flight, or another thread has already seen a
+    /// later second).
+    Expired,
     /// Still warming up after a restart (`503`).
     WarmingUp {
         /// Seconds until the warm-up ends.
@@ -157,6 +161,13 @@ struct Inner {
     groups: HashMap<Arc<str>, Counter>,
     local: Counter,
     remote: Counter,
+    /// The latest "now" the store has been given. Every decision uses
+    /// `max(now, high_water)`, so the store's clock never runs backwards:
+    /// a caller holding an older reading (it read the clock, then waited for
+    /// the lock) or a wall clock stepped back by NTP cannot sweep less than a
+    /// previous caller already swept and so miss an entry that is gone
+    /// (§4.5 "Restarts": expiry is measured on one clock).
+    high_water: i64,
 }
 
 /// Heap payload: ordered by address only, so the heap never compares
@@ -181,6 +192,14 @@ impl Ord for ArcByAddr {
 }
 
 impl Inner {
+    /// Move the store's clock to `max(now, high_water)`, sweep, and return it.
+    fn advance(&mut self, now: i64) -> i64 {
+        self.high_water = self.high_water.max(now);
+        let now = self.high_water;
+        self.sweep(now);
+        now
+    }
+
     fn sweep(&mut self, now: i64) {
         while let Some(Reverse((expires, _))) = self.expiry.peek() {
             if *expires > now {
@@ -334,30 +353,42 @@ impl ReplayStore {
         Ok(())
     }
 
+    /// Whether `u`'s timestamp is still acceptable at the store's `now`.
+    fn fresh(&self, u: &NonceUse<'_>, now: i64) -> Result<(), ReplayError> {
+        if u.signed_at + self.skew_secs < now {
+            Err(ReplayError::Expired)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Step 4: would this use be accepted? Records nothing.
     pub fn check(&self, surface: Surface, u: &NonceUse<'_>, now: i64) -> Result<(), ReplayError> {
         self.warm_up(surface, u, now)?;
         let mut inner = self.lock();
-        inner.sweep(now);
+        let now = inner.advance(now);
+        self.fresh(u, now)?;
         if inner.contains(u) {
             return Err(ReplayError::Replayed);
         }
         self.admit(&inner, u, now)
     }
 
-    /// After the signature verified: atomically re-check and record. `now`
-    /// must be a fresh clock reading (not one taken before the body arrived).
+    /// After the signature verified: atomically re-check freshness and
+    /// replay, and record. Pass a fresh clock reading; the store also never
+    /// lets its clock run backwards (see `Inner::high_water`).
     pub fn record(&self, surface: Surface, u: &NonceUse<'_>, now: i64) -> Result<(), ReplayError> {
         self.warm_up(surface, u, now)?;
         let mut inner = self.lock();
-        inner.sweep(now);
+        let now = inner.advance(now);
+        self.fresh(u, now)?;
         if inner.contains(u) {
             return Err(ReplayError::Replayed);
         }
         self.admit(&inner, u, now)?;
-        // Accepted while `now <= signed_at + skew`, so gone at the second after.
-        // Never earlier than one second from now (a timestamp in the past).
-        let expires = (u.signed_at + self.skew_secs + 1).max(now + 1);
+        // Accepted while `now <= signed_at + skew` (checked just above), so
+        // gone at the second after; that is always later than `now`.
+        let expires = u.signed_at + self.skew_secs + 1;
         let signer: Arc<str> = Arc::from(u.signer);
         let remote_group = self
             .is_remote(u)
@@ -389,7 +420,7 @@ impl ReplayStore {
     /// Number of live entries (for metrics and tests).
     pub fn len(&self, now: i64) -> usize {
         let mut inner = self.lock();
-        inner.sweep(now);
+        inner.advance(now);
         inner.entries.len()
     }
 

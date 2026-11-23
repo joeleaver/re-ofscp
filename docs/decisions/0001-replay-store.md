@@ -46,9 +46,14 @@ surface:
   of the earliest expiries among the quotas that refused.
   - Without registrable-domain grouping, one provider could use
     `a.evil.example`, `b.evil.example:8443` and so on as unlimited separate
-    domains. With it, filling the remote pool takes about ten separately
-    registered domains. That's a real cost, and it still can't touch local
-    users.
+    domains.
+  - **Private suffixes count as separate domains.** The PSL includes its
+    private section, so `alice.github.io` and `bob.duckdns.org` are each
+    their own group. We keep that on purpose: independent OFSCP providers
+    hosted under a shared suffix shouldn't share one quota. The cost is
+    that free subdomains under such suffixes are cheap to obtain. About ten
+    of them (each serving valid keys and signing validly) could fill the
+    remote pool. Even then, the pools keep local users unaffected.
   - Filling the local pool takes about 40 local accounts at full rate. The
     defence there is rate-limited account creation, which is a requirement
     for the accounts PR.
@@ -63,12 +68,23 @@ surface:
   before the body is read (`Verifier::precheck`, then `complete`), so a
   request that fails them costs no buffering. A signed body must arrive
   within 30 s (`408 request_timeout` otherwise).
-- **Fresh clock at record time:** `complete` reads the clock again before
-  recording, refuses a timestamp that expired while the request was in
-  flight, and sweeps and records with that fresh time. Using the precheck's
-  clock let a slow copy of a request miss its sibling's already-expired
-  entry and record the same nonce twice. The second independent review
-  found this, and `slow_copy_cannot_record_with_a_stale_clock` pins it.
+- **One clock that never runs backwards:** the store keeps a high-water
+  mark of every "now" it has been given, and makes each decision under its
+  lock with `max(now, high_water)`: sweeping, a freshness re-check
+  (`signed_at + skew ≥ now`, else `401`) and recording. `complete` also
+  hands the store a fresh clock reading rather than the precheck's.
+  - **Why:** two reviews found variants of the same race. A copy of a
+    request with an older clock reading (from before its body arrived, or
+    read just before it queued for the lock) could sweep less than a fresher
+    caller already had. It would then miss its sibling's expired entry and
+    record the same nonce a second time. An NTP step backwards had the same
+    effect.
+  - **Tests:** `slow_copy_cannot_record_with_a_stale_clock`,
+    `a_stale_reading_cannot_resurrect_a_swept_nonce` and
+    `a_wall_clock_stepped_back_does_not_reopen_nonces`.
+  - **Cost:** if the clock steps *forward* and then back, timestamps valid
+    on the corrected clock may be refused as expired until it catches up.
+    That fails closed.
 - **Host check:** step 2 compares the request's `Host` (never a forwarding
   header) with `DOMAIN`. The spec requires it, but security doesn't depend
   on it, because the canonical string always uses `DOMAIN`. It does assume
