@@ -94,15 +94,42 @@ impl<S: Send + Sync> FromRequestParts<S> for Peer {
 /// /64, the usual unit one subscriber controls, so a client cannot mint
 /// fresh rate-limit keys by cycling through its own prefix.
 fn client_key(state: &AppState, headers: &HeaderMap, peer: &Peer) -> String {
-    let from_header = state.config.client_ip_header.as_ref().and_then(|name| {
-        let v = headers.get(name.as_str())?.to_str().ok()?;
-        let last = v.rsplit(',').next()?.trim();
-        last.parse::<IpAddr>().ok()
-    });
-    match from_header.or(peer.0.map(|a| a.ip())) {
+    let Some(name) = state.config.client_ip_header.as_ref() else {
+        return peer
+            .0
+            .map_or_else(|| "unknown".to_owned(), |a| rate_key(a.ip()));
+    };
+    let last = headers
+        .get(name.as_str())
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.rsplit(',').next())
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    let Some(last) = last else {
+        // The trusted proxy always sets it; without it every client would
+        // share the proxy's address as one bucket.
+        tracing::error!(header = %name, "client address header missing; keying by TCP peer");
+        return peer
+            .0
+            .map_or_else(|| "unknown".to_owned(), |a| rate_key(a.ip()));
+    };
+    match parse_client_addr(last) {
         Some(ip) => rate_key(ip),
-        None => "unknown".to_owned(),
+        None => {
+            // Appended by the trusted proxy, so still one client's value:
+            // key by it rather than collapse everyone into one bucket.
+            tracing::error!(header = %name, "client address header is not an IP address");
+            format!("raw:{}", last.chars().take(64).collect::<String>())
+        }
     }
+}
+
+/// An address as proxies write it: `203.0.113.7`, `2001:db8::1`,
+/// `203.0.113.7:4711` or `[2001:db8::1]:4711`.
+fn parse_client_addr(v: &str) -> Option<IpAddr> {
+    v.parse::<IpAddr>()
+        .ok()
+        .or_else(|| v.parse::<SocketAddr>().ok().map(|a| a.ip()))
 }
 
 /// IPv4 as is (and IPv4-mapped IPv6 as IPv4); other IPv6 by its /64.
@@ -188,12 +215,21 @@ pub async fn login(
             .attempt(&req.handle, now)
             .map_err(limited)?;
     }
+    // A fault before the password is decided must not count against the
+    // account (a flood that saturates hashing would otherwise lock real
+    // users out): take the attempt back.
+    let undecided = |p: Problem| {
+        if valid {
+            accounts.login_backoff.refund(&req.handle);
+        }
+        p
+    };
     let user = if valid {
         accounts
             .store
             .find_user(&req.handle)
             .await
-            .map_err(internal)?
+            .map_err(|e| undecided(internal(e)))?
     } else {
         None
     };
@@ -205,7 +241,7 @@ pub async fn login(
             active.as_ref().map(|u| u.password_hash.as_str()),
         )
         .await
-        .map_err(password_error)?;
+        .map_err(|e| undecided(password_error(e)))?;
     let Some(user) = active.filter(|_| ok) else {
         return Err(Problem::unauthorized().with_detail("invalid handle or password"));
     };
@@ -420,6 +456,16 @@ pub async fn user_keys(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_addresses_parse_with_or_without_a_port() {
+        let ip = |s: &str| parse_client_addr(s).map(|a| a.to_string());
+        assert_eq!(ip("203.0.113.7").as_deref(), Some("203.0.113.7"));
+        assert_eq!(ip("203.0.113.7:4711").as_deref(), Some("203.0.113.7"));
+        assert_eq!(ip("[2001:db8::1]:4711").as_deref(), Some("2001:db8::1"));
+        assert_eq!(ip("2001:db8::1").as_deref(), Some("2001:db8::1"));
+        assert_eq!(ip("for=203.0.113.7"), None);
+    }
 
     #[test]
     fn rate_keys_group_ipv6_by_64() {

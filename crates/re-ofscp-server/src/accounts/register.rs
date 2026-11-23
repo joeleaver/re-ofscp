@@ -174,17 +174,37 @@ impl Accounts {
             .await
         {
             Ok(user) => Ok(user),
+            Err(StoreError::HandleTaken) => {
+                self.release_invite(&hash, &req.handle).await;
+                Err(RegisterError::HandleTaken)
+            }
             Err(e) => {
-                if let Err(release) = self.invites.release(&hash).await {
-                    tracing::error!(
-                        error = %release,
+                // Ambiguous: the write may have landed (say, a timeout after
+                // the row was stored). Release only if the account is
+                // certainly absent, or one invite could create two accounts.
+                match self.store.find_user(&req.handle).await {
+                    Ok(None) => self.release_invite(&hash, &req.handle).await,
+                    Ok(Some(_)) => {}
+                    Err(check) => tracing::error!(
+                        error = %check,
                         handle = %req.handle,
-                        "could not release an invite after a failed registration; \
+                        "could not tell whether a failed registration stored its account; \
                          the invite stays spent"
-                    );
+                    ),
                 }
                 Err(e.into())
             }
+        }
+    }
+
+    async fn release_invite(&self, hash: &str, handle: &str) {
+        if let Err(e) = self.invites.release(hash).await {
+            tracing::error!(
+                error = %e,
+                handle = %handle,
+                "could not release an invite after a failed registration; \
+                 the invite stays spent"
+            );
         }
     }
 }

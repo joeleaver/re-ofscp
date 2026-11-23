@@ -215,7 +215,20 @@ pub fn router(state: AppState) -> Router {
             ProblemBase::new(&state.config.domain),
             problem::render,
         ))
-        .layer(tower_http::trace::TraceLayer::new_for_http())
+        .layer(
+            tower_http::trace::TraceLayer::new_for_http().make_span_with(
+                // The path only: query strings can carry secrets (invite
+                // tokens in `?invite=`, §4.1.1 "SHOULD NOT log invite
+                // tokens").
+                |req: &axum::http::Request<axum::body::Body>| {
+                    tracing::info_span!(
+                        "request",
+                        method = %req.method(),
+                        path = %req.uri().path(),
+                    )
+                },
+            ),
+        )
         .with_state(state)
 }
 

@@ -21,7 +21,8 @@
   shared as `https://{DOMAIN}/register?invite={token}`. Only the token's
   SHA-256 is stored (`RegistrationInvite`), and tokens are never logged. A
   pinned handle must be a valid registration handle and not already taken
-  when the invite is issued.
+  when the invite is issued. Request logs record the path only, never the
+  query string.
 - **`POST /api/auth/register`** checks, in the spec's order:
   1. Closed mode → `403 registration_closed`, invite or not.
   2. No invite, or one that is unknown, expired, used, or pinned to another
@@ -32,7 +33,8 @@
      (`used == false && expires_at > now`), and a claim whose account can't
      be created is released. The invite therefore stays usable after a
      failed registration, and of two registrations with one invite exactly
-     one succeeds.
+     one succeeds. After an ambiguous storage error the invite is released
+     only if the account is confirmed absent.
   5. `201` with a bootstrap token.
 - **Display name:** starts as the handle; the registration request carries
   none.
@@ -63,19 +65,31 @@
 - **Choosing the address:** it comes from the **last** entry of
   `CLIENT_IP_HEADER` (the one the trusted proxy appended) when that's
   configured, otherwise the TCP peer. IPv6 addresses are grouped by /64, so
-  one subscriber can't mint fresh keys from its own prefix. Set the header
-  only when every request passes through that proxy.
+  one subscriber can't mint fresh keys from its own prefix. `ip:port` forms
+  are accepted. If the header is missing, or isn't an address, that's logged
+  as an error: a missing header falls back to the TCP peer, and an
+  unparsable one is used as the key verbatim, rather than putting every
+  client in one bucket. Set the header only when every request passes
+  through that proxy.
   - **Check on the first deploy:** what jkbase's proxy sends.
-- **Per handle:** every login attempt for a valid handle counts as a failure
-  *before* the password is checked, and a success clears the count. So
-  concurrent guesses can't all get in ahead of the first recorded failure.
-  After 5 attempts the handle is locked for 60 s, doubling per further
-  attempt up to 1 h. During a lockout even the right password gets `429`,
-  without hashing anything. Invalid handles aren't tracked: they can't
-  exist, and tracking them would let anyone fill the table.
-  - **Trade-off:** someone can deliberately lock a victim out for up to an
-    hour. The spec suggests this behaviour, and it's the usual trade against
-    online guessing.
+- **Per handle:** a login attempt for a valid handle is admitted only while
+  the handle isn't locked. It counts as a failure *before* the password is
+  checked, and a success clears the count. So concurrent guesses can't all
+  get in ahead of the first recorded failure.
+  - **The lock:** the 5th admitted attempt also sets a 60 s lock, which
+    applies if that attempt fails. Each later admitted attempt doubles it,
+    up to 1 h.
+  - **Refusals:** refused attempts never extend a lock. Once a lock lapses,
+    exactly one attempt is let through again.
+  - **During a lockout:** even the right password gets `429`, without any
+    hashing.
+  - **Faults don't count:** if the database fails, or hashing is saturated,
+    before the password is checked, the attempt is refunded.
+  - **Invalid handles aren't tracked:** they can't exist, and tracking them
+    would let anyone fill the table.
+  - **Trade-off:** anyone can keep an account locked by guessing once per
+    lapse, for up to an hour at a time. The spec suggests this behaviour,
+    and it's the usual trade against online guessing.
 - **Bounded memory:** both trackers are bounded, and they fail closed when
   full.
 - **Bounded hashing queue:** a request waits at most 5 s for a hashing slot,
