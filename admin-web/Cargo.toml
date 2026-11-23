@@ -1,0 +1,26 @@
+[package]
+name = "re-ofscp-admin-web"
+description = "re-ofscp admin UI (user management) — rinch, browser-native DOM, built by trunk."
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Not a member of the root workspace (it targets wasm32); an empty [workspace]
+# table makes this crate its own workspace root when trunk builds it.
+[workspace]
+
+[dependencies]
+re-ofscp-types = { path = "../crates/re-ofscp-types" }
+
+# rinch — pinned to an exact upstream commit. Bump deliberately.
+rinch = { git = "https://github.com/joeleaver/rinch", rev = "7b9e92a9fd0c221b1fd41c8d19fbd500763258b6", default-features = false, features = ["components", "theme"] }
+rinch-core = { git = "https://github.com/joeleaver/rinch", rev = "7b9e92a9fd0c221b1fd41c8d19fbd500763258b6", features = ["theme"] }
+rinch-web = { git = "https://github.com/joeleaver/rinch", rev = "7b9e92a9fd0c221b1fd41c8d19fbd500763258b6" }
+
+wasm-bindgen = "0.2"
+console_error_panic_hook = "0.1"
+
+[profile.release]
+opt-level = "z"
+lto = true

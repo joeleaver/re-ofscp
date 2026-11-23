@@ -1,0 +1,11 @@
+[package]
+name = "re-ofscp-types"
+description = "Wire types shared by the re-ofscp server and its admin UI (no I/O, wasm-safe)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true }

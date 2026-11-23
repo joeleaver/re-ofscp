@@ -1,0 +1,5 @@
+[build]
+target = "index.html"
+dist = "dist"
+# Served by jkbase under the `/admin` prefix (`[sites.admin]` in jkbase.toml).
+public_url = "/admin/"

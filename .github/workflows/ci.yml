@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  server:
+    name: server (fmt, clippy, test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # rustup reads rust-toolchain.toml (pinned 1.99.0 + rustfmt/clippy).
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --all-targets
+
+  admin-web:
+    name: admin-web (trunk build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: admin-web
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: trunk
+      - run: cargo fmt --manifest-path admin-web/Cargo.toml --check
+      - run: trunk build --release
+        working-directory: admin-web

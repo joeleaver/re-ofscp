@@ -1,0 +1,7 @@
+/target
+/admin-web/target
+/admin-web/dist
+/data
+*.swp
+.DS_Store
+.env

@@ -1,0 +1,20 @@
+// re-ofscp database schema (rhypedb SDL). Deployed by jkbase via `[database]`.
+// Starter types only — the build grows this to the full OFSCP data model.
+
+type User {
+    handle: String @unique
+    display_name: String
+    password_hash: String
+    is_admin: Bool
+    created_at: DateTime @indexed
+    device_keys: [DeviceKey] @on_delete(cascade)
+}
+
+type DeviceKey {
+    key_id: String @unique
+    user: User @inverse(User.device_keys)
+    public_key: String
+    device_name: String
+    created_at: DateTime
+    revoked: Bool
+}

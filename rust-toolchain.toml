@@ -1,0 +1,6 @@
+# One exact toolchain for dev, CI and the jkbase builder. Matches rinch's pin
+# (the admin UI depends on rinch). Bump deliberately, in its own PR.
+[toolchain]
+channel = "1.99.0"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]

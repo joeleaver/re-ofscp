@@ -1,0 +1,41 @@
+# jkbase deployment manifest for re-ofscp.
+#
+# One project, three parts:
+#   - [servers.app]   the OFSCP provider (Rust; built by jkbase's Rust buildpack)
+#   - [database]      managed rhypedb, reachable from the app on 127.0.0.1:4201
+#   - [sites.admin]   the rinch admin UI (wasm; built by jkbase's trunk buildpack),
+#                     served under /admin
+#
+# First deploy (from the repo root):
+#   jkbase project create re-ofscp
+#   jkbase secret set DOMAIN=<public host>   # MUST equal the host clients use (OFSCP §4.4.2)
+#   jkbase deploy
+#
+# The runtime clears the environment: every env var the server reads
+# (see crates/re-ofscp-server/src/config.rs) is supplied as a secret.
+
+[project]
+name = "re-ofscp"
+
+[servers.app]
+source = "."
+language = "rust"
+port = 8080
+health_check = { path = "/api/health", interval = "10s", timeout = "5s" }
+
+[database]
+engine = "rhypedb"
+schema = "schema.rhype"
+size = "4GiB"
+
+[sites.admin]
+source = "admin-web"
+# Build from the repo root so admin-web can path-depend on crates/re-ofscp-types.
+context = "."
+build = "trunk"
+prefix = "/admin"
+spa = true
+
+[routes]
+"/api/*" = { service = "server", name = "app" }
+"/.well-known/*" = { service = "server", name = "app" }

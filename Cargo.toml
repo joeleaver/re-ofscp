@@ -1,0 +1,35 @@
+[workspace]
+resolver = "3"
+members = ["crates/re-ofscp-types", "crates/re-ofscp-server"]
+# The admin UI is a wasm32 crate built by trunk (jkbase `[sites.admin]`); it is
+# NOT a workspace member, so `cargo build`/`cargo test` at the root (and the
+# jkbase Rust server buildpack) never try to compile it for the host.
+exclude = ["admin-web"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/joeleaver/re-ofscp"
+rust-version = "1.99"
+
+[workspace.dependencies]
+re-ofscp-types = { path = "crates/re-ofscp-types" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time"] }
+axum = "0.8"
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# rhypedb (the database) — pinned to an exact upstream commit. Bump deliberately.
+rhypedb-client = { git = "https://github.com/joeleaver/rhypedb", rev = "c73cc88d14fbebc5a7dbc4ef2f2ef6f99f5a0192", features = ["async"] }
+rhypedb-schema = { git = "https://github.com/joeleaver/rhypedb", rev = "c73cc88d14fbebc5a7dbc4ef2f2ef6f99f5a0192" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
