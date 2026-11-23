@@ -2,8 +2,9 @@
 //!
 //! `type` URIs are minted under the same `https://ofscp.org/problems/` base
 //! the reference implementation uses, so clients that key on `type` see the
-//! same values from either implementation. Every problem also carries a
-//! stable `errorCode` (§2.6 allows it).
+//! same values from either implementation; clients treat `type` as opaque.
+//! Every problem carries an `errorCode` from the registered list. Clients
+//! branch on `status` + `errorCode` (lost-conn/ofscp#17, open).
 
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};

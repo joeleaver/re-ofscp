@@ -16,7 +16,7 @@
 //! To stop a request captured before the restart from being replayed after
 //! it, the store has a *floor*: a signature whose timestamp is earlier than
 //! the moment the store was created is refused. See
-//! `docs/decisions/0001-replay-store.md`.
+//! `docs/decisions/0001-replay-store.md` and lost-conn/ofscp#17 (open).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, PoisonError};

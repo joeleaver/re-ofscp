@@ -42,6 +42,4 @@ a deploy could then be replayed for up to the 300 s skew window afterwards.
   we ever scale out, the store has to move somewhere shared (rhypedb or
   similar). The `ReplayStore` API, `check` plus `record`, is the seam to
   replace.
-- **Possible spec PR:** §4.5 could say that a store which loses state on
-  restart must refuse signatures timestamped before the loss. That is
-  implementation guidance rather than wire behaviour, so it's not urgent.
+- **Spec:** [lost-conn/ofscp#17](https://github.com/lost-conn/ofscp/pull/17) (open) adds this restart rule to §4.5 as a MUST.

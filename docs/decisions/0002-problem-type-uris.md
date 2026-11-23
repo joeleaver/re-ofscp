@@ -2,7 +2,7 @@
 
 - **Status:** accepted. The shared base is pending a Joe and Seth decision.
 - **Date:** 2026-11-23
-- **Spec:** §2.6, §7.3. An oracle spec PR is on its way; its number goes here once it exists.
+- **Spec:** §2.6, §7.3; [lost-conn/ofscp#17](https://github.com/lost-conn/ofscp/pull/17) (open)
 
 ## Context
 
