@@ -55,9 +55,18 @@ re-ofscp is an **enterprise-grade OFSCP provider** written in Rust. It is hosted
   - An audit log for admin actions.
   - Design schema migrations deliberately, using rhypedb's migrations.
 - **Admin console:**
-  - Role-based access, with provider admins kept distinct from group roles.
-  - Every admin action goes through a server admin API (`/api/admin/*`) and is audited.
-  - How the admin UI authenticates is an **open design decision**. One candidate is OFSCP device-key signing in the browser via WebCrypto Ed25519.
+  - **Admins have their own sign-ins (decided).**
+    - Admin accounts are a separate identity system from OFSCP users. They are not actors, are never federated, and never sign OFSCP requests.
+    - Store them as their own type in `schema.rhype` (e.g. `Admin`), not as a flag on `User`.
+    - An admin managing OFSCP users does not need, and should not use, an OFSCP account.
+    - Suggested defaults, to confirm while building:
+      - Argon2id password hashing.
+      - A server-side session (HttpOnly, Secure, SameSite=Strict cookie scoped to `/api/admin` and `/admin`), with CSRF protection on mutations.
+      - TOTP or WebAuthn second factor.
+      - Login rate-limiting and lockout.
+      - A bootstrap path for the first admin (e.g. a one-time setup token from a jkbase secret).
+  - Role-based access *among admins* (e.g. owner / operator / read-only), distinct from OFSCP group roles.
+  - Every admin action goes through the server's admin API (`/api/admin/*`), authenticated by the admin session, never by OFSCP signatures, and is recorded in an audit log naming the admin.
 
 ## Security requirements (learned from auditing the spec and Forumall)
 

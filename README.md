@@ -15,7 +15,7 @@ An enterprise-grade server for the [Open Federated Social Communications Protoco
 | --- | --- |
 | `crates/re-ofscp-server` | The OFSCP provider: HTTP API, WebSocket and federation. Builds the `re-ofscp` binary. |
 | `crates/re-ofscp-types` | Wire types shared by the server and the admin UI. Contains no I/O, so it also builds for wasm. |
-| `admin-web` | The rinch admin UI, built with trunk. It isn't a workspace member because it targets wasm32. |
+| `admin-web` | The rinch admin UI, built with trunk. Admins sign in with their own accounts, separate from OFSCP users. It isn't a workspace member because it targets wasm32. |
 | `schema.rhype` | The rhypedb schema, applied by jkbase on deploy. |
 | `jkbase.toml` | The deployment manifest. |
 
