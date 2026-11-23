@@ -24,8 +24,8 @@ use axum::response::{IntoResponse, Response};
 use re_ofscp_types::{Actor, Authority};
 
 pub use verify::{
-    Clock, KeyError, KeyFuture, KeyResolver, RequestParts, Signer, StaticKeys, SystemClock,
-    Verified, Verifier, VerifyError,
+    Clock, KeyError, KeyFuture, KeyResolver, Precheck, RequestParts, Signer, StaticKeys,
+    SystemClock, Verified, Verifier, VerifyError,
 };
 
 use crate::problem::Problem;
@@ -35,6 +35,9 @@ use crate::problem::Problem;
 pub const MAX_SIGNED_BODY: usize = 1024 * 1024;
 
 /// Middleware: verify signed requests, pass unsigned ones through.
+///
+/// Steps 1–4 (headers, host, timestamp, replay) run before the body is read,
+/// so a request that fails them costs no buffering.
 pub async fn authenticate(
     State(verifier): State<Arc<Verifier>>,
     req: Request,
@@ -47,6 +50,15 @@ pub async fn authenticate(
         return next.run(req).await;
     }
     let (parts, body) = req.into_parts();
+    let request = RequestParts {
+        method: &parts.method,
+        uri: &parts.uri,
+        headers: &parts.headers,
+    };
+    let pre = match verifier.precheck(request) {
+        Ok(pre) => pre,
+        Err(e) => return reject(&e, parts.uri.path()),
+    };
     let bytes = match to_bytes(body, MAX_SIGNED_BODY).await {
         Ok(b) => b,
         Err(e) => {
@@ -65,27 +77,19 @@ pub async fn authenticate(
             };
         }
     };
-    let outcome = verifier
-        .verify(
-            RequestParts {
-                method: &parts.method,
-                uri: &parts.uri,
-                headers: &parts.headers,
-            },
-            &bytes,
-        )
-        .await;
-    match outcome {
+    match verifier.complete(pre, request, &bytes).await {
         Ok(verified) => {
             let mut req = Request::from_parts(parts, Body::from(bytes));
             req.extensions_mut().insert(verified);
             next.run(req).await
         }
-        Err(e) => {
-            tracing::info!(reason = %e, path = parts.uri.path(), "rejected signed request");
-            Problem::from(e).into_response()
-        }
+        Err(e) => reject(&e, parts.uri.path()),
     }
+}
+
+fn reject(e: &VerifyError, path: &str) -> Response {
+    tracing::info!(reason = %e, path, "rejected signed request");
+    Problem::from(e.clone()).into_response()
 }
 
 /// Extractor: the request was signed and verified. `401` otherwise.

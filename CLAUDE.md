@@ -12,6 +12,7 @@ re-ofscp is an **enterprise-grade OFSCP provider** written in Rust. It is hosted
     - [lost-conn/ofscp#14](https://github.com/lost-conn/ofscp/pull/14): private groups are invite-only, and read markers use message ids.
     - [lost-conn/ofscp#15](https://github.com/lost-conn/ofscp/pull/15): DMs across devices (`to`, conversation pointers).
     - [lost-conn/ofscp#16](https://github.com/lost-conn/ofscp/pull/16): read-marker and conversation-pointer hardening; canonical actors and provider authorities on everything received.
+    - [lost-conn/ofscp#17](https://github.com/lost-conn/ofscp/pull/17): the `errorCode` registry, `type` = `https://{authority}/problems/{errorCode}`, nonce retention (timestamp + skew), and the replay-store restart warm-up.
     - Still open: [lost-conn/ofscp#10](https://github.com/lost-conn/ofscp/pull/10) (actor identity is `(handle, domain)`). We implement it regardless; see security requirement 1.
   - Where the spec is still ambiguous, choose the conservative, interoperable reading. Write the choice down in `docs/decisions/`, and propose a spec PR rather than diverging silently.
 - **Reference implementation:** Forumall, at `~/dev/forumall` (a worktree is at `~/dev/forumall-wt`), upstream `lost-conn/forumall`. It's in Bun/TypeScript. Use it to check wire behaviour and to interoperate-test against. It's a reference, not a template, and it has known bugs; see the security list below.

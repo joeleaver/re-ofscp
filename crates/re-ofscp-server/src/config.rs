@@ -7,6 +7,8 @@ use std::net::SocketAddr;
 
 use re_ofscp_types::Authority;
 
+use crate::replay::ReplayLimits;
+
 /// Server configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -19,9 +21,11 @@ pub struct Config {
     /// rhypedb binary-protocol address (`RHYPEDB_ADDR`, default `127.0.0.1:4201`,
     /// where jkbase's managed `[database]` listens inside the app VM).
     pub rhypedb_addr: String,
-    /// Maximum live nonces in the replay store (`REPLAY_CAPACITY`, default
-    /// 500 000). When full, signed requests get `503` (spec §4.5).
-    pub replay_capacity: usize,
+    /// Replay-store bounds (spec §4.5): `REPLAY_CAPACITY` (total live nonces,
+    /// default 500 000; full → `503`), `REPLAY_PER_SIGNER` (default 6 000,
+    /// about 10 signed requests/s sustained; over → `429`) and
+    /// `REPLAY_PER_REMOTE_DOMAIN` (default 50 000; over → `429`).
+    pub replay: ReplayLimits,
 }
 
 /// A configuration error.
@@ -56,23 +60,37 @@ impl Config {
                 reason: e.to_string(),
             })?;
         let rhypedb_addr = get("RHYPEDB_ADDR").unwrap_or_else(|| "127.0.0.1:4201".to_owned());
-        let replay_capacity = match get("REPLAY_CAPACITY") {
-            None => 500_000,
-            Some(v) => v
-                .parse::<usize>()
-                .ok()
-                .filter(|n| *n > 0)
-                .ok_or(ConfigError::Invalid {
-                    name: "REPLAY_CAPACITY",
-                    reason: "must be a positive integer".to_owned(),
-                })?,
+        let replay = ReplayLimits {
+            capacity: positive(&get, "REPLAY_CAPACITY", 500_000)?,
+            per_signer: positive(&get, "REPLAY_PER_SIGNER", 6_000)?,
+            per_remote_domain: positive(&get, "REPLAY_PER_REMOTE_DOMAIN", 50_000)?,
         };
         Ok(Self {
             domain,
             bind,
             rhypedb_addr,
-            replay_capacity,
+            replay,
         })
+    }
+}
+
+/// A positive integer variable, or `default` when unset.
+fn positive(
+    get: &impl Fn(&str) -> Option<String>,
+    name: &'static str,
+    default: usize,
+) -> Result<usize, ConfigError> {
+    match get(name) {
+        None => Ok(default),
+        Some(v) => v
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n > 0)
+            .ok_or(ConfigError::Invalid {
+                name,
+                reason: "must be a positive integer".to_owned(),
+            }),
     }
 }
 
@@ -100,7 +118,14 @@ mod tests {
     fn defaults_and_normalisation() {
         let c = Config::from_lookup(env(&[("DOMAIN", " Social.Example ")])).unwrap();
         assert_eq!(c.domain.as_str(), "social.example");
-        assert_eq!(c.replay_capacity, 500_000);
+        assert_eq!(
+            c.replay,
+            ReplayLimits {
+                capacity: 500_000,
+                per_signer: 6_000,
+                per_remote_domain: 50_000,
+            }
+        );
         assert_eq!(c.bind.to_string(), "0.0.0.0:8080");
         assert_eq!(c.rhypedb_addr, "127.0.0.1:4201");
     }
@@ -112,11 +137,11 @@ mod tests {
             r,
             Err(ConfigError::Invalid { name: "DOMAIN", .. })
         ));
-        let r = Config::from_lookup(env(&[("DOMAIN", "a.example"), ("REPLAY_CAPACITY", "0")]));
+        let r = Config::from_lookup(env(&[("DOMAIN", "a.example"), ("REPLAY_PER_SIGNER", "0")]));
         assert!(matches!(
             r,
             Err(ConfigError::Invalid {
-                name: "REPLAY_CAPACITY",
+                name: "REPLAY_PER_SIGNER",
                 ..
             })
         ));

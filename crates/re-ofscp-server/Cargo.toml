@@ -19,6 +19,7 @@ path = "src/lib.rs"
 re-ofscp-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+jsonschema = { version = "0.60", default-features = false }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
@@ -38,3 +39,4 @@ rhypedb-schema = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 time = { workspace = true, features = ["macros"] }
 serde_json = { workspace = true }
+jsonschema = { version = "0.60", default-features = false }

@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{Json, Router, extract::State, middleware, routing::get};
+use problem::ProblemBase;
 use re_ofscp_types::{Health, OFSCP_VERSION};
 
 pub use config::Config;
@@ -22,11 +23,6 @@ use signing::{Clock, KeyResolver, SystemClock, Verifier};
 
 /// Maximum clock skew accepted on signed requests, in seconds (§4.5 step 3, §8).
 pub const MAX_SKEW_SECS: i64 = 300;
-
-/// How long a nonce is remembered (§4.5 step 4: at least the skew window,
-/// RECOMMENDED ≥600 s). Twice the skew, so a nonce outlives every moment its
-/// timestamp is still acceptable.
-pub const REPLAY_RETENTION_SECS: i64 = 2 * MAX_SKEW_SECS;
 
 /// Shared application state.
 #[derive(Clone)]
@@ -49,10 +45,10 @@ impl AppState {
         // because a predecessor process may have recorded them
         // (docs/decisions/0001-replay-store.md, lost-conn/ofscp#17).
         let replay = Arc::new(ReplayStore::new(
-            config.replay_capacity,
-            REPLAY_RETENTION_SECS,
-            clock.now().unix_timestamp(),
+            config.replay,
             MAX_SKEW_SECS,
+            clock.now().unix_timestamp(),
+            config.domain.as_str(),
         ));
         let verifier = Arc::new(Verifier::new(
             config.domain.clone(),
@@ -69,12 +65,23 @@ impl AppState {
 }
 
 /// Build the HTTP router.
+///
+/// Layer order, outermost first: tracing, problem rendering (so every
+/// [`Problem`], including the signature layer's and extractors' rejections,
+/// gets its body), signature verification, routes.
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/health", get(health))
+        .route("/problems/{code}", get(problem::describe))
+        .fallback(|| async { Problem::not_found() })
+        .method_not_allowed_fallback(|| async { Problem::method_not_allowed() })
         .layer(middleware::from_fn_with_state(
             state.verifier.clone(),
             signing::authenticate,
+        ))
+        .layer(middleware::map_response_with_state(
+            ProblemBase::new(&state.config.domain),
+            problem::render,
         ))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)

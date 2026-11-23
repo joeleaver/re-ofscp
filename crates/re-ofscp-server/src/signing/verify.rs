@@ -16,7 +16,7 @@ use time::format_description::well_known::Rfc3339;
 
 use super::canonical::{self, CanonicalRequest};
 use crate::problem::Problem;
-use crate::replay::{ReplayError, ReplayStore, SignerKind, Surface};
+use crate::replay::{NonceUse, ReplayError, ReplayStore, SignerKind, Surface};
 
 /// Header names (§4.4.1, §8.1). Lowercase, as `http` stores them.
 pub mod headers {
@@ -94,8 +94,11 @@ pub type KeyFuture<'a> =
 ///
 /// `fresh = false` may answer from cache. The verifier calls again with
 /// `fresh = true` when the key is unknown or the signature fails, so rotated
-/// keys are picked up (§4.6, §8.1); implementations that fetch remotely must
-/// rate-limit fresh lookups (§8 "Outbound requests").
+/// keys are picked up (§4.6, §8.1). That happens on *every* failed
+/// signature, forgeries included, so an implementation that fetches remotely
+/// **must** rate-limit fresh lookups per signer domain and answer from cache
+/// when the limit is hit (§8 "Outbound requests"); otherwise a stream of
+/// forged requests becomes a stream of outbound fetches.
 pub trait KeyResolver: Send + Sync {
     /// Resolve `key_id` for `signer`. `Ok(None)` means "no such active key".
     fn resolve<'a>(&'a self, signer: &'a Signer, key_id: &'a str, fresh: bool) -> KeyFuture<'a>;
@@ -140,9 +143,16 @@ pub enum VerifyError {
         retry_after: u64,
     },
     /// Step 4: the replay store is warming up after a restart and cannot yet
-    /// vouch for this timestamp (lost-conn/ofscp#17).
-    #[error("provider is warming up after a restart; retry shortly")]
+    /// vouch for this timestamp (§4.5 "Restarts").
+    #[error("provider is warming up after a restart; re-sign and retry shortly")]
     WarmingUp {
+        /// Seconds to wait.
+        retry_after: u64,
+    },
+    /// Step 4 / record: this signer or its provider has too many nonces in
+    /// flight.
+    #[error("too many signed requests from this signer; slow down")]
+    RateLimited {
         /// Seconds to wait.
         retry_after: u64,
     },
@@ -164,6 +174,7 @@ impl From<VerifyError> for Problem {
             VerifyError::StoreFull { retry_after } | VerifyError::WarmingUp { retry_after } => {
                 Problem::service_unavailable(retry_after)
             }
+            VerifyError::RateLimited { retry_after } => Problem::too_many_requests(retry_after),
             _ => Problem::unauthorized(),
         };
         p.with_detail(e.to_string())
@@ -191,13 +202,37 @@ pub struct RequestParts<'a> {
     pub headers: &'a HeaderMap,
 }
 
-struct SigHeaders<'a> {
+/// The signing headers of a request that passed §4.5 steps 1–4.
+///
+/// Produced by [`Verifier::precheck`] *before* the body is read, so cheap
+/// rejections (missing headers, wrong host, stale timestamp, replay) cost no
+/// body buffering. Finish with [`Verifier::complete`].
+#[derive(Debug, Clone)]
+pub struct Precheck {
     signer: Signer,
-    key_id: &'a str,
-    timestamp: &'a str,
-    nonce: &'a str,
-    digest: &'a str,
-    signature: &'a str,
+    /// Canonical signer identity and home domain, for replay quotas.
+    signer_id: String,
+    signer_domain: String,
+    key_id: String,
+    timestamp: String,
+    nonce: String,
+    digest: String,
+    signature: String,
+    signed_at: i64,
+    now: i64,
+}
+
+impl Precheck {
+    fn nonce_use(&self) -> NonceUse<'_> {
+        NonceUse {
+            kind: self.signer.kind(),
+            signer: &self.signer_id,
+            domain: &self.signer_domain,
+            key_id: &self.key_id,
+            nonce: &self.nonce,
+            signed_at: self.signed_at,
+        }
+    }
 }
 
 impl Verifier {
@@ -229,12 +264,18 @@ impl Verifier {
         req: RequestParts<'_>,
         body: &[u8],
     ) -> Result<Verified, VerifyError> {
+        let pre = self.precheck(req)?;
+        self.complete(pre, req, body).await
+    }
+
+    /// §4.5 steps 1–4, which need no body.
+    pub fn precheck(&self, req: RequestParts<'_>) -> Result<Precheck, VerifyError> {
         // Step 1: header presence (and well-formedness of the signer identity).
         let h = parse_headers(req.headers)?;
 
         // Step 2: the request was addressed to us. The canonical string uses
-        // our configured authority, so a request for another host cannot
-        // verify; checking the Host explicitly gives a clear error first.
+        // our configured authority, so a request for another host could not
+        // verify anyway; checking the Host explicitly fails fast and clearly.
         let host = request_host(req)
             .and_then(|h| Authority::canonicalize(h).ok())
             .ok_or(VerifyError::Authority)?;
@@ -253,75 +294,88 @@ impl Verifier {
             ));
         }
 
-        // Step 4: replay check only. Recording happens after step 7.
-        let kind = h.signer.kind();
-        self.replay
-            .check(
-                Surface::SignedRequest,
-                kind,
-                h.key_id,
-                h.nonce,
-                signed_at,
-                now,
-            )
-            .map_err(replay_error)?;
+        let (signer_id, signer_domain) = match &h.signer {
+            Signer::Actor(a) => (a.to_string(), a.domain().to_string()),
+            Signer::Provider(p) => (p.to_string(), p.to_string()),
+        };
+        let pre = Precheck {
+            signer: h.signer,
+            signer_id,
+            signer_domain,
+            key_id: h.key_id.to_owned(),
+            timestamp: h.timestamp.to_owned(),
+            nonce: h.nonce.to_owned(),
+            digest: h.digest.to_owned(),
+            signature: h.signature.to_owned(),
+            signed_at,
+            now,
+        };
 
+        // Step 4: replay check only. Recording happens after step 7.
+        self.replay
+            .check(Surface::SignedRequest, &pre.nonce_use(), now)
+            .map_err(replay_error)?;
+        Ok(pre)
+    }
+
+    /// §4.5 steps 5–7, then record the nonce. `req` must be the request
+    /// `pre` came from.
+    pub async fn complete(
+        &self,
+        pre: Precheck,
+        req: RequestParts<'_>,
+        body: &[u8],
+    ) -> Result<Verified, VerifyError> {
         // Step 5: body digest.
-        if canonical::content_digest(body) != h.digest {
+        if canonical::content_digest(body) != pre.digest {
             return Err(VerifyError::Digest);
         }
 
         // Steps 6 and 7: resolve the key and verify; on failure re-fetch once
-        // so a freshly rotated key is honoured (§4.6, §8.1).
+        // so a freshly rotated key is honoured (§4.6, §8.1). Resolvers that
+        // fetch remotely rate-limit fresh lookups (see `KeyResolver`).
         let canonical = CanonicalRequest {
             authority: self.authority.as_str(),
             method: req.method.as_str(),
             path: req.uri.path(),
             query: req.uri.query(),
-            timestamp: h.timestamp,
-            nonce: h.nonce,
-            content_digest: h.digest,
+            timestamp: &pre.timestamp,
+            nonce: &pre.nonce,
+            content_digest: &pre.digest,
         }
         .render();
-        let mut outcome = self.try_key(&h, &canonical, false).await;
+        let mut outcome = self.try_key(&pre, &canonical, false).await;
         if outcome.is_err() {
-            outcome = self.try_key(&h, &canonical, true).await;
+            outcome = self.try_key(&pre, &canonical, true).await;
         }
         outcome?;
 
         // Re-check and record atomically.
         self.replay
-            .record(
-                Surface::SignedRequest,
-                kind,
-                h.key_id,
-                h.nonce,
-                signed_at,
-                now,
-            )
+            .record(Surface::SignedRequest, &pre.nonce_use(), pre.now)
             .map_err(replay_error)?;
 
         Ok(Verified {
-            signer: h.signer,
-            key_id: h.key_id.to_owned(),
+            signer: pre.signer,
+            key_id: pre.key_id,
         })
     }
 
     async fn try_key(
         &self,
-        h: &SigHeaders<'_>,
+        pre: &Precheck,
         canonical: &str,
         fresh: bool,
     ) -> Result<(), VerifyError> {
-        let key = match self.keys.resolve(&h.signer, h.key_id, fresh).await {
+        let key = match self.keys.resolve(&pre.signer, &pre.key_id, fresh).await {
             Ok(Some(key)) => key,
             Ok(None) => return Err(VerifyError::UnknownKey),
             Err(e) => {
-                tracing::debug!(error = %e, key_id = h.key_id, "key resolution failed");
+                tracing::debug!(error = %e, key_id = pre.key_id, "key resolution failed");
                 return Err(VerifyError::UnknownKey);
             }
         };
-        if canonical::verify(&key, canonical, h.signature) {
+        if canonical::verify(&key, canonical, &pre.signature) {
             Ok(())
         } else {
             Err(VerifyError::Signature)
@@ -329,11 +383,22 @@ impl Verifier {
     }
 }
 
+/// Borrowed signing headers, straight from the request.
+struct SigHeaders<'a> {
+    signer: Signer,
+    key_id: &'a str,
+    timestamp: &'a str,
+    nonce: &'a str,
+    digest: &'a str,
+    signature: &'a str,
+}
+
 fn replay_error(e: ReplayError) -> VerifyError {
     match e {
         ReplayError::Replayed => VerifyError::Replayed,
         ReplayError::Full { retry_after } => VerifyError::StoreFull { retry_after },
         ReplayError::WarmingUp { retry_after } => VerifyError::WarmingUp { retry_after },
+        ReplayError::RateLimited { retry_after } => VerifyError::RateLimited { retry_after },
     }
 }
 

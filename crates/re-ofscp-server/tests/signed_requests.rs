@@ -3,7 +3,7 @@
 mod common;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -12,7 +12,8 @@ use axum::{Router, middleware};
 use common::{spec_json, vector_key};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use http_body_util::BodyExt;
-use re_ofscp_server::replay::ReplayStore;
+use re_ofscp_server::problem::{self, ProblemBase};
+use re_ofscp_server::replay::{ReplayLimits, ReplayStore};
 use re_ofscp_server::signing::canonical::{CanonicalRequest, content_digest, sign};
 use re_ofscp_server::signing::{
     Authenticated, Clock, KeyFuture, KeyResolver, Signer, StaticKeys, Verifier, authenticate,
@@ -29,6 +30,31 @@ struct FixedClock(OffsetDateTime);
 impl Clock for FixedClock {
     fn now(&self) -> OffsetDateTime {
         self.0
+    }
+}
+
+/// A clock tests can move.
+struct SettableClock(AtomicI64);
+impl SettableClock {
+    fn at(t: OffsetDateTime) -> Arc<Self> {
+        Arc::new(Self(AtomicI64::new(t.unix_timestamp())))
+    }
+    fn set(&self, t: OffsetDateTime) {
+        self.0.store(t.unix_timestamp(), Ordering::SeqCst);
+    }
+}
+impl Clock for SettableClock {
+    fn now(&self) -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(self.0.load(Ordering::SeqCst)).unwrap()
+    }
+}
+
+/// Only the global bound applies.
+fn limits(capacity: usize) -> ReplayLimits {
+    ReplayLimits {
+        capacity,
+        per_signer: usize::MAX,
+        per_remote_domain: usize::MAX,
     }
 }
 
@@ -63,13 +89,14 @@ struct Harness {
     replay: Arc<ReplayStore>,
 }
 
-fn harness_with(keys: Arc<dyn KeyResolver>, now: OffsetDateTime, capacity: usize) -> Harness {
-    // The store's warm-up ended exactly at SIGNED_AT.
+fn harness_with(keys: Arc<dyn KeyResolver>, now: OffsetDateTime, limits: ReplayLimits) -> Harness {
+    // The store began 301 s before SIGNED_AT, so its warm-up covers
+    // timestamps up to SIGNED_AT - 1.
     let replay = Arc::new(ReplayStore::new(
-        capacity,
-        600,
-        SIGNED_AT.unix_timestamp() - 300,
+        limits,
         300,
+        SIGNED_AT.unix_timestamp() - 301,
+        "providera.com",
     ));
     let verifier = Arc::new(Verifier::new(
         provider_a(),
@@ -88,12 +115,16 @@ fn harness_with(keys: Arc<dyn KeyResolver>, now: OffsetDateTime, capacity: usize
                 }
             }),
         )
-        .layer(middleware::from_fn_with_state(verifier, authenticate));
+        .layer(middleware::from_fn_with_state(verifier, authenticate))
+        .layer(middleware::map_response_with_state(
+            ProblemBase::new(&provider_a()),
+            problem::render,
+        ));
     Harness { app, replay }
 }
 
 fn harness() -> Harness {
-    harness_with(Arc::new(alice_keys()), SIGNED_AT, 1000)
+    harness_with(Arc::new(alice_keys()), SIGNED_AT, limits(1000))
 }
 
 /// A request signed like the spec vector, with knobs for breaking it.
@@ -299,7 +330,7 @@ async fn clock_skew_beyond_300s_is_refused() {
     let h = harness_with(
         Arc::new(alice_keys()),
         SIGNED_AT + time::Duration::seconds(301),
-        1000,
+        limits(1000),
     );
     assert_eq!(
         send(&h.app, Req::vector().build()).await.0,
@@ -308,15 +339,15 @@ async fn clock_skew_beyond_300s_is_refused() {
     let h = harness_with(
         Arc::new(alice_keys()),
         SIGNED_AT + time::Duration::seconds(300),
-        1000,
+        limits(1000),
     );
     assert_eq!(send(&h.app, Req::vector().build()).await.0, StatusCode::OK);
 }
 
 #[tokio::test]
 async fn requests_during_restart_warm_up_get_503_with_retry_after() {
-    // The store's warm-up ends at SIGNED_AT; a request timestamped one second
-    // earlier may have been recorded by a previous process.
+    // The store's warm-up covers timestamps up to SIGNED_AT - 1; such a
+    // request may have been recorded by a previous process.
     let h = harness();
     let mut r = Req::vector();
     r.timestamp = "2026-01-01T11:59:59Z".into();
@@ -334,7 +365,8 @@ async fn production_state_warms_up_for_one_skew_window() {
         _ => None,
     })
     .unwrap();
-    // Started exactly when the vector was signed: inside the warm-up.
+    // Started exactly when the vector was signed: inside the warm-up, which
+    // covers timestamps up to start + 300 inclusive.
     let state = re_ofscp_server::AppState::with_clock(
         config,
         Arc::new(alice_keys()),
@@ -343,21 +375,105 @@ async fn production_state_warms_up_for_one_skew_window() {
     let app = re_ofscp_server::router(state);
     let mut req = Req::vector().build();
     *req.uri_mut() = "/api/health".parse().unwrap();
-    let (status, _, _, retry) = send(&app, req).await;
+    let (status, json, _, retry) = send(&app, req).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(retry.as_deref(), Some("300"));
+    assert_eq!(retry.as_deref(), Some("301"));
+    assert_eq!(
+        json["type"],
+        "https://providera.com/problems/service_unavailable"
+    );
 }
 
 #[tokio::test]
 async fn full_replay_store_fails_closed_with_503() {
-    let h = harness_with(Arc::new(alice_keys()), SIGNED_AT, 1);
+    let h = harness_with(Arc::new(alice_keys()), SIGNED_AT, limits(1));
     assert_eq!(send(&h.app, Req::vector().build()).await.0, StatusCode::OK);
     let mut r = Req::vector();
     r.nonce = "another-nonce-0123456789".into();
     let (status, json, _, retry) = send(&h.app, r.build()).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(json["errorCode"], "service_unavailable");
-    assert_eq!(retry.as_deref(), Some("600"));
+    // The vector's nonce expires at SIGNED_AT + 301.
+    assert_eq!(retry.as_deref(), Some("301"));
+}
+
+#[tokio::test]
+async fn one_signer_over_its_share_gets_429_not_everyone_503() {
+    let h = harness_with(
+        Arc::new(alice_keys()),
+        SIGNED_AT,
+        ReplayLimits {
+            capacity: 1000,
+            per_signer: 1,
+            per_remote_domain: 1000,
+        },
+    );
+    assert_eq!(send(&h.app, Req::vector().build()).await.0, StatusCode::OK);
+    let mut r = Req::vector();
+    r.nonce = "another-nonce-0123456789".into();
+    let (status, json, _, retry) = send(&h.app, r.build()).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(json["errorCode"], "too_many_requests");
+    assert_eq!(retry.as_deref(), Some("301"));
+    // A provider signature is a different signer and still gets through.
+    let mut p = Req::vector();
+    p.identity = ("x-ofscp-provider", "providera.com".into());
+    p.nonce = "provider-nonce-0123456789".into();
+    assert_eq!(send(&h.app, p.build()).await.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn replay_refused_through_the_last_acceptable_second() {
+    // Signed 300 s ahead of the clock: acceptable until SIGNED_AT + 600.
+    let clock = SettableClock::at(SIGNED_AT);
+    let replay = Arc::new(ReplayStore::new(
+        limits(1000),
+        300,
+        SIGNED_AT.unix_timestamp() - 301,
+        "providera.com",
+    ));
+    let verifier = Arc::new(Verifier::new(
+        provider_a(),
+        300,
+        replay,
+        Arc::new(alice_keys()),
+        clock.clone(),
+    ));
+    let app = Router::new()
+        .route(PATH, post(|_: Authenticated| async { "ok" }))
+        .layer(middleware::from_fn_with_state(verifier, authenticate));
+    let mut r = Req::vector();
+    r.timestamp = "2026-01-01T12:05:00Z".into();
+    assert_eq!(send(&app, r.build()).await.0, StatusCode::OK);
+    for at in [599, 600] {
+        clock.set(SIGNED_AT + time::Duration::seconds(at));
+        assert_eq!(
+            send(&app, r.build()).await.0,
+            StatusCode::UNAUTHORIZED,
+            "replayed at +{at}s"
+        );
+    }
+    // At +601 the timestamp itself is too old.
+    clock.set(SIGNED_AT + time::Duration::seconds(601));
+    assert_eq!(send(&app, r.build()).await.0, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn cheap_checks_run_before_the_body_is_read() {
+    // A half-signed request with an oversized body is refused for its
+    // headers (401), not for its size (413): the body was never buffered.
+    let h = harness();
+    let req = Request::post(PATH)
+        .header("host", "providera.com")
+        .header("x-ofscp-nonce", "abc")
+        .body(Body::from(
+            "x".repeat(re_ofscp_server::signing::MAX_SIGNED_BODY + 1),
+        ))
+        .unwrap();
+    let (status, json, _, _) = send(&h.app, req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(json["errorCode"], "unauthorized");
+    assert_eq!(json["type"], "https://providera.com/problems/unauthorized");
 }
 
 #[tokio::test]
@@ -374,7 +490,7 @@ async fn provider_signed_request_uses_its_own_replay_namespace() {
 
 #[tokio::test]
 async fn unknown_key_is_401() {
-    let h = harness_with(Arc::new(StaticKeys::default()), SIGNED_AT, 1000);
+    let h = harness_with(Arc::new(StaticKeys::default()), SIGNED_AT, limits(1000));
     let (status, json, _, _) = send(&h.app, Req::vector().build()).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(json["detail"], "unknown or revoked key");
@@ -413,7 +529,7 @@ async fn stale_cache_is_refreshed_once_before_rejecting() {
         key: key().verifying_key(),
         fresh_calls: AtomicUsize::new(0),
     });
-    let h = harness_with(keys.clone(), SIGNED_AT, 1000);
+    let h = harness_with(keys.clone(), SIGNED_AT, limits(1000));
     assert_eq!(send(&h.app, Req::vector().build()).await.0, StatusCode::OK);
     assert_eq!(keys.fresh_calls.load(Ordering::SeqCst), 1);
 }
@@ -426,14 +542,15 @@ async fn production_router_rejects_signed_requests_it_cannot_verify() {
         _ => None,
     })
     .unwrap();
-    // Started 300 s before signing (the request is 300 s ahead, the most
-    // skew allows), so the warm-up ends exactly at SIGNED_AT and step 6 is
+    // Started well before signing, so the warm-up is over and step 6 is
     // reached.
+    let clock = SettableClock::at(SIGNED_AT - time::Duration::seconds(301));
     let state = re_ofscp_server::AppState::with_clock(
         config,
         Arc::new(StaticKeys::default()),
-        Arc::new(FixedClock(SIGNED_AT - time::Duration::seconds(300))),
+        clock.clone(),
     );
+    clock.set(SIGNED_AT);
     let app = re_ofscp_server::router(state);
     let mut req = Req::vector().build();
     *req.uri_mut() = "/api/health".parse().unwrap();

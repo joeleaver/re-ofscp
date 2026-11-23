@@ -1,31 +1,41 @@
-# 0002: Problem `type` URIs mirror Forumall; `errorCode` is the interop key
+# 0002: Error responses: `errorCode` registry and per-provider `type` URIs
 
-- **Status:** accepted. The shared base is pending a Joe and Seth decision.
+- **Status:** accepted
 - **Date:** 2026-11-23
-- **Spec:** §2.6, §7.3; [lost-conn/ofscp#17](https://github.com/lost-conn/ofscp/pull/17) (open)
+- **Spec:** §2.6, §7.3, from
+  [lost-conn/ofscp#17](https://github.com/lost-conn/ofscp/pull/17) (merged)
 
 ## Context
 
-The spec requires `type` to be a stable https URI, but it names no base and
-no list of values. A client that branched on `type` would behave differently
-from one provider to the next.
+The spec used to require `type` to be "a stable https URI" without saying
+which one. Forumall used `https://ofscp.org/problems/…`, a domain nobody
+owns. When asked, the oracle first passed the question to Joe and Seth. Joe
+pushed back, since what a field contains is the spec's job to settle, and
+the spec now does.
 
-## Decision
+## Decision (as the spec now says)
 
-These points come from the OFSCP oracle's answer.
+- **`errorCode`:** every problem response carries one, from the §7.3
+  registry: `bad_request`, `unauthorized`, `forbidden`, `not_found`,
+  `conflict`, `subscription_limit` (409), `payload_too_large`,
+  `too_many_requests`, `internal_error` and `service_unavailable`. Clients
+  branch on `status` plus `errorCode`, never on `type`.
+- **`type`:** set to `https://{our canonical DOMAIN}/problems/{errorCode}`,
+  with the code verbatim (underscores included). `GET /problems/{code}`
+  serves a plain-text description, as the spec says we SHOULD.
+- **Extension codes:** these are allowed when paired with their status. We
+  use one, `method_not_allowed` (405), for a known path called with the
+  wrong method.
 
-- **`errorCode` is the key clients use.** It will be REQUIRED, and it comes
-  from a registered snake_case list keyed to the §7.3 status table:
-  `bad_request`, `unauthorized`, `forbidden`, `not_found`, `conflict`,
-  `payload_too_large`, `too_many_requests`, `internal_error` and
-  `service_unavailable`. Clients branch on `status` plus `errorCode`, never
-  on `type`. The WebSocket `error` event's `code` uses the same list.
-- **`type` is opaque to clients.** We mint `https://ofscp.org/problems/<slug>`,
-  the same base Forumall uses (`crates/re-ofscp-server/src/problem.rs`).
+## Implementation
 
-## Open question (needs Joe and Seth)
-
-Should `https://ofscp.org/problems/<errorCode>` become the blessed shared base?
-That only makes sense if someone owns ofscp.org. Until it's decided we keep
-mirroring Forumall. That's harmless, and it already matches if the base is
-blessed.
+- **Where:** `crates/re-ofscp-server/src/problem.rs`.
+- **How the URL gets our domain:** a `Problem` doesn't know the domain, so
+  its `IntoResponse` sets the status and headers and stores itself in the
+  response. The `problem::render` layer, installed once on the router, then
+  writes the JSON body.
+- **Unknown routes:** they return a `not_found` problem, and wrong methods
+  return `method_not_allowed`.
+- **Tests:** `tests/problems.rs` validates real responses against the spec's
+  `problem-details.json` schema, and checks that the schema really rejects
+  the old shape.

@@ -1,95 +1,206 @@
 //! RFC 7807 `application/problem+json` errors (spec §2.6, §7.3).
 //!
-//! `type` URIs are minted under the same `https://ofscp.org/problems/` base
-//! the reference implementation uses, so clients that key on `type` see the
-//! same values from either implementation; clients treat `type` as opaque.
-//! Every problem carries an `errorCode` from the registered list. Clients
-//! branch on `status` + `errorCode` (lost-conn/ofscp#17, open).
+//! * Every problem carries an `errorCode` from the registry in §7.3. That is
+//!   the cross-provider identifier clients branch on (with `status`).
+//! * `type` is `https://{our canonical authority}/problems/{errorCode}`
+//!   (§2.6), and [`describe`] serves a human-readable page at that URL.
+//!
+//! Handlers return [`Problem`] values. Because `type` depends on the
+//! configured authority, a `Problem` turns into a response in two steps: its
+//! `IntoResponse` sets the status and headers and stashes itself in the
+//! response extensions, and the [`render`] layer, installed once on the
+//! router, writes the JSON body. A response that bypassed the layer would
+//! have an empty body, which the router tests guard against.
 
+use std::sync::Arc;
+
+use axum::body::Body;
+use axum::extract::{Path, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use re_ofscp_types::Authority;
 use serde::Serialize;
-
-/// Base for problem `type` URIs.
-pub const PROBLEM_TYPE_BASE: &str = "https://ofscp.org/problems/";
 
 /// Content type of every error response.
 pub const PROBLEM_CONTENT_TYPE: &str = "application/problem+json";
 
+/// One registered error code (§7.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ErrorCode {
+    /// The `errorCode` value.
+    pub code: &'static str,
+    /// The HTTP status it pairs with.
+    pub status: u16,
+    /// The `title`.
+    pub title: &'static str,
+    /// Served at the `type` URL.
+    pub description: &'static str,
+}
+
+// The §7.3 registry, one constant per code.
+/// `bad_request`.
+pub const BAD_REQUEST: ErrorCode = ErrorCode {
+    code: "bad_request",
+    status: 400,
+    title: "Bad Request",
+    description: "The request was malformed, failed schema validation, or its body did not match X-OFSCP-Content-Digest.",
+};
+/// `unauthorized`.
+pub const UNAUTHORIZED: ErrorCode = ErrorCode {
+    code: "unauthorized",
+    status: 401,
+    title: "Unauthorized",
+    description: "The request was not signed, or its signature, key, timestamp or nonce did not verify.",
+};
+/// `forbidden`.
+pub const FORBIDDEN: ErrorCode = ErrorCode {
+    code: "forbidden",
+    status: 403,
+    title: "Forbidden",
+    description: "The signer is authenticated but not allowed to do this.",
+};
+/// `not_found`.
+pub const NOT_FOUND: ErrorCode = ErrorCode {
+    code: "not_found",
+    status: 404,
+    title: "Not Found",
+    description: "No such resource, or the signer may not know that it exists.",
+};
+/// `conflict`.
+pub const CONFLICT: ErrorCode = ErrorCode {
+    code: "conflict",
+    status: 409,
+    title: "Conflict",
+    description: "The request conflicts with current state, for example a duplicate clientMessageId.",
+};
+/// `subscription_limit`.
+pub const SUBSCRIPTION_LIMIT: ErrorCode = ErrorCode {
+    code: "subscription_limit",
+    status: 409,
+    title: "Subscription Limit",
+    description: "The connection already holds the maximum number of subscriptions; unsubscribe first. Waiting does not help.",
+};
+/// `payload_too_large`.
+pub const PAYLOAD_TOO_LARGE: ErrorCode = ErrorCode {
+    code: "payload_too_large",
+    status: 413,
+    title: "Payload Too Large",
+    description: "The request body exceeds this provider's limit.",
+};
+/// `too_many_requests`.
+pub const TOO_MANY_REQUESTS: ErrorCode = ErrorCode {
+    code: "too_many_requests",
+    status: 429,
+    title: "Too Many Requests",
+    description: "Rate limited. Wait for Retry-After seconds; signed requests must be re-signed with a fresh timestamp and nonce.",
+};
+/// `internal_error`.
+pub const INTERNAL_ERROR: ErrorCode = ErrorCode {
+    code: "internal_error",
+    status: 500,
+    title: "Internal Server Error",
+    description: "The provider failed unexpectedly.",
+};
+/// `service_unavailable`.
+pub const SERVICE_UNAVAILABLE: ErrorCode = ErrorCode {
+    code: "service_unavailable",
+    status: 503,
+    title: "Service Unavailable",
+    description: "Temporarily unavailable (for example warming up after a restart). Wait for Retry-After seconds, then re-sign with a fresh timestamp and nonce and retry.",
+};
+
+/// Extension code (§7.3 allows extensions paired with their status): the
+/// resource exists but not with this method.
+pub const METHOD_NOT_ALLOWED: ErrorCode = ErrorCode {
+    code: "method_not_allowed",
+    status: 405,
+    title: "Method Not Allowed",
+    description: "The resource exists but does not support this HTTP method.",
+};
+
+/// Codes this provider uses beyond the registry.
+pub const EXTENSIONS: &[ErrorCode] = &[METHOD_NOT_ALLOWED];
+
+/// Every registered code (§7.3).
+pub const REGISTRY: &[ErrorCode] = &[
+    BAD_REQUEST,
+    UNAUTHORIZED,
+    FORBIDDEN,
+    NOT_FOUND,
+    CONFLICT,
+    SUBSCRIPTION_LIMIT,
+    PAYLOAD_TOO_LARGE,
+    TOO_MANY_REQUESTS,
+    INTERNAL_ERROR,
+    SERVICE_UNAVAILABLE,
+];
+
+/// Look up a registered or extension code.
+pub fn lookup(code: &str) -> Option<&'static ErrorCode> {
+    REGISTRY.iter().chain(EXTENSIONS).find(|c| c.code == code)
+}
+
 /// A problem response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Problem {
-    status: StatusCode,
-    slug: &'static str,
-    title: &'static str,
+    code: &'static ErrorCode,
     detail: Option<String>,
     retry_after: Option<u64>,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct Body<'a> {
-    #[serde(rename = "type")]
-    kind: String,
-    title: &'a str,
-    status: u16,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    detail: Option<&'a str>,
-    error_code: &'a str,
-}
-
 impl Problem {
-    const fn new(status: StatusCode, slug: &'static str, title: &'static str) -> Self {
+    const fn new(code: &'static ErrorCode) -> Self {
         Self {
-            status,
-            slug,
-            title,
+            code,
             detail: None,
             retry_after: None,
         }
     }
 
-    /// 400.
-    pub const fn bad_request() -> Self {
-        Self::new(StatusCode::BAD_REQUEST, "bad_request", "Bad Request")
+    /// 400 `bad_request`.
+    pub fn bad_request() -> Self {
+        Self::new(&BAD_REQUEST)
     }
-    /// 401.
-    pub const fn unauthorized() -> Self {
-        Self::new(StatusCode::UNAUTHORIZED, "unauthorized", "Unauthorized")
+    /// 401 `unauthorized`.
+    pub fn unauthorized() -> Self {
+        Self::new(&UNAUTHORIZED)
     }
-    /// 403.
-    pub const fn forbidden() -> Self {
-        Self::new(StatusCode::FORBIDDEN, "forbidden", "Forbidden")
+    /// 403 `forbidden`.
+    pub fn forbidden() -> Self {
+        Self::new(&FORBIDDEN)
     }
-    /// 404.
-    pub const fn not_found() -> Self {
-        Self::new(StatusCode::NOT_FOUND, "not_found", "Not Found")
+    /// 404 `not_found`.
+    pub fn not_found() -> Self {
+        Self::new(&NOT_FOUND)
     }
-    /// 413.
-    pub const fn payload_too_large() -> Self {
-        Self::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "payload_too_large",
-            "Payload Too Large",
-        )
+    /// 405 `method_not_allowed` (extension code).
+    pub fn method_not_allowed() -> Self {
+        Self::new(&METHOD_NOT_ALLOWED)
     }
-    /// 500. The detail is never shown to the client; log the cause instead.
-    pub const fn internal() -> Self {
-        Self::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal_error",
-            "Internal Server Error",
-        )
+    /// 409 `conflict`.
+    pub fn conflict() -> Self {
+        Self::new(&CONFLICT)
     }
-    /// 503 with `Retry-After` in seconds.
-    pub const fn service_unavailable(retry_after_secs: u64) -> Self {
-        let mut p = Self::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "service_unavailable",
-            "Service Unavailable",
-        );
-        p.retry_after = Some(retry_after_secs);
-        p
+    /// 413 `payload_too_large`.
+    pub fn payload_too_large() -> Self {
+        Self::new(&PAYLOAD_TOO_LARGE)
+    }
+    /// 429 `too_many_requests` with `Retry-After`.
+    pub fn too_many_requests(retry_after_secs: u64) -> Self {
+        Self::new(&TOO_MANY_REQUESTS).retry_after(retry_after_secs)
+    }
+    /// 500 `internal_error`. Log the cause; never put it in the detail.
+    pub fn internal() -> Self {
+        Self::new(&INTERNAL_ERROR)
+    }
+    /// 503 `service_unavailable` with `Retry-After`.
+    pub fn service_unavailable(retry_after_secs: u64) -> Self {
+        Self::new(&SERVICE_UNAVAILABLE).retry_after(retry_after_secs)
+    }
+
+    fn retry_after(mut self, secs: u64) -> Self {
+        self.retry_after = Some(secs);
+        self
     }
 
     /// Attach a human-readable explanation.
@@ -101,12 +212,12 @@ impl Problem {
 
     /// The HTTP status.
     pub fn status(&self) -> StatusCode {
-        self.status
+        StatusCode::from_u16(self.code.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
     }
 
-    /// The `errorCode` / slug.
+    /// The `errorCode`.
     pub fn code(&self) -> &'static str {
-        self.slug
+        self.code.code
     }
 
     /// The `detail`, if any.
@@ -117,15 +228,7 @@ impl Problem {
 
 impl IntoResponse for Problem {
     fn into_response(self) -> Response {
-        let body = Body {
-            kind: format!("{PROBLEM_TYPE_BASE}{}", self.slug.replace('_', "-")),
-            title: self.title,
-            status: self.status.as_u16(),
-            detail: self.detail.as_deref(),
-            error_code: self.slug,
-        };
-        let bytes = serde_json::to_vec(&body).unwrap_or_default();
-        let mut res = (self.status, bytes).into_response();
+        let mut res = self.status().into_response();
         let headers = res.headers_mut();
         headers.insert(
             header::CONTENT_TYPE,
@@ -134,34 +237,119 @@ impl IntoResponse for Problem {
         if let Some(secs) = self.retry_after {
             headers.insert(header::RETRY_AFTER, HeaderValue::from(secs));
         }
+        res.extensions_mut().insert(self);
         res
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProblemJson<'a> {
+    #[serde(rename = "type")]
+    kind: String,
+    title: &'a str,
+    status: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<&'a str>,
+    error_code: &'a str,
+}
+
+/// Where `type` URIs point: `https://{authority}/problems/`.
+#[derive(Debug, Clone)]
+pub struct ProblemBase(Arc<str>);
+
+impl ProblemBase {
+    /// The base for this provider.
+    pub fn new(authority: &Authority) -> Self {
+        Self(Arc::from(format!("https://{authority}/problems/")))
+    }
+
+    /// The `type` URI for `code`.
+    pub fn type_uri(&self, code: &str) -> String {
+        format!("{}{code}", self.0)
+    }
+}
+
+/// Response layer: writes the body of every [`Problem`] response.
+/// Install with `axum::middleware::map_response_with_state`.
+pub async fn render(State(base): State<ProblemBase>, mut res: Response) -> Response {
+    let Some(problem) = res.extensions_mut().remove::<Problem>() else {
+        return res;
+    };
+    let body = ProblemJson {
+        kind: base.type_uri(problem.code()),
+        title: problem.code.title,
+        status: problem.code.status,
+        detail: problem.detail(),
+        error_code: problem.code(),
+    };
+    let bytes = serde_json::to_vec(&body).unwrap_or_default();
+    res.headers_mut().remove(header::CONTENT_LENGTH);
+    *res.body_mut() = Body::from(bytes);
+    res
+}
+
+/// `GET /problems/{errorCode}`: a plain-text description of a registered
+/// code (§2.6 SHOULD), `404` otherwise.
+pub async fn describe(Path(code): Path<String>) -> Response {
+    match lookup(&code) {
+        Some(c) => (
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            format!(
+                "{} ({} {})\n\n{}\n",
+                c.code, c.status, c.title, c.description
+            ),
+        )
+            .into_response(),
+        None => Problem::not_found()
+            .with_detail("no such error code")
+            .into_response(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http_body_util::BodyExt;
 
-    #[tokio::test]
-    async fn renders_problem_json() {
-        let res = Problem::service_unavailable(30)
-            .with_detail("replay store full")
-            .into_response();
-        assert_eq!(res.status(), 503);
-        assert_eq!(res.headers()[header::CONTENT_TYPE], PROBLEM_CONTENT_TYPE);
-        assert_eq!(res.headers()[header::RETRY_AFTER], "30");
-        let body = res.into_body().collect().await.unwrap().to_bytes();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    #[test]
+    fn every_constructor_is_registered() {
+        for p in [
+            Problem::bad_request(),
+            Problem::unauthorized(),
+            Problem::forbidden(),
+            Problem::not_found(),
+            Problem::method_not_allowed(),
+            Problem::conflict(),
+            Problem::payload_too_large(),
+            Problem::too_many_requests(1),
+            Problem::internal(),
+            Problem::service_unavailable(1),
+        ] {
+            let c = lookup(p.code()).unwrap();
+            assert_eq!(p.status().as_u16(), c.status);
+        }
+        assert_eq!(Problem::internal().code(), "internal_error");
+    }
+
+    #[test]
+    fn registry_codes_are_snake_case_and_unique() {
+        let all: Vec<_> = REGISTRY.iter().chain(EXTENSIONS).collect();
+        for (i, c) in all.iter().enumerate() {
+            assert!(
+                c.code
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            );
+            assert!(all[i + 1..].iter().all(|o| o.code != c.code));
+        }
+    }
+
+    #[test]
+    fn type_uri_uses_our_authority_and_the_code_verbatim() {
+        let base = ProblemBase::new(&Authority::parse_canonical("social.example").unwrap());
         assert_eq!(
-            v,
-            serde_json::json!({
-                "type": "https://ofscp.org/problems/service-unavailable",
-                "title": "Service Unavailable",
-                "status": 503,
-                "detail": "replay store full",
-                "errorCode": "service_unavailable",
-            })
+            base.type_uri("service_unavailable"),
+            "https://social.example/problems/service_unavailable"
         );
     }
 }
