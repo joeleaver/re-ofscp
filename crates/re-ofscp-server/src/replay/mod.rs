@@ -89,6 +89,17 @@ pub struct NonceUse<'a> {
     pub signed_at: i64,
 }
 
+/// What [`ReplayStore::record`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Recorded {
+    /// When the entry expires (unix seconds).
+    pub expires: i64,
+    /// The store clock the use was judged by (never behind any earlier
+    /// decision). The ledger compares expiries against this, not a raw
+    /// wall-clock reading.
+    pub clock: i64,
+}
+
 /// Size limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReplayLimits {
@@ -450,9 +461,14 @@ impl ReplayStore {
 
     /// After the signature verified: atomically re-check freshness and
     /// replay, and record. Pass a fresh clock reading; the store also never
-    /// lets its clock run backwards (see `Inner::high_water`). Returns when
-    /// the entry expires (unix seconds), for the persistent ledger.
-    pub fn record(&self, surface: Surface, u: &NonceUse<'_>, now: i64) -> Result<i64, ReplayError> {
+    /// lets its clock run backwards (see `Inner::high_water`). Returns the
+    /// entry's expiry and the store clock it was judged by, for the ledger.
+    pub fn record(
+        &self,
+        surface: Surface,
+        u: &NonceUse<'_>,
+        now: i64,
+    ) -> Result<Recorded, ReplayError> {
         self.warm_up(surface, u, now)?;
         let mut inner = self.lock();
         let now = inner.advance(now);
@@ -465,7 +481,10 @@ impl ReplayStore {
         // gone at the second after; that is always later than `now`.
         let expires = u.signed_at + self.skew_secs + 1;
         self.insert(&mut inner, u, expires);
-        Ok(expires)
+        Ok(Recorded {
+            expires,
+            clock: now,
+        })
     }
 
     /// Insert `u` expiring at `expires`, with all bookkeeping.

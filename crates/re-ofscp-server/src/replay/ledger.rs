@@ -192,10 +192,9 @@ struct ClockRow {
     high_water: String,
 }
 
+/// Any row (only its existence matters).
 #[derive(Deserialize)]
-struct ExpiryRow {
-    expires_at: String,
-}
+struct Exists {}
 
 fn unix(rfc3339: &str) -> Result<i64, LedgerError> {
     OffsetDateTime::parse(rfc3339, &Rfc3339)
@@ -245,6 +244,7 @@ impl RhypeLedger {
 
     /// The persisted replay clock, if any.
     async fn read_clock(&self) -> Result<Option<(u64, i64)>, LedgerError> {
+        // (id, high_water)
         let q = Ql::new("ReplayClock.filter(.name == ")
             .str(CLOCK_NAME)
             .raw(")");
@@ -255,33 +255,42 @@ impl RhypeLedger {
         }
     }
 
-    /// Persist the replay clock as at least `clock` (never lowering it).
+    /// Persist the replay clock as at least `clock` (never lowering it). The
+    /// raise is one conditional update, so concurrent writers can never
+    /// lower it.
     async fn advance_clock(&self, clock: i64) -> Result<(), LedgerError> {
-        // Two attempts: if the row is created concurrently between our read
-        // and our create, the second pass raises that row instead.
         for _ in 0..2 {
-            match self.read_clock().await? {
-                Some((_, saved)) if saved >= clock => return Ok(()),
-                Some((id, _)) => {
-                    let q = Ql::new("ReplayClock.get(")
-                        .uint(id)
-                        .raw(").update({ high_water: ")
-                        .unix_seconds(clock)
-                        .raw(" })");
-                    return self.db.execute(&q).await.map_err(unavailable);
-                }
-                None => {
-                    let q = Ql::new("ReplayClock.create({ name: ")
-                        .str(CLOCK_NAME)
-                        .raw(", high_water: ")
-                        .unix_seconds(clock)
-                        .raw(" })");
-                    match self.db.execute(&q).await {
-                        Ok(()) => return Ok(()),
-                        Err(DbError::Conflict(_)) => continue,
-                        Err(e) => return Err(unavailable(e)),
-                    }
-                }
+            let q = Ql::new("ReplayClock.filter(.name == ")
+                .str(CLOCK_NAME)
+                .raw(" && .high_water < ")
+                .unix_seconds(clock)
+                .raw(").update({ high_water: ")
+                .unix_seconds(clock)
+                .raw(" })");
+            if !self
+                .db
+                .write_rows(&q)
+                .await
+                .map_err(unavailable)?
+                .into_objects()
+                .is_empty()
+            {
+                return Ok(());
+            }
+            if self.read_clock().await?.is_some() {
+                // Already at or past `clock`.
+                return Ok(());
+            }
+            let q = Ql::new("ReplayClock.create({ name: ")
+                .str(CLOCK_NAME)
+                .raw(", high_water: ")
+                .unix_seconds(clock)
+                .raw(" })");
+            match self.db.execute(&q).await {
+                Ok(()) => return Ok(()),
+                // Created concurrently: raise that row on the next pass.
+                Err(DbError::Conflict(_)) => continue,
+                Err(e) => return Err(unavailable(e)),
             }
         }
         Err(LedgerError::Unavailable(
@@ -301,28 +310,53 @@ impl NonceLedger for RhypeLedger {
             }
             // Same identity already stored. Live: a replay. Expired but not
             // yet purged (a client reusing a nonce after its window, which
-            // §4.5 permits): replace it.
-            let q = Ql::new("ReplayNonce.filter(.key == ").str(&key).raw(")");
-            let rows = self.db.fetch::<ExpiryRow>(&q).await.map_err(unavailable)?;
-            let expired = match rows.first() {
-                Some(r) => unix(&r.data.expires_at)? <= now,
-                // Purged between the two queries: try again below.
-                None => true,
-            };
-            if !expired {
-                return Err(LedgerError::Duplicate);
+            // §4.5 permits): overwrite it in place, in one conditional
+            // update, so there is never a moment without a row covering
+            // this identity (a delete-then-create could lose it to a crash
+            // or a failed create, and a restart would then reopen it).
+            for _ in 0..2 {
+                let q = Ql::new("ReplayNonce.filter(.key == ")
+                    .str(&key)
+                    .raw(" && .expires_at <= ")
+                    .unix_seconds(now)
+                    .raw(").update({ signer: ")
+                    .str(&n.signer)
+                    .raw(", domain: ")
+                    .str(&n.domain)
+                    .raw(", signed_at: ")
+                    .unix_seconds(n.signed_at)
+                    .raw(", expires_at: ")
+                    .unix_seconds(n.expires)
+                    .raw(" })");
+                let replaced = self
+                    .db
+                    .write_rows(&q)
+                    .await
+                    .map_err(unavailable)?
+                    .into_objects();
+                if !replaced.is_empty() {
+                    return Ok(());
+                }
+                // Nothing expired to overwrite: either the row is live (a
+                // replay) or it was purged since our create failed.
+                let q = Ql::new("ReplayNonce.filter(.key == ").str(&key).raw(")");
+                if !self
+                    .db
+                    .fetch::<Exists>(&q)
+                    .await
+                    .map_err(unavailable)?
+                    .is_empty()
+                {
+                    return Err(LedgerError::Duplicate);
+                }
+                match self.create(n, &key).await {
+                    Ok(()) => return Ok(()),
+                    // Recreated concurrently: look again.
+                    Err(DbError::Conflict(_)) => continue,
+                    Err(e) => return Err(unavailable(e)),
+                }
             }
-            let q = Ql::new("ReplayNonce.filter(.key == ")
-                .str(&key)
-                .raw(" && .expires_at <= ")
-                .unix_seconds(now)
-                .raw(").delete()");
-            self.db.execute(&q).await.map_err(unavailable)?;
-            match self.create(n, &key).await {
-                Ok(()) => Ok(()),
-                Err(DbError::Conflict(_)) => Err(LedgerError::Duplicate),
-                Err(e) => Err(unavailable(e)),
-            }
+            Err(LedgerError::Duplicate)
         })
     }
 
@@ -382,7 +416,7 @@ impl NonceLedger for RhypeLedger {
                     .raw(").limit(1)");
                 if self
                     .db
-                    .fetch::<ExpiryRow>(&probe)
+                    .fetch::<Exists>(&probe)
                     .await
                     .map_err(unavailable)?
                     .is_empty()

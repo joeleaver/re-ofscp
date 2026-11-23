@@ -378,7 +378,7 @@ impl Verifier {
         // freshness under its lock on a clock that never runs backwards, so
         // a slow or stale copy cannot record a nonce a sibling already used.
         let now = self.clock.now().unix_timestamp();
-        let expires = self
+        let recorded = self
             .replay
             .record(Surface::SignedRequest, &pre.nonce_use(), now)
             .map_err(replay_error)?;
@@ -387,7 +387,10 @@ impl Verifier {
         // this fails, so the nonce remains burned either way.
         match self
             .ledger
-            .persist(&StoredNonce::from_use(&pre.nonce_use(), expires), now)
+            .persist(
+                &StoredNonce::from_use(&pre.nonce_use(), recorded.expires),
+                recorded.clock,
+            )
             .await
         {
             Ok(()) => {}

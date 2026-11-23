@@ -8,8 +8,12 @@
 //! When one connection breaks, every pooled connection is discarded: the
 //! usual cause is a database restart, which leaves all of them stale.
 //! Reads ([`Db::fetch`], [`Db::one`], [`Db::ping`]) are retried once on a
-//! fresh connection. Writes ([`Db::execute`]) are never retried: after an I/O
-//! error their outcome is unknown, and the caller decides what is safe.
+//! fresh connection. Writes ([`Db::execute`], [`Db::write_one`],
+//! [`Db::write_rows`]) are not retried after a failure mid-exchange: their
+//! outcome is unknown, and the caller decides what is safe. A connection
+//! found *already* closed (nothing was sent on it) is replaced and the query
+//! sent once more, for writes too. Every round trip runs in its own task, so
+//! a cancelled caller cannot poison a connection.
 
 pub mod ql;
 
@@ -145,12 +149,26 @@ impl Db {
     /// clears the whole pool, since the database is down or restarted.
     async fn client(&self) -> Result<(usize, Arc<AsyncClient>), DbError> {
         let slot = self.next.fetch_add(1, Ordering::Relaxed) % self.slots.len();
+        self.client_at(slot).await
+    }
+
+    /// As [`Db::client`], for a given slot.
+    async fn client_at(&self, slot: usize) -> Result<(usize, Arc<AsyncClient>), DbError> {
         let mut guard = self.slots[slot].lock().await;
         if let Some(p) = guard.as_mut() {
             let idle = p.last_used.elapsed() >= self.config.liveness_after;
             p.last_used = Instant::now();
             let client = p.client.clone();
-            if !idle || client.ping().await.is_ok() {
+            if !idle {
+                return Ok((slot, client));
+            }
+            // The liveness ping runs in its own task too, so a cancelled
+            // caller cannot leave this connection half-way through it.
+            let pinger = client.clone();
+            let alive = tokio::spawn(async move { pinger.ping().await })
+                .await
+                .is_ok_and(|r| r.is_ok());
+            if alive {
                 return Ok((slot, client));
             }
             *guard = None;
@@ -209,8 +227,13 @@ impl Db {
     /// A connection found already closed is replaced and the query sent
     /// once more, even for a write: nothing was sent on it.
     async fn query_once(&self, q: &Ql) -> Result<QueryResult, DbError> {
-        for _ in 0..2 {
-            let (slot, client) = self.client().await?;
+        let (mut slot, mut client) = self.client().await?;
+        for attempt in 0..2 {
+            if attempt > 0 {
+                // Reconnect the same slot (just discarded), not the next one,
+                // which might be latched closed too.
+                (slot, client) = self.client_at(slot).await?;
+            }
             let text = q.as_str().to_owned();
             let task_client = client.clone();
             let outcome = tokio::spawn(async move { task_client.query(&text).await }).await;
@@ -299,9 +322,17 @@ impl Db {
         }
     }
 
-    /// Run a write (`create`, `update`, `delete`, `link`). Never retried.
+    /// Run a write (`create`, `update`, `delete`, `link`). Not retried
+    /// after a failure mid-exchange.
     pub async fn execute(&self, q: &Ql) -> Result<(), DbError> {
         self.query_once(q).await.map(|_| ())
+    }
+
+    /// Run a write and return what it returned (an `update` returns the
+    /// objects it changed, so an empty result means nothing matched). Not
+    /// retried after a failure mid-exchange.
+    pub async fn write_rows(&self, q: &Ql) -> Result<QueryResult, DbError> {
+        self.query_once(q).await
     }
 
     /// Whether the database answers a ping (retried once, like a read).

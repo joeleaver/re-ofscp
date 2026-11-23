@@ -347,9 +347,18 @@ async fn an_expired_unpurged_row_is_replaced_not_a_replay() {
         ledger.persist(&again, 900).await,
         Err(LedgerError::Duplicate)
     );
+    #[derive(Deserialize)]
+    struct Any {}
+    let db = db(&server);
+    let before = db.fetch::<Any>(&Ql::new("ReplayNonce")).await.unwrap();
     // Expired at 1_500: replaced.
     ledger.persist(&again, 1_500).await.unwrap();
     let live = ledger.load(1_500).await.unwrap().nonces;
     assert_eq!(live.len(), 1);
     assert_eq!(live[0].expires, 2_000);
+    // In place: the same object, so no moment existed without a covering row.
+    let after = db.fetch::<Any>(&Ql::new("ReplayNonce")).await.unwrap();
+    assert_eq!(before.len(), 1);
+    assert_eq!(after.len(), 1);
+    assert_eq!(before[0].id, after[0].id);
 }

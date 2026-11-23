@@ -444,8 +444,10 @@ fn a_wall_clock_stepped_back_does_not_reopen_nonces() {
 #[test]
 fn record_reports_expiry_and_restore_round_trips() {
     let s = warm(10);
-    let expires = s.record(SignedRequest, &alice("n", T), T).unwrap();
-    assert_eq!(expires, T + SKEW + 1);
+    let recorded = s.record(SignedRequest, &alice("n", T), T).unwrap();
+    assert_eq!(recorded.expires, T + SKEW + 1);
+    assert_eq!(recorded.clock, T);
+    let expires = recorded.expires;
 
     // A fresh store (a restarted process) restores what the ledger held.
     let fresh = ReplayStore::new(limits(10), SKEW, T + 5, HOME);

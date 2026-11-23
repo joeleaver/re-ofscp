@@ -124,9 +124,16 @@ The spec says a provider SHOULD persist the store, and we do
     correction and a restart would bring back a nonce the purge had already
     deleted. The independent review confirmed that sequence, and
     `forward_clock_step_purge_then_restart_still_refuses_the_replay` pins it.
-- **Expired rows are replaced.** A nonce reused after its window (§4.5
-  allows this) can hit a stale row that hasn't been purged yet. That row is
-  replaced, so the request isn't refused as a replay.
+- **Expired rows are replaced in place.** A nonce reused after its window
+  (§4.5 allows this) can hit a stale row that hasn't been purged yet.
+  - **How:** that row is overwritten with one conditional update, matching
+    `key` and `expires_at ≤ store clock`. There's never a moment without a
+    row covering the identity; a delete-then-create could lose it to a crash
+    or a failed create.
+  - **Which clock:** expiries are judged by the store's clock (what
+    `record` returns), not a raw wall-clock reading.
+- **The clock only goes up.** The persisted clock is raised by a conditional
+  update (`high_water < X`), so it can never be lowered.
 
 ## Consequences
 
