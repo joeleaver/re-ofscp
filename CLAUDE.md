@@ -6,13 +6,31 @@ re-ofscp is an **enterprise-grade OFSCP provider** written in Rust. It is hosted
 
 - **The spec:** `~/dev/ofscp`, upstream at `lost-conn/ofscp`. Read `docs/ofscp_spec.md`. The JSON Schemas are in `schemas/v0.1`, and the samples and signing vectors are in `tests/`.
   - **Build against the open spec PRs, not just `main`.** These PRs write down behaviour the reference implementation already settled, and fix gaps in v0.1:
-    - [lost-conn/ofscp#11](https://github.com/lost-conn/ofscp/pull/11) covers what Forumall already settled: identifier forms, handle grammar, CORS, the replay store, device-key endpoints, paging, "losing access", the effective-read-access rule, and tiers.
+    - [lost-conn/ofscp#11](https://github.com/lost-conn/ofscp/pull/11) (**merged**) covers what Forumall already settled: identifier forms, handle grammar, CORS, the replay store, device-key endpoints, paging, "losing access", the effective-read-access rule, and tiers.
     - [lost-conn/ofscp#12](https://github.com/lost-conn/ofscp/pull/12): security hardening (contacts accept, replay store, outbound SSRF rules).
     - [lost-conn/ofscp#13](https://github.com/lost-conn/ofscp/pull/13): notifications, mentions, Web Push, nicknames, guest upgrade.
     - [lost-conn/ofscp#14](https://github.com/lost-conn/ofscp/pull/14): private groups are invite-only, and read markers use message ids.
     - [lost-conn/ofscp#15](https://github.com/lost-conn/ofscp/pull/15): DMs across devices (`to`, conversation pointers).
   - Where the spec is still ambiguous, choose the conservative, interoperable reading. Write the choice down in `docs/decisions/`, and propose a spec PR rather than diverging silently.
 - **Reference implementation:** Forumall, at `~/dev/forumall` (a worktree is at `~/dev/forumall-wt`), upstream `lost-conn/forumall`. It's in Bun/TypeScript. Use it to check wire behaviour and to interoperate-test against. It's a reference, not a template, and it has known bugs; see the security list below.
+
+## Protocol questions: ask the OFSCP oracle
+
+A separate Claude session, **"OFSCP oracle"** (session id `local_a5cc84d7-2370-4fa1-8849-4687aef3e1a1`, working in `~/dev/ofscp`), owns the OFSCP spec. It audited the spec and Forumall, and it authored the open spec PRs. **The premise:** if you can't work out how to behave from the spec text (and checking against Forumall), the spec has a gap. The fix belongs in the spec, not in a private guess.
+
+**When to ask:** whenever a protocol or interoperability question isn't answered unambiguously by the spec plus the open spec PRs. Examples: a field shape, an ordering, an error code, what a remote provider will send or expect, how two rules interact, or behaviour where Forumall and the spec disagree. Don't ask about Rust, rhypedb, rinch, jkbase or this server's internal design. Those are yours.
+
+**How:** send a message to the session above (`SendMessage` with `to: "local_a5cc84d7-2370-4fa1-8849-4687aef3e1a1"`). If you can't reach it, ask Joe to relay. Each question should include:
+1. the spec section(s) and the exact text you're unsure about;
+2. the concrete case: request/response or event, actors, providers;
+3. what you would do if you had to decide now, and why.
+
+**What comes back** is one of these:
+- **A citation:** the spec already answers it, and you get the section.
+- **A spec change:** a new spec PR, or a comment on an open one, with the answer you should implement now.
+- **"Needs Joe and Seth":** a genuine design decision. Implement your proposed default behind a clearly named seam, record it in `docs/decisions/`, and move on.
+
+**Don't block on the answer.** Keep working on other parts while you wait. **Never** treat an oracle answer as final until it is in the spec or an open spec PR. Note the PR number in code comments where the behaviour depends on it.
 
 ## Layout
 
