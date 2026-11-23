@@ -21,9 +21,14 @@ A separate Claude session, the **OFSCP oracle**, owns the OFSCP spec. It always 
 **When to ask:** whenever a protocol or interoperability question isn't answered unambiguously by the spec plus the open spec PRs. Examples: a field shape, an ordering, an error code, what a remote provider will send or expect, how two rules interact, or behaviour where Forumall and the spec disagree. Don't ask about Rust, rhypedb, rinch, jkbase or this server's internal design. Those are yours.
 
 **How:** find the oracle's current session, then message it.
-- **Find it:** call `mcp__ccd_session_mgmt__list_sessions` with a modest limit (about 20). Pick the non-archived session whose `cwd` is `/home/joe/dev/ofscp`, or a worktree under it. If several match, prefer one titled "OFSCP oracle", otherwise the most recently active one. If nothing matches, raise the limit before giving up.
+- **Find it:** call `mcp__ccd_session_mgmt__list_sessions` with a modest limit (about 20). Archived sessions are left out by default; don't pass `include_archived`.
+  1. Prefer a session whose `cwd` is exactly `/home/joe/dev/ofscp` and whose title contains "OFSCP oracle".
+  2. Failing that, any session whose `cwd` is exactly `/home/joe/dev/ofscp`, skipping ones that have a `startedBy` (those are the oracle's own helpers). If several match, take the most recently active.
+  3. Don't pick a session in a worktree under `~/dev/ofscp` (for example `.claude/worktrees/...`). Those are short-lived spec-PR workers, not the oracle.
+  4. If nothing matches, raise the limit and try once more.
+- **Idle is fine:** the oracle usually shows `isRunning: false` between questions. A non-archived match is the oracle whether or not it is running; message it anyway.
 - **Message it:** use `SendMessage` with `to` set to its `local_…` id, or `send_message` with that `session_id`.
-- **If none is live,** ask Joe to start one or to relay. Don't unarchive an old session.
+- **If no non-archived session matches,** ask Joe to start one or to relay. Don't unarchive an old session.
 
 Each question should include:
 1. the spec section(s) and the exact text you're unsure about;
