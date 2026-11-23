@@ -3,6 +3,11 @@ use SignerKind::{Actor, Provider};
 use Surface::{SignedRequest, WsHandshake};
 
 const T: i64 = 1_000_000;
+
+/// `record`, ignoring the expiry it reports.
+fn rec(s: &ReplayStore, surface: Surface, u: &NonceUse<'_>, now: i64) -> Result<(), ReplayError> {
+    s.record(surface, u, now).map(|_| ())
+}
 const SKEW: i64 = 300;
 const HOME: &str = "home.example";
 
@@ -59,13 +64,13 @@ fn check_does_not_record() {
 #[test]
 fn record_then_replay_is_refused() {
     let s = warm(10);
-    assert_eq!(s.record(SignedRequest, &alice("n", T), T), Ok(()));
+    assert_eq!(rec(&s, SignedRequest, &alice("n", T), T), Ok(()));
     assert_eq!(
         s.check(SignedRequest, &alice("n", T), T),
         Err(ReplayError::Replayed)
     );
     assert_eq!(
-        s.record(SignedRequest, &alice("n", T), T),
+        rec(&s, SignedRequest, &alice("n", T), T),
         Err(ReplayError::Replayed)
     );
 }
@@ -73,7 +78,7 @@ fn record_then_replay_is_refused() {
 #[test]
 fn surfaces_share_one_store() {
     let s = warm(10);
-    assert_eq!(s.record(WsHandshake, &alice("n", T), T), Ok(()));
+    assert_eq!(rec(&s, WsHandshake, &alice("n", T), T), Ok(()));
     assert_eq!(
         s.check(SignedRequest, &alice("n", T), T),
         Err(ReplayError::Replayed)
@@ -83,13 +88,13 @@ fn surfaces_share_one_store() {
 #[test]
 fn signer_kinds_and_key_ids_do_not_collide() {
     let s = warm(10);
-    assert_eq!(s.record(SignedRequest, &alice("n", T), T), Ok(()));
+    assert_eq!(rec(&s, SignedRequest, &alice("n", T), T), Ok(()));
     let mut p = alice("n", T);
     p.kind = Provider;
-    assert_eq!(s.record(SignedRequest, &p, T), Ok(()));
+    assert_eq!(rec(&s, SignedRequest, &p, T), Ok(()));
     let mut k2 = alice("n", T);
     k2.key_id = "k2";
-    assert_eq!(s.record(SignedRequest, &k2, T), Ok(()));
+    assert_eq!(rec(&s, SignedRequest, &k2, T), Ok(()));
 }
 
 /// The nonce must outlive every moment its timestamp is accepted, which is
@@ -100,7 +105,7 @@ fn nonce_lives_exactly_as_long_as_its_timestamp_is_acceptable() {
         let s = warm(10);
         let u = alice("n", signed_at);
         let now = T;
-        s.record(SignedRequest, &u, now).unwrap();
+        rec(&s, SignedRequest, &u, now).unwrap();
         let last_ok = signed_at + SKEW;
         assert_eq!(
             s.check(SignedRequest, &u, last_ok),
@@ -120,12 +125,11 @@ fn nonce_lives_exactly_as_long_as_its_timestamp_is_acceptable() {
 #[test]
 fn full_store_fails_closed_without_evicting() {
     let s = warm(2);
-    s.record(SignedRequest, &alice("a", T), T).unwrap();
-    s.record(SignedRequest, &alice("b", T + 10), T + 10)
-        .unwrap();
+    rec(&s, SignedRequest, &alice("a", T), T).unwrap();
+    rec(&s, SignedRequest, &alice("b", T + 10), T + 10).unwrap();
     // `a` expires at T + 301.
     assert_eq!(
-        s.record(SignedRequest, &alice("c", T + 100), T + 100),
+        rec(&s, SignedRequest, &alice("c", T + 100), T + 100),
         Err(ReplayError::Full { retry_after: 201 })
     );
     // Nothing was evicted.
@@ -139,7 +143,7 @@ fn full_store_fails_closed_without_evicting() {
     );
     // Once `a` expires there is room again.
     assert_eq!(
-        s.record(SignedRequest, &alice("c", T + 100), T + SKEW + 1),
+        rec(&s, SignedRequest, &alice("c", T + 100), T + SKEW + 1),
         Ok(())
     );
 }
@@ -149,9 +153,8 @@ fn expiry_order_is_by_timestamp_not_arrival() {
     // A later-arriving nonce with an earlier timestamp expires first and
     // frees room first.
     let s = warm(2);
-    s.record(SignedRequest, &alice("late", T + 200), T).unwrap();
-    s.record(SignedRequest, &alice("early", T - 200), T)
-        .unwrap();
+    rec(&s, SignedRequest, &alice("late", T + 200), T).unwrap();
+    rec(&s, SignedRequest, &alice("early", T - 200), T).unwrap();
     assert_eq!(s.len(T + 101), 1, "early (T-200) expired at T+101");
     assert_eq!(
         s.check(SignedRequest, &alice("late", T + 200), T + 101),
@@ -165,15 +168,15 @@ fn one_signer_cannot_take_the_whole_store() {
         per_signer: 2,
         ..limits(100)
     });
-    s.record(SignedRequest, &alice("a", T), T).unwrap();
-    s.record(SignedRequest, &alice("b", T + 5), T).unwrap();
+    rec(&s, SignedRequest, &alice("a", T), T).unwrap();
+    rec(&s, SignedRequest, &alice("b", T + 5), T).unwrap();
     let limited = Err(ReplayError::RateLimited { retry_after: 301 });
     assert_eq!(s.check(SignedRequest, &alice("c", T), T), limited);
-    assert_eq!(s.record(SignedRequest, &alice("c", T), T), limited);
+    assert_eq!(rec(&s, SignedRequest, &alice("c", T), T), limited);
     // Someone else is unaffected.
     let mut bob = alice("c", T);
     bob.signer = "bob@home.example";
-    assert_eq!(s.record(SignedRequest, &bob, T), Ok(()));
+    assert_eq!(rec(&s, SignedRequest, &bob, T), Ok(()));
 }
 
 #[test]
@@ -183,20 +186,23 @@ fn one_remote_domain_cannot_take_the_whole_store() {
         ..limits(100)
     });
     // A hostile provider minting fresh actors still shares one domain quota.
-    s.record(
+    rec(
+        &s,
         SignedRequest,
         &remote("u1@evil.example", "evil.example", "1"),
         T,
     )
     .unwrap();
-    s.record(
+    rec(
+        &s,
         SignedRequest,
         &remote("u2@evil.example", "evil.example", "2"),
         T,
     )
     .unwrap();
     assert!(matches!(
-        s.record(
+        rec(
+            &s,
             SignedRequest,
             &remote("u3@evil.example", "evil.example", "3"),
             T
@@ -205,7 +211,8 @@ fn one_remote_domain_cannot_take_the_whole_store() {
     ));
     // Other remote domains and local users are unaffected.
     assert_eq!(
-        s.record(
+        rec(
+            &s,
             SignedRequest,
             &remote("v@good.example", "good.example", "4"),
             T
@@ -217,7 +224,7 @@ fn one_remote_domain_cannot_take_the_whole_store() {
         let mut u = alice(&n, T);
         let signer = format!("user{i}@home.example");
         u.signer = &signer;
-        assert_eq!(s.record(SignedRequest, &u, T), Ok(()), "local user {i}");
+        assert_eq!(rec(&s, SignedRequest, &u, T), Ok(()), "local user {i}");
     }
 }
 
@@ -227,10 +234,10 @@ fn quotas_free_up_as_entries_expire() {
         per_signer: 1,
         ..limits(100)
     });
-    s.record(SignedRequest, &alice("a", T), T).unwrap();
-    assert!(s.record(SignedRequest, &alice("b", T), T).is_err());
+    rec(&s, SignedRequest, &alice("a", T), T).unwrap();
+    assert!(rec(&s, SignedRequest, &alice("b", T), T).is_err());
     assert_eq!(
-        s.record(SignedRequest, &alice("b", T + SKEW + 1), T + SKEW + 1),
+        rec(&s, SignedRequest, &alice("b", T + SKEW + 1), T + SKEW + 1),
         Ok(())
     );
 }
@@ -242,7 +249,7 @@ fn warm_up_refuses_through_start_plus_skew_inclusive() {
     let s = ReplayStore::new(limits(10), SKEW, T, HOME);
     let warming = |r| Err(ReplayError::WarmingUp { retry_after: r });
     assert_eq!(s.check(SignedRequest, &alice("n", T), T), warming(301));
-    assert_eq!(s.record(SignedRequest, &alice("n", T), T), warming(301));
+    assert_eq!(rec(&s, SignedRequest, &alice("n", T), T), warming(301));
     assert_eq!(
         s.check(SignedRequest, &alice("n", T + SKEW), T),
         warming(301)
@@ -258,7 +265,7 @@ fn warm_up_refuses_through_start_plus_skew_inclusive() {
     );
     // From T + 301 on, signatures are accepted.
     assert_eq!(
-        s.record(SignedRequest, &alice("n", T + SKEW + 1), T + SKEW + 1),
+        rec(&s, SignedRequest, &alice("n", T + SKEW + 1), T + SKEW + 1),
         Ok(())
     );
 }
@@ -267,9 +274,9 @@ fn warm_up_refuses_through_start_plus_skew_inclusive() {
 fn ws_handshake_is_exempt_from_warm_up() {
     let s = ReplayStore::new(limits(10), SKEW, T, HOME);
     assert_eq!(s.check(WsHandshake, &alice("n", T), T), Ok(()));
-    assert_eq!(s.record(WsHandshake, &alice("n", T), T), Ok(()));
+    assert_eq!(rec(&s, WsHandshake, &alice("n", T), T), Ok(()));
     assert_eq!(
-        s.record(WsHandshake, &alice("n", T), T),
+        rec(&s, WsHandshake, &alice("n", T), T),
         Err(ReplayError::Replayed)
     );
 }
@@ -281,7 +288,7 @@ fn concurrent_records_have_exactly_one_winner() {
         let handles: Vec<_> = (0..16)
             .map(|_| {
                 let s = s.clone();
-                scope.spawn(move || usize::from(s.record(SignedRequest, &alice("n", T), T).is_ok()))
+                scope.spawn(move || usize::from(rec(&s, SignedRequest, &alice("n", T), T).is_ok()))
             })
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).sum()
@@ -308,16 +315,23 @@ fn subdomains_and_ports_of_one_domain_share_a_quota() {
         per_remote_domain: 2,
         ..limits(100)
     });
-    s.record(SignedRequest, &remote("u@a.evil.com", "a.evil.com", "1"), T)
-        .unwrap();
-    s.record(
+    rec(
+        &s,
+        SignedRequest,
+        &remote("u@a.evil.com", "a.evil.com", "1"),
+        T,
+    )
+    .unwrap();
+    rec(
+        &s,
         SignedRequest,
         &remote("u@b.evil.com:8443", "b.evil.com:8443", "2"),
         T,
     )
     .unwrap();
     assert!(matches!(
-        s.record(
+        rec(
+            &s,
             SignedRequest,
             &remote("u@evil.com:8444", "evil.com:8444", "3"),
             T
@@ -334,15 +348,18 @@ fn a_full_remote_pool_does_not_touch_local_users() {
         per_signer: usize::MAX,
         per_remote_domain: usize::MAX,
     });
-    s.record(SignedRequest, &remote("u@one.com", "one.com", "1"), T)
-        .unwrap();
-    s.record(SignedRequest, &remote("u@two.com", "two.com", "2"), T)
-        .unwrap();
+    rec(&s, SignedRequest, &remote("u@one.com", "one.com", "1"), T).unwrap();
+    rec(&s, SignedRequest, &remote("u@two.com", "two.com", "2"), T).unwrap();
     assert_eq!(
-        s.record(SignedRequest, &remote("u@three.com", "three.com", "3"), T),
+        rec(
+            &s,
+            SignedRequest,
+            &remote("u@three.com", "three.com", "3"),
+            T
+        ),
         Err(ReplayError::Full { retry_after: 301 })
     );
-    assert_eq!(s.record(SignedRequest, &alice("local", T), T), Ok(()));
+    assert_eq!(rec(&s, SignedRequest, &alice("local", T), T), Ok(()));
 }
 
 #[test]
@@ -353,13 +370,13 @@ fn a_full_local_pool_does_not_touch_remote_users() {
         per_signer: usize::MAX,
         per_remote_domain: usize::MAX,
     });
-    s.record(SignedRequest, &alice("a", T), T).unwrap();
+    rec(&s, SignedRequest, &alice("a", T), T).unwrap();
     assert!(matches!(
-        s.record(SignedRequest, &alice("b", T), T),
+        rec(&s, SignedRequest, &alice("b", T), T),
         Err(ReplayError::Full { .. })
     ));
     assert_eq!(
-        s.record(SignedRequest, &remote("u@one.com", "one.com", "1"), T),
+        rec(&s, SignedRequest, &remote("u@one.com", "one.com", "1"), T),
         Ok(())
     );
 }
@@ -375,16 +392,16 @@ fn retry_after_on_a_domain_quota_waits_for_the_domain() {
     });
     let mut a = remote("a@evil.com", "evil.com", "1");
     a.signed_at = T - 200; // expires at T + 101
-    s.record(SignedRequest, &a, T).unwrap();
-    s.record(SignedRequest, &remote("b@evil.com", "evil.com", "2"), T)
-        .unwrap();
+    rec(&s, SignedRequest, &a, T).unwrap();
+    rec(&s, SignedRequest, &remote("b@evil.com", "evil.com", "2"), T).unwrap();
     assert_eq!(
-        s.record(SignedRequest, &remote("c@evil.com", "evil.com", "3"), T),
+        rec(&s, SignedRequest, &remote("c@evil.com", "evil.com", "3"), T),
         Err(ReplayError::RateLimited { retry_after: 101 })
     );
     // And at that moment there is room again.
     assert_eq!(
-        s.record(
+        rec(
+            &s,
             SignedRequest,
             &remote("c@evil.com", "evil.com", "3"),
             T + 101
@@ -399,11 +416,10 @@ fn retry_after_on_a_domain_quota_waits_for_the_domain() {
 #[test]
 fn a_stale_reading_cannot_resurrect_a_swept_nonce() {
     let s = warm(10);
-    s.record(SignedRequest, &alice("dup", T), T).unwrap();
-    s.record(SignedRequest, &alice("other", T + 300), T + SKEW + 1)
-        .unwrap();
+    rec(&s, SignedRequest, &alice("dup", T), T).unwrap();
+    rec(&s, SignedRequest, &alice("other", T + 300), T + SKEW + 1).unwrap();
     assert_eq!(
-        s.record(SignedRequest, &alice("dup", T), T + SKEW),
+        rec(&s, SignedRequest, &alice("dup", T), T + SKEW),
         Err(ReplayError::Expired)
     );
     assert_eq!(
@@ -415,12 +431,40 @@ fn a_stale_reading_cannot_resurrect_a_swept_nonce() {
 #[test]
 fn a_wall_clock_stepped_back_does_not_reopen_nonces() {
     let s = warm(10);
-    s.record(SignedRequest, &alice("n", T), T).unwrap();
+    rec(&s, SignedRequest, &alice("n", T), T).unwrap();
     // Time passes beyond the nonce's life; something sweeps.
     assert!(s.is_empty(T + SKEW + 1));
     // NTP steps the clock back into the nonce's window.
     assert_eq!(
-        s.record(SignedRequest, &alice("n", T), T + 10),
+        rec(&s, SignedRequest, &alice("n", T), T + 10),
         Err(ReplayError::Expired)
+    );
+}
+
+#[test]
+fn record_reports_expiry_and_restore_round_trips() {
+    let s = warm(10);
+    let expires = s.record(SignedRequest, &alice("n", T), T).unwrap();
+    assert_eq!(expires, T + SKEW + 1);
+
+    // A fresh store (a restarted process) restores what the ledger held.
+    let fresh = ReplayStore::new(limits(10), SKEW, T + 5, HOME);
+    assert!(fresh.warming_up());
+    let stored = vec![
+        StoredNonce::from_use(&alice("n", T), expires),
+        // Already expired by `now`: skipped.
+        StoredNonce::from_use(&alice("old", T - 400), T - 99),
+    ];
+    assert_eq!(fresh.restore(stored, T + 5), 1);
+    fresh.end_warm_up();
+    assert!(!fresh.warming_up());
+    // The restored nonce is still refused; a new one is accepted at once.
+    assert_eq!(
+        fresh.check(SignedRequest, &alice("n", T), T + 5),
+        Err(ReplayError::Replayed)
+    );
+    assert_eq!(
+        rec(&fresh, SignedRequest, &alice("new", T + 5), T + 5),
+        Ok(())
     );
 }

@@ -4,6 +4,7 @@
 //! everything testable lives here.
 
 pub mod config;
+pub mod db;
 pub mod problem;
 pub mod replay;
 pub mod signing;
@@ -18,48 +19,123 @@ use re_ofscp_types::{Health, OFSCP_VERSION};
 pub use config::Config;
 pub use problem::Problem;
 
+use db::{Db, DbConfig};
 use replay::ReplayStore;
-use signing::{Clock, KeyResolver, SystemClock, Verifier};
+use replay::ledger::{LedgerError, NonceLedger, RhypeLedger};
+use signing::{Clock, KeyResolver, StaticKeys, SystemClock, Verifier};
 
 /// Maximum clock skew accepted on signed requests, in seconds (§4.5 step 3, §8).
 pub const MAX_SKEW_SECS: i64 = 300;
+
+/// How often expired nonces are deleted from the persistent ledger.
+pub const LEDGER_PURGE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Shared application state.
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
+    /// The rhypedb connection pool.
+    pub db: Arc<Db>,
     /// Verifies every signed request, REST and federation alike, against the
     /// one provider-wide replay store.
     pub verifier: Arc<Verifier>,
 }
 
-impl AppState {
-    /// Build state with the wall clock.
-    pub fn new(config: Config, keys: Arc<dyn KeyResolver>) -> Self {
-        Self::with_clock(config, keys, Arc::new(SystemClock))
+/// Builds an [`AppState`]. Defaults: the wall clock, no keys, and the
+/// rhypedb-backed replay ledger.
+pub struct AppStateBuilder {
+    config: Config,
+    keys: Arc<dyn KeyResolver>,
+    ledger: Option<Arc<dyn NonceLedger>>,
+    clock: Arc<dyn Clock>,
+}
+
+impl AppStateBuilder {
+    /// Resolve signing keys with `keys`.
+    #[must_use]
+    pub fn keys(mut self, keys: Arc<dyn KeyResolver>) -> Self {
+        self.keys = keys;
+        self
     }
 
-    /// Build state with an explicit clock (tests).
-    pub fn with_clock(config: Config, keys: Arc<dyn KeyResolver>, clock: Arc<dyn Clock>) -> Self {
-        // The store begins now. For one skew window, signed requests get 503
-        // because a predecessor process may have recorded them
-        // (docs/decisions/0001-replay-store.md, lost-conn/ofscp#17).
+    /// Persist nonces to `ledger` instead of rhypedb.
+    #[must_use]
+    pub fn ledger(mut self, ledger: Arc<dyn NonceLedger>) -> Self {
+        self.ledger = Some(ledger);
+        self
+    }
+
+    /// Use `clock` instead of the wall clock.
+    #[must_use]
+    pub fn clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Build the state. The replay store starts in its restart warm-up;
+    /// [`AppState::restore_replay`] ends it once the ledger is reloaded.
+    pub fn build(self) -> AppState {
+        let config = self.config;
+        let db = Arc::new(Db::new(DbConfig::new(config.rhypedb_addr.clone())));
+        let ledger = self
+            .ledger
+            .unwrap_or_else(|| Arc::new(RhypeLedger::new(db.clone())));
         let replay = Arc::new(ReplayStore::new(
             config.replay,
             MAX_SKEW_SECS,
-            clock.now().unix_timestamp(),
+            self.clock.now().unix_timestamp(),
             config.domain.as_str(),
         ));
         let verifier = Arc::new(Verifier::new(
             config.domain.clone(),
             MAX_SKEW_SECS,
             replay,
-            keys,
-            clock,
+            ledger,
+            self.keys,
+            self.clock,
         ));
-        Self {
+        AppState {
             config: Arc::new(config),
+            db,
             verifier,
+        }
+    }
+}
+
+impl AppState {
+    /// Start building state for `config`.
+    pub fn builder(config: Config) -> AppStateBuilder {
+        AppStateBuilder {
+            config,
+            keys: Arc::new(StaticKeys::default()),
+            ledger: None,
+            clock: Arc::new(SystemClock),
+        }
+    }
+
+    /// Reload every live nonce from the persistent ledger into the replay
+    /// store and end its restart warm-up. Call before serving. On error the
+    /// warm-up stays in force (signed requests get `503` for one skew window
+    /// after startup), which is safe.
+    pub async fn restore_replay(&self) -> Result<usize, LedgerError> {
+        let now = self.verifier.now();
+        let nonces = self.verifier.ledger().load(now).await?;
+        let store = self.verifier.replay_store();
+        let restored = store.restore(nonces, now);
+        store.end_warm_up();
+        Ok(restored)
+    }
+
+    /// Delete expired nonces from the ledger, every
+    /// [`LEDGER_PURGE_INTERVAL`], until the task is dropped.
+    pub async fn purge_ledger_forever(self) {
+        let mut tick = tokio::time::interval(LEDGER_PURGE_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            if let Err(e) = self.verifier.ledger().purge(self.verifier.now()).await {
+                tracing::warn!(error = %e, "purging expired nonces failed");
+            }
         }
     }
 }
@@ -89,23 +165,13 @@ pub fn router(state: AppState) -> Router {
 
 /// `GET /api/health` — liveness plus a database reachability probe.
 async fn health(State(state): State<AppState>) -> Json<Health> {
-    let database = database_reachable(&state.config.rhypedb_addr).await;
+    let database = tokio::time::timeout(Duration::from_secs(2), state.db.ping())
+        .await
+        .unwrap_or(false);
     Json(Health {
         status: if database { "ok" } else { "degraded" }.to_owned(),
         ofscp: OFSCP_VERSION.to_owned(),
         domain: state.config.domain.to_string(),
         database,
     })
-}
-
-/// Whether rhypedb accepts a connection within a short timeout.
-async fn database_reachable(addr: &str) -> bool {
-    matches!(
-        tokio::time::timeout(
-            Duration::from_secs(2),
-            rhypedb_client::AsyncClient::connect(addr)
-        )
-        .await,
-        Ok(Ok(_))
-    )
 }

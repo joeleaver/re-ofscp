@@ -13,7 +13,7 @@ use axum::{Router, middleware};
 use ed25519_dalek::SigningKey;
 use http_body_util::BodyExt;
 use re_ofscp_server::problem::{self, ProblemBase};
-use re_ofscp_server::replay::{ReplayLimits, ReplayStore};
+use re_ofscp_server::replay::{NoLedger, ReplayLimits, ReplayStore};
 use re_ofscp_server::signing::canonical::{CanonicalRequest, content_digest, sign};
 use re_ofscp_server::signing::{
     Authenticated, Clock, KeyResolver, Signer, StaticKeys, Verifier, authenticate,
@@ -111,6 +111,7 @@ pub fn harness_with(
         provider_a(),
         300,
         replay.clone(),
+        Arc::new(NoLedger),
         keys,
         Arc::new(FixedClock(now)),
     ));
@@ -139,6 +140,9 @@ pub fn harness() -> Harness {
 /// A request signed like the spec vector, with knobs for breaking it.
 #[derive(Clone)]
 pub struct Req {
+    pub method: &'static str,
+    pub path: &'static str,
+    pub query: Option<&'static str>,
     pub host: &'static str,
     pub identity: (&'static str, String),
     pub nonce: String,
@@ -151,8 +155,12 @@ pub struct Req {
 }
 
 impl Req {
+    /// The spec's signing vector, exactly.
     pub fn vector() -> Self {
         Self {
+            method: "POST",
+            path: PATH,
+            query: Some("foo=1"),
             host: "providera.com",
             identity: ("x-ofscp-actor", "alice@providera.com".into()),
             nonce: "8wQk2mJ0r5sV1xZ3aB6cDg".into(),
@@ -165,13 +173,25 @@ impl Req {
         }
     }
 
+    /// A signed, bodiless `GET /api/health` with the vector's key, timestamp
+    /// and nonce (for tests against the production router).
+    pub fn health() -> Self {
+        Self {
+            method: "GET",
+            path: "/api/health",
+            query: None,
+            body: String::new(),
+            ..Self::vector()
+        }
+    }
+
     pub fn build(&self) -> Request<Body> {
         let digest = content_digest(self.body.as_bytes());
         let canonical = CanonicalRequest {
             authority: "providera.com",
-            method: "POST",
-            path: PATH,
-            query: Some("foo=1"),
+            method: self.method,
+            path: self.path,
+            query: self.query,
             timestamp: &self.timestamp,
             nonce: &self.nonce,
             content_digest: &digest,
@@ -196,7 +216,11 @@ impl Req {
         if let Some(extra) = &self.extra_header {
             headers.push((extra.0, extra.1.clone()));
         }
-        let mut b = Request::post(format!("{PATH}?foo=1"));
+        let uri = match self.query {
+            Some(q) => format!("{}?{q}", self.path),
+            None => self.path.to_owned(),
+        };
+        let mut b = Request::builder().method(self.method).uri(uri);
         for (k, v) in headers {
             b = b.header(k, v);
         }

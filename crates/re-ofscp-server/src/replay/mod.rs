@@ -38,13 +38,16 @@
 //! for one connection and dies with it. See
 //! `docs/decisions/0001-replay-store.md`.
 
+pub mod ledger;
 mod quota;
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+pub use ledger::{LedgerError, NoLedger, NonceLedger, StoredNonce};
 use quota::Counter;
 
 /// Who produced a signature. Part of the replay key (§4.5).
@@ -300,7 +303,9 @@ pub struct ReplayStore {
     limits: ReplayLimits,
     skew_secs: i64,
     /// `T0 + skew`: signed requests timestamped at or before it are refused.
-    warm_until: i64,
+    /// `i64::MIN` once the warm-up has ended (nonces restored from the
+    /// persistent ledger, see [`ReplayStore::end_warm_up`]).
+    warm_until: AtomicI64,
     local_domain: Box<str>,
 }
 
@@ -313,7 +318,7 @@ impl ReplayStore {
             inner: Mutex::new(Inner::default()),
             limits,
             skew_secs,
-            warm_until: started_at + skew_secs,
+            warm_until: AtomicI64::new(started_at + skew_secs),
             local_domain: local_domain.into(),
         }
     }
@@ -326,12 +331,43 @@ impl ReplayStore {
     }
 
     fn warm_up(&self, surface: Surface, u: &NonceUse<'_>, now: i64) -> Result<(), ReplayError> {
-        if surface == Surface::SignedRequest && u.signed_at <= self.warm_until {
+        let warm_until = self.warm_until.load(Ordering::SeqCst);
+        if surface == Surface::SignedRequest && u.signed_at <= warm_until {
             return Err(ReplayError::WarmingUp {
-                retry_after: secs_until(self.warm_until + 1, now),
+                retry_after: secs_until(warm_until.saturating_add(1), now),
             });
         }
         Ok(())
+    }
+
+    /// End the restart warm-up. Call only once every nonce the previous
+    /// process could have accepted is back in the store (restored from the
+    /// persistent ledger), so nothing can be replayed across the restart.
+    pub fn end_warm_up(&self) {
+        self.warm_until.store(i64::MIN, Ordering::SeqCst);
+    }
+
+    /// Whether the restart warm-up is still in force.
+    pub fn warming_up(&self) -> bool {
+        self.warm_until.load(Ordering::SeqCst) != i64::MIN
+    }
+
+    /// Load nonces recorded before a restart. Entries already expired at
+    /// `now`, or already present, are skipped; limits are not applied (each
+    /// was admitted when first recorded). Returns how many were restored.
+    pub fn restore(&self, nonces: impl IntoIterator<Item = StoredNonce>, now: i64) -> usize {
+        let mut inner = self.lock();
+        let now = inner.advance(now);
+        let mut restored = 0;
+        for n in nonces {
+            let u = n.as_use();
+            if n.expires <= now || inner.contains(&u) {
+                continue;
+            }
+            self.insert(&mut inner, &u, n.expires);
+            restored += 1;
+        }
+        restored
     }
 
     fn is_remote(&self, u: &NonceUse<'_>) -> bool {
@@ -400,8 +436,9 @@ impl ReplayStore {
 
     /// After the signature verified: atomically re-check freshness and
     /// replay, and record. Pass a fresh clock reading; the store also never
-    /// lets its clock run backwards (see `Inner::high_water`).
-    pub fn record(&self, surface: Surface, u: &NonceUse<'_>, now: i64) -> Result<(), ReplayError> {
+    /// lets its clock run backwards (see `Inner::high_water`). Returns when
+    /// the entry expires (unix seconds), for the persistent ledger.
+    pub fn record(&self, surface: Surface, u: &NonceUse<'_>, now: i64) -> Result<i64, ReplayError> {
         self.warm_up(surface, u, now)?;
         let mut inner = self.lock();
         let now = inner.advance(now);
@@ -413,6 +450,12 @@ impl ReplayStore {
         // Accepted while `now <= signed_at + skew` (checked just above), so
         // gone at the second after; that is always later than `now`.
         let expires = u.signed_at + self.skew_secs + 1;
+        self.insert(&mut inner, u, expires);
+        Ok(expires)
+    }
+
+    /// Insert `u` expiring at `expires`, with all bookkeeping.
+    fn insert(&self, inner: &mut Inner, u: &NonceUse<'_>, expires: i64) {
         let signer: Arc<str> = Arc::from(u.signer);
         let remote_group = self
             .is_remote(u)
@@ -438,7 +481,6 @@ impl ReplayStore {
             }
             None => inner.local.add(expires),
         }
-        Ok(())
     }
 
     /// Number of live entries (for metrics and tests).

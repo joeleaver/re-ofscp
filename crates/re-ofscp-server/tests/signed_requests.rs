@@ -193,14 +193,15 @@ async fn production_router_rejects_signed_requests_it_cannot_verify() {
     // Started well before signing, so the warm-up is over and step 6 is
     // reached.
     let clock = SettableClock::at(SIGNED_AT - time::Duration::seconds(301));
-    let state = re_ofscp_server::AppState::with_clock(
-        config,
-        Arc::new(StaticKeys::default()),
-        clock.clone(),
-    );
+    let state = re_ofscp_server::AppState::builder(config)
+        .keys(Arc::new(StaticKeys::default()))
+        .ledger(Arc::new(re_ofscp_server::replay::NoLedger))
+        .clock(clock.clone())
+        .build();
     clock.set(SIGNED_AT);
     let app = re_ofscp_server::router(state);
-    let mut req = Req::vector().build();
-    *req.uri_mut() = "/api/health".parse().unwrap();
-    assert_eq!(send(&app, req).await.0, StatusCode::UNAUTHORIZED);
+    let req = Req::health().build();
+    let (status, json, _, _) = send(&app, req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(json["detail"], "unknown or revoked key");
 }

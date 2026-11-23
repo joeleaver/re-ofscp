@@ -11,7 +11,7 @@ use axum::{Router, middleware};
 use common::harness::*;
 use ed25519_dalek::SigningKey;
 use http_body_util::BodyExt;
-use re_ofscp_server::replay::{ReplayLimits, ReplayStore};
+use re_ofscp_server::replay::{NoLedger, ReplayLimits, ReplayStore};
 use re_ofscp_server::signing::canonical::sign;
 use re_ofscp_server::signing::{Authenticated, Clock, Verifier, authenticate};
 
@@ -62,14 +62,13 @@ async fn production_state_warms_up_for_one_skew_window() {
     .unwrap();
     // Started exactly when the vector was signed: inside the warm-up, which
     // covers timestamps up to start + 300 inclusive.
-    let state = re_ofscp_server::AppState::with_clock(
-        config,
-        Arc::new(alice_keys()),
-        Arc::new(FixedClock(SIGNED_AT)),
-    );
+    let state = re_ofscp_server::AppState::builder(config)
+        .keys(Arc::new(alice_keys()))
+        .ledger(Arc::new(re_ofscp_server::replay::NoLedger))
+        .clock(Arc::new(FixedClock(SIGNED_AT)))
+        .build();
     let app = re_ofscp_server::router(state);
-    let mut req = Req::vector().build();
-    *req.uri_mut() = "/api/health".parse().unwrap();
+    let req = Req::health().build();
     let (status, json, _, retry) = send(&app, req).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(retry.as_deref(), Some("301"));
@@ -130,6 +129,7 @@ async fn replay_refused_through_the_last_acceptable_second() {
         provider_a(),
         300,
         replay,
+        Arc::new(NoLedger),
         Arc::new(alice_keys()),
         clock.clone(),
     ));
@@ -175,6 +175,7 @@ fn verifier_at(clock: Arc<SettableClock>) -> (Verifier, Arc<ReplayStore>) {
         provider_a(),
         300,
         replay.clone(),
+        Arc::new(NoLedger),
         Arc::new(alice_keys()),
         clock,
     );

@@ -20,6 +20,15 @@ jobs:
       # Conformance tests read the spec's vectors and samples from a sibling
       # checkout (../ofscp), as Forumall's CI does.
       - run: git clone --depth 1 https://github.com/lost-conn/ofscp "$GITHUB_WORKSPACE/../ofscp"
+      # Integration tests run against a real rhypedb-server at the commit
+      # Cargo.toml pins (scripts/install-rhypedb.sh reads it from there).
+      - id: rhypedb-rev
+        run: echo "rev=$(scripts/install-rhypedb.sh --print-rev)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.local/rhypedb-*
+          key: rhypedb-server-${{ runner.os }}-${{ steps.rhypedb-rev.outputs.rev }}
+      - run: scripts/install-rhypedb.sh
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all-targets

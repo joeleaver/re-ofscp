@@ -18,3 +18,17 @@ type DeviceKey {
     created_at: DateTime
     revoked: Bool
 }
+
+// The persistent replay ledger (spec §4.5 "Restarts"; docs/decisions/0001).
+// One row per accepted nonce, written before the request is accepted and
+// purged once expired. `key` is SHA-256 over (signer kind, key id, nonce).
+type ReplayNonce {
+    key: String @unique
+    kind: String
+    signer: String
+    domain: String
+    key_id: String
+    nonce: String
+    signed_at: DateTime
+    expires_at: DateTime @indexed
+}

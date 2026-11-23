@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 
 pub mod harness;
+pub mod rhypedb;
 
 use std::path::PathBuf;
 
