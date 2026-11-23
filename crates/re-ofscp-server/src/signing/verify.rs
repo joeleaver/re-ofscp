@@ -82,11 +82,20 @@ pub struct Verified {
     pub key_id: String,
 }
 
-/// A failure to resolve keys (network error, malformed key document, denied
-/// by federation policy, …). §4.5 step 6 answers all of them with `401`.
+/// A failure to resolve keys.
 #[derive(Debug, Clone, thiserror::Error)]
-#[error("{0}")]
-pub struct KeyError(pub String);
+pub enum KeyError {
+    /// The signer's keys could not be obtained from *them* (their provider
+    /// unreachable, a malformed key document, denied by federation policy).
+    /// §4.5 step 6: `401`.
+    #[error("keys unresolvable: {0}")]
+    Unresolvable(String),
+    /// *This* provider could not look the key up (its own database is
+    /// down). Not the client's fault: `503`, so it retries rather than
+    /// concluding its credentials are bad.
+    #[error("key store unavailable: {0}")]
+    Unavailable(String),
+}
 
 /// Boxed future returned by [`KeyResolver::resolve`].
 pub type KeyFuture<'a> =
@@ -165,9 +174,13 @@ pub enum VerifyError {
     /// Step 5: body digest mismatch.
     #[error("X-OFSCP-Content-Digest does not match the body")]
     Digest,
-    /// Step 6: no active key with that id (or lookup failed).
+    /// Step 6: no active key with that id (or the signer's keys could not
+    /// be obtained).
     #[error("unknown or revoked key")]
     UnknownKey,
+    /// Step 6: this provider's own key store is unavailable.
+    #[error("key store unavailable; retry shortly")]
+    KeysUnavailable,
     /// Step 7: bad signature.
     #[error("signature does not verify")]
     Signature,
@@ -180,7 +193,9 @@ impl From<VerifyError> for Problem {
             VerifyError::StoreFull { retry_after } | VerifyError::WarmingUp { retry_after } => {
                 Problem::service_unavailable(retry_after)
             }
-            VerifyError::LedgerUnavailable => Problem::service_unavailable(LEDGER_RETRY_SECS),
+            VerifyError::LedgerUnavailable | VerifyError::KeysUnavailable => {
+                Problem::service_unavailable(LEDGER_RETRY_SECS)
+            }
             VerifyError::RateLimited { retry_after } => Problem::too_many_requests(retry_after),
             _ => Problem::unauthorized(),
         };
@@ -416,9 +431,13 @@ impl Verifier {
         let key = match self.keys.resolve(&pre.signer, &pre.key_id, fresh).await {
             Ok(Some(key)) => key,
             Ok(None) => return Err(VerifyError::UnknownKey),
-            Err(e) => {
+            Err(KeyError::Unresolvable(e)) => {
                 tracing::debug!(error = %e, key_id = pre.key_id, "key resolution failed");
                 return Err(VerifyError::UnknownKey);
+            }
+            Err(KeyError::Unavailable(e)) => {
+                tracing::error!(error = %e, key_id = pre.key_id, "key store unavailable");
+                return Err(VerifyError::KeysUnavailable);
             }
         };
         if canonical::verify(&key, canonical, &pre.signature) {

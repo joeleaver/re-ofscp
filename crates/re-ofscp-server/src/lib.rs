@@ -105,6 +105,7 @@ impl AppStateBuilder {
         ));
         let accounts = Arc::new(Accounts::new(
             config.domain.clone(),
+            config.registration,
             db.clone(),
             self.remote_keys,
         ));
@@ -181,11 +182,19 @@ impl AppState {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/health", get(health))
-        .route("/api/auth/register", post(accounts::routes::register))
-        .route("/api/auth/login", post(accounts::routes::login))
+        .route(
+            "/api/auth/register",
+            post(accounts::routes::register).layer(auth_body_limit()),
+        )
+        .route(
+            "/api/auth/login",
+            post(accounts::routes::login).layer(auth_body_limit()),
+        )
         .route(
             "/api/auth/device-keys",
-            post(accounts::routes::register_device_key).get(accounts::routes::list_device_keys),
+            post(accounts::routes::register_device_key)
+                .layer(auth_body_limit())
+                .get(accounts::routes::list_device_keys),
         )
         .route(
             "/api/auth/device-keys/{key_id}",
@@ -208,6 +217,14 @@ pub fn router(state: AppState) -> Router {
         ))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
+}
+
+/// Body limit for the unauthenticated auth endpoints, whose bodies are a
+/// handle, a password (at most 1 KiB) and similar: far below axum's 2 MiB
+/// default, so nobody can make the provider buffer and parse megabytes
+/// before any check.
+fn auth_body_limit() -> axum::extract::DefaultBodyLimit {
+    axum::extract::DefaultBodyLimit::max(accounts::routes::AUTH_BODY_LIMIT)
 }
 
 /// `GET /api/health` — liveness plus a database reachability probe.

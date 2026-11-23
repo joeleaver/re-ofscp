@@ -3,8 +3,10 @@
 //! * [`RateLimiter`]: a token bucket per key (e.g. per client address):
 //!   `burst` requests at once, refilled at `per_minute`.
 //! * [`FailureBackoff`]: progressive lockout per key (e.g. per handle):
-//!   after `free` consecutive failures, each further failure locks the key
-//!   for a doubling interval, capped; a success clears it.
+//!   each attempt counts as a failure *before* it is checked (so concurrent
+//!   attempts cannot all slip in ahead of the first recorded failure); past
+//!   `free` of them the key is locked for a doubling interval, capped; a
+//!   success clears it.
 //!
 //! Both are bounded: past their capacity they drop idle entries first and,
 //! if still full, refuse new keys (fail closed) rather than forget a key
@@ -110,26 +112,25 @@ impl FailureBackoff {
         self.entries.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Refuse if `key` is locked at `now`.
-    pub fn check(&self, key: &str, now: i64) -> Result<(), Limited> {
-        match self.lock().get(key) {
-            Some(f) if f.locked_until > now => Err(Limited {
-                retry_after: u64::try_from(f.locked_until - now).unwrap_or(1).max(1),
-            }),
-            _ => Ok(()),
-        }
-    }
-
-    /// Record a failure for `key` at `now`.
-    pub fn fail(&self, key: &str, now: i64) {
+    /// Begin an attempt for `key` at `now`: refused if the key is locked;
+    /// otherwise counted as a failure up front, and refused if that pushes
+    /// it past the allowance. Call [`FailureBackoff::succeed`] if the attempt
+    /// then succeeds.
+    pub fn attempt(&self, key: &str, now: i64) -> Result<(), Limited> {
         let mut map = self.lock();
+        if let Some(f) = map.get(key)
+            && f.locked_until > now
+        {
+            return Err(Limited {
+                retry_after: u64::try_from(f.locked_until - now).unwrap_or(1).max(1),
+            });
+        }
         if !map.contains_key(key) && map.len() >= self.capacity {
-            // Forget keys that are not locked right now; if every tracked
-            // key is locked, stop tracking new ones (the caller's per-source
-            // limiter still applies).
+            // Forget keys that are not locked right now. If every tracked
+            // key is locked, refuse untracked ones (fail closed).
             map.retain(|_, f| f.locked_until > now);
             if map.len() >= self.capacity {
-                return;
+                return Err(Limited { retry_after: 1 });
             }
         }
         let f = map.entry(key.to_owned()).or_insert(Failures {
@@ -144,7 +145,11 @@ impl FailureBackoff {
                 .saturating_mul(1i64 << exp)
                 .min(self.max_secs);
             f.locked_until = now + secs;
+            return Err(Limited {
+                retry_after: u64::try_from(secs).unwrap_or(1).max(1),
+            });
         }
+        Ok(())
     }
 
     /// Clear `key` after a success.
@@ -190,23 +195,60 @@ mod tests {
     }
 
     #[test]
-    fn backoff_locks_progressively_and_clears_on_success() {
+    fn backoff_counts_attempts_up_front_and_clears_on_success() {
         let b = FailureBackoff::new(3, 60, 3600, 100);
         for _ in 0..3 {
-            b.fail("alice", T);
-            assert_eq!(b.check("alice", T), Ok(()));
+            assert_eq!(b.attempt("alice", T), Ok(()));
         }
-        b.fail("alice", T);
-        assert_eq!(b.check("alice", T), Err(Limited { retry_after: 60 }));
-        b.fail("alice", T);
-        assert_eq!(b.check("alice", T), Err(Limited { retry_after: 120 }));
-        for _ in 0..20 {
-            b.fail("alice", T);
+        // The fourth attempt is refused without being tried, and locks.
+        assert_eq!(b.attempt("alice", T), Err(Limited { retry_after: 60 }));
+        assert_eq!(b.attempt("alice", T), Err(Limited { retry_after: 60 }));
+        // After the lock, each further attempt doubles it.
+        assert_eq!(
+            b.attempt("alice", T + 60),
+            Err(Limited { retry_after: 120 })
+        );
+        assert_eq!(
+            b.attempt("alice", T + 180),
+            Err(Limited { retry_after: 240 })
+        );
+        for i in 0..20 {
+            let _ = b.attempt("alice", T + 10_000 * (i + 1));
         }
-        assert_eq!(b.check("alice", T), Err(Limited { retry_after: 3600 }));
-        assert_eq!(b.check("alice", T + 3600), Ok(()));
+        let later = T + 10_000 * 21;
+        assert_eq!(
+            b.attempt("alice", later),
+            Err(Limited { retry_after: 3600 })
+        );
         b.succeed("alice");
-        b.fail("alice", T);
-        assert_eq!(b.check("alice", T), Ok(()));
+        assert_eq!(b.attempt("alice", later), Ok(()));
+        assert_eq!(b.attempt("bob", later), Ok(()), "keys are independent");
+    }
+
+    #[test]
+    fn concurrent_attempts_cannot_exceed_the_allowance() {
+        let b = std::sync::Arc::new(FailureBackoff::new(5, 60, 3600, 100));
+        let admitted: usize = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..40)
+                .map(|_| {
+                    let b = b.clone();
+                    scope.spawn(move || usize::from(b.attempt("alice", T).is_ok()))
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).sum()
+        });
+        assert_eq!(admitted, 5);
+    }
+
+    #[test]
+    fn backoff_capacity_fails_closed() {
+        let b = FailureBackoff::new(0, 60, 3600, 2);
+        let _ = b.attempt("a", T);
+        let _ = b.attempt("b", T);
+        // Full of locked keys: an untracked key is refused (retry soon).
+        assert_eq!(b.attempt("c", T), Err(Limited { retry_after: 1 }));
+        // Once those locks lapse they are dropped and "c" is tracked (and,
+        // with no free attempts, locked by its own attempt).
+        assert_eq!(b.attempt("c", T + 60), Err(Limited { retry_after: 60 }));
     }
 }

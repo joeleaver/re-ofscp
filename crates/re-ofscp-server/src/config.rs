@@ -6,6 +6,7 @@
 use std::net::SocketAddr;
 
 use re_ofscp_types::Authority;
+use re_ofscp_types::auth::RegistrationMode;
 
 use crate::replay::ReplayLimits;
 
@@ -22,11 +23,15 @@ pub struct Config {
     /// where jkbase's managed `[database]` listens inside the app VM).
     pub rhypedb_addr: String,
     /// A request header carrying the client's address, set by a trusted
-    /// reverse proxy (`CLIENT_IP_HEADER`, e.g. `x-forwarded-for`; its first
-    /// entry is used). Unset: the TCP peer address. Only set this when every
-    /// request passes through a proxy that overwrites the header, or clients
-    /// can choose their own rate-limit key.
+    /// reverse proxy (`CLIENT_IP_HEADER`, e.g. `x-forwarded-for`; its
+    /// **last** entry, the one the proxy appended, is used). Unset: the TCP
+    /// peer address. Only set this when every request passes through that
+    /// proxy, or clients can choose their own rate-limit key.
     pub client_ip_header: Option<String>,
+    /// Who may register (`REGISTRATION`, §4.1.1): `invite` (default) or
+    /// `closed`. `open` is refused: this provider's accounts are created by
+    /// admins and invitations only (docs/decisions/0004).
+    pub registration: RegistrationMode,
     /// Replay-store bounds (spec §4.5):
     /// * `REPLAY_LOCAL_TOTAL` / `REPLAY_REMOTE_TOTAL`: live nonces from local
     ///   and from remote signers (default 250 000 each; full → `503` for that
@@ -87,11 +92,25 @@ impl Config {
                 reason: "not a valid header name".to_owned(),
             });
         }
+        let registration = match get("REGISTRATION").as_deref().map(str::trim) {
+            None | Some("invite") => RegistrationMode::Invite,
+            Some("closed") => RegistrationMode::Closed,
+            Some(other) => {
+                return Err(ConfigError::Invalid {
+                    name: "REGISTRATION",
+                    reason: format!(
+                        "{other:?} is not supported: use \"invite\" or \"closed\" \
+                         (open self-registration is not offered)"
+                    ),
+                });
+            }
+        };
         Ok(Self {
             domain,
             bind,
             rhypedb_addr,
             client_ip_header,
+            registration,
             replay,
         })
     }
@@ -152,6 +171,26 @@ mod tests {
         );
         assert_eq!(c.bind.to_string(), "0.0.0.0:8080");
         assert_eq!(c.rhypedb_addr, "127.0.0.1:4201");
+        assert_eq!(c.registration, RegistrationMode::Invite);
+    }
+
+    #[test]
+    fn registration_mode_is_invite_or_closed() {
+        let mode = |v: &str| {
+            Config::from_lookup(env(&[("DOMAIN", "a.example"), ("REGISTRATION", v)]))
+                .map(|c| c.registration)
+        };
+        assert_eq!(mode("closed").unwrap(), RegistrationMode::Closed);
+        assert_eq!(mode(" invite ").unwrap(), RegistrationMode::Invite);
+        for bad in ["open", "Invite", ""] {
+            assert!(matches!(
+                mode(bad),
+                Err(ConfigError::Invalid {
+                    name: "REGISTRATION",
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]

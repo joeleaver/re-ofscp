@@ -6,19 +6,24 @@
 //! registers a device key with it; every request after that is signed.
 
 pub mod bootstrap;
+pub mod invites;
 pub mod keys;
 pub mod password;
+pub mod register;
 pub mod routes;
 pub mod store;
 
 use std::sync::Arc;
 
+use re_ofscp_types::auth::RegistrationMode;
 use re_ofscp_types::{Authority, is_valid_handle};
 use tokio::sync::{Mutex, broadcast};
 
 pub use bootstrap::{BOOTSTRAP_TTL_SECS, BootstrapTokens, IssueError};
+pub use invites::{InviteStore, IssuedInvite};
 pub use keys::{NoRemoteKeys, ProviderKeys};
 pub use password::{PasswordError, Passwords};
+pub use register::{InviteError, RegisterError};
 pub use store::{AccountStore, DeviceKey, StoreError, User};
 
 use crate::db::Db;
@@ -84,8 +89,12 @@ pub fn check_new_handle(handle: &str) -> Result<(), CreateError> {
 pub struct Accounts {
     /// This provider's authority.
     pub domain: Authority,
+    /// Who may register (§4.1.1).
+    pub registration: RegistrationMode,
     /// Storage.
     pub store: AccountStore,
+    /// Account invites.
+    pub invites: InviteStore,
     /// Password hashing.
     pub passwords: Passwords,
     /// Outstanding bootstrap tokens.
@@ -99,19 +108,29 @@ pub struct Accounts {
     /// Serializes device-key registration, so the per-account key cap holds
     /// exactly (registration is rare).
     pub key_registration: Mutex<()>,
+    /// Serializes claiming an invite with creating its account.
+    registration_lock: Mutex<()>,
     revocations: broadcast::Sender<Revocation>,
 }
 
 impl Accounts {
-    /// Account services over `db` for `domain`, resolving remote signers
-    /// with `remote`.
-    pub fn new(domain: Authority, db: Arc<Db>, remote: Arc<dyn KeyResolver>) -> Self {
+    /// Account services over `db` for `domain`, registering by
+    /// `registration`, resolving remote signers with `remote`.
+    pub fn new(
+        domain: Authority,
+        registration: RegistrationMode,
+        db: Arc<Db>,
+        remote: Arc<dyn KeyResolver>,
+    ) -> Self {
+        let invites = InviteStore::new(db.clone());
         let store = AccountStore::new(db);
         let keys = Arc::new(ProviderKeys::new(domain.clone(), store.clone(), remote));
         let (revocations, _) = broadcast::channel(1024);
         Self {
             domain,
+            registration,
             store,
+            invites,
             passwords: Passwords::new(4),
             tokens: BootstrapTokens::new(100_000),
             keys,
@@ -120,6 +139,7 @@ impl Accounts {
             // 5 free failures, then 60 s doubling to 1 h.
             login_backoff: FailureBackoff::new(5, 60, 3600, 100_000),
             key_registration: Mutex::new(()),
+            registration_lock: Mutex::new(()),
             revocations,
         }
     }
@@ -148,15 +168,20 @@ impl Accounts {
 
     /// Disable an account: it can no longer log in, its keys stop
     /// verifying, outstanding bootstrap tokens die, and its keys are revoked.
+    ///
+    /// The status change is what takes effect (logins and key lookups check
+    /// it), so once it is stored the in-process effects run unconditionally,
+    /// before the fallible bulk revocation: a failure there leaves the keys
+    /// marked active but unusable, and calling this again finishes the job.
     pub async fn disable_account(&self, user: &User, now: i64) -> Result<(), StoreError> {
         self.store.set_status(user, store::status::DISABLED).await?;
         self.tokens.revoke_handle(&user.handle);
-        self.store.revoke_all_keys(&user.handle, now).await?;
         self.keys.invalidate(&user.handle);
         self.announce(Revocation {
             handle: user.handle.clone(),
             key_id: None,
         });
+        self.store.revoke_all_keys(&user.handle, now).await?;
         Ok(())
     }
 

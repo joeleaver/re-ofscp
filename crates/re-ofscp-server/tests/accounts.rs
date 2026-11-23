@@ -3,121 +3,15 @@
 
 mod common;
 
-use std::sync::Arc;
-
-use axum::Router;
-use axum::body::Body;
-use axum::http::{Request, StatusCode, header};
+use axum::http::{StatusCode, header};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
+use common::accounts::*;
 use common::harness::*;
-use common::rhypedb::RhypeServer;
-use ed25519_dalek::SigningKey;
 use re_ofscp_server::accounts::{CreateError, MAX_DEVICE_KEYS, StoreError};
 use re_ofscp_server::signing::{Signer, StaticKeys};
-use re_ofscp_server::{AppState, Config, router};
 use re_ofscp_types::Actor;
 use serde_json::{Value, json};
-
-/// "Now" for every test: the store began well before, so no warm-up.
-const NOW: &str = "2026-01-01T12:00:00Z";
-
-struct Env {
-    _server: RhypeServer,
-    state: AppState,
-    app: Router,
-}
-
-fn config(server: &RhypeServer) -> Config {
-    let addr = server.tcp_addr();
-    Config::from_lookup(move |k| match k {
-        "DOMAIN" => Some("providera.com".into()),
-        "RHYPEDB_ADDR" => Some(addr.clone()),
-        // Tests choose their own source address per request.
-        "CLIENT_IP_HEADER" => Some("x-test-ip".into()),
-        _ => None,
-    })
-    .unwrap()
-}
-
-async fn env_with(remote: Option<StaticKeys>) -> Env {
-    let server = RhypeServer::start();
-    let clock = SettableClock::at(SIGNED_AT - time::Duration::seconds(400));
-    let mut b = AppState::builder(config(&server)).clock(clock.clone());
-    if let Some(r) = remote {
-        b = b.remote_keys(Arc::new(r));
-    }
-    let state = b.build();
-    state.restore_replay().await.unwrap();
-    clock.set(SIGNED_AT);
-    let app = router(state.clone());
-    Env {
-        _server: server,
-        state,
-        app,
-    }
-}
-
-async fn env() -> Env {
-    env_with(None).await
-}
-
-async fn create(env: &Env, handle: &str, password: &str) {
-    env.state
-        .accounts
-        .create_account(handle, "Some Name", password, SIGNED_AT.unix_timestamp())
-        .await
-        .unwrap();
-}
-
-fn post_json(path: &str, body: Value, ip: &str) -> Request<Body> {
-    Request::post(path)
-        .header("host", "providera.com")
-        .header("content-type", "application/json")
-        .header("x-test-ip", ip)
-        .body(Body::from(body.to_string()))
-        .unwrap()
-}
-
-async fn login(
-    env: &Env,
-    handle: &str,
-    password: &str,
-    ip: &str,
-) -> (StatusCode, Value, Option<String>) {
-    let (s, j, _, r) = send(
-        &env.app,
-        post_json(
-            "/api/auth/login",
-            json!({"handle": handle, "password": password}),
-            ip,
-        ),
-    )
-    .await;
-    (s, j, r)
-}
-
-async fn register_key(env: &Env, token: &str, key: &SigningKey, ip: &str) -> (StatusCode, Value) {
-    let body = json!({
-        "public_key": B64.encode(key.verifying_key().to_bytes()),
-        "algorithm": "Ed25519",
-        "device_name": "Firefox on Linux",
-    });
-    let mut req = post_json("/api/auth/device-keys", body, ip);
-    req.headers_mut().insert(
-        header::AUTHORIZATION,
-        format!("Bearer {token}").parse().unwrap(),
-    );
-    let (s, j, _, _) = send(&env.app, req).await;
-    (s, j)
-}
-
-fn get(path: &str) -> Request<Body> {
-    Request::get(path)
-        .header("host", "providera.com")
-        .body(Body::empty())
-        .unwrap()
-}
 
 #[tokio::test]
 async fn login_register_a_key_sign_list_and_revoke() {
@@ -244,14 +138,15 @@ async fn failed_logins_reveal_nothing_and_lock_out_progressively() {
     assert_eq!(wrong, unknown);
     assert_eq!(wrong, invalid);
 
-    // Five free failures (one done above), then a lockout, even for the
-    // right password.
+    // Five free attempts (one done above); the sixth is refused without
+    // being tried, and so is the right password during the lockout.
     for i in 0..4 {
         let (s, _, _) = login(&env, "alice", "wrong password!", &format!("10.1.0.{i}")).await;
         assert_eq!(s, StatusCode::UNAUTHORIZED);
     }
-    let (s, _, _) = login(&env, "alice", "wrong password!", "10.1.1.1").await;
-    assert_eq!(s, StatusCode::UNAUTHORIZED, "the sixth failure is recorded");
+    let (s, _, retry) = login(&env, "alice", "wrong password!", "10.1.1.1").await;
+    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(retry.as_deref(), Some("60"));
     let (s, body, retry) = login(&env, "alice", "correct horse battery", "10.1.1.2").await;
     assert_eq!(s, StatusCode::TOO_MANY_REQUESTS, "{body}");
     assert_eq!(body["errorCode"], "too_many_requests");
@@ -325,12 +220,12 @@ async fn disabled_accounts_cannot_log_in_and_their_keys_stop_verifying() {
         NOW,
     );
     assert_eq!(send(&env.app, req).await.0, StatusCode::UNAUTHORIZED);
-    assert_eq!(
-        send(&env.app, get("/.well-known/ofscp/users/carol/keys"))
-            .await
-            .0,
-        StatusCode::NOT_FOUND
-    );
+    // The keys endpoint answers as for a handle that was never registered.
+    let (s, carol, _, _) = send(&env.app, get("/.well-known/ofscp/users/carol/keys")).await;
+    let (_, nobody, _, _) = send(&env.app, get("/.well-known/ofscp/users/nobody/keys")).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(carol["keys"], json!([]));
+    assert_eq!(carol["keys"], nobody["keys"]);
 }
 
 #[tokio::test]
@@ -409,31 +304,17 @@ async fn an_account_holds_at_most_the_maximum_number_of_keys() {
 }
 
 #[tokio::test]
-async fn registration_is_closed() {
-    let env = env().await;
-    let (s, j, _, _) = send(
-        &env.app,
-        post_json(
-            "/api/auth/register",
-            json!({"handle": "mallory", "password": "password123"}),
-            "10.0.3.1",
-        ),
-    )
-    .await;
-    assert_eq!(s, StatusCode::FORBIDDEN);
-    common::assert_valid(&common::schema("problem-details.json"), &j);
-    assert_eq!(j["errorCode"], "registration_closed");
-}
-
-#[tokio::test]
 async fn remote_actors_cannot_use_local_account_endpoints() {
     let bob = new_key();
     let bob_actor = Actor::parse_canonical("bob@providerb.com").unwrap();
-    let env = env_with(Some(StaticKeys::default().with(
-        Signer::Actor(bob_actor),
-        "dk_bob",
-        bob.verifying_key(),
-    )))
+    let env = env_with(EnvOptions {
+        remote: Some(StaticKeys::default().with(
+            Signer::Actor(bob_actor),
+            "dk_bob",
+            bob.verifying_key(),
+        )),
+        ..EnvOptions::default()
+    })
     .await;
     // Even with a local "bob" present, bob@providerb.com is someone else.
     create(&env, "bob", "correct horse battery").await;
@@ -483,12 +364,13 @@ async fn account_creation_validates_handles_and_rejects_duplicates() {
             .await,
         Err(CreateError::Store(StoreError::HandleTaken))
     );
-    assert_eq!(
-        send(&env.app, get("/.well-known/ofscp/users/nobody/keys"))
-            .await
-            .0,
-        StatusCode::NOT_FOUND
-    );
+    // Unknown handles do not reveal that they are unknown (schema-valid,
+    // no keys); impossible ones are simply not found.
+    let (s, nobody, _, _) = send(&env.app, get("/.well-known/ofscp/users/nobody/keys")).await;
+    assert_eq!(s, StatusCode::OK);
+    common::assert_valid(&common::schema("user-keys-response.json"), &nobody);
+    assert_eq!(nobody["actor"], "nobody@providera.com");
+    assert_eq!(nobody["keys"], json!([]));
     assert_eq!(
         send(&env.app, get("/.well-known/ofscp/users/BAD/keys"))
             .await

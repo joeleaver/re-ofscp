@@ -1,20 +1,45 @@
 # 0004: Accounts, login, bootstrap tokens and device keys
 
-- **Status:** accepted. Invite-based sign-up is pending the oracle (see
-  "Open").
+- **Status:** accepted.
 - **Date:** 2026-11-23
-- **Spec:** §2.2.1, §4.1–§4.7
+- **Spec:** §2.2.1, §4.1–§4.7; registration modes and account invites from
+  lost-conn/ofscp#18 (merged)
 
 ## Decisions
 
 ### Who can create accounts (Joe, 2026-11-23)
 
 **Admins and invitations only. There is no open self-registration.**
-`POST /api/auth/register` answers `403 registration_closed`, an extension
-code paired with its status. Accounts are created through
-`Accounts::create_account`, which the admin API will call (with admin
-authentication and an audit log), and by invitation once the protocol for
-presenting an invite is settled.
+
+- **Mode:** `REGISTRATION` is `invite` (the default) or `closed`. `open` is
+  refused at startup. Discovery will advertise it as
+  `authentication.registration` (§3.1) when the discovery document lands.
+- **Admins** create accounts directly through `Accounts::create_account`,
+  which the admin API will call, with admin authentication and an audit log.
+- **Invites** (§4.1.1): `Accounts::create_invite` issues `ai_` + 256 random
+  bits, valid 7 days by default (at most 30), optionally pinned to a handle,
+  shared as `https://{DOMAIN}/register?invite={token}`. Only the token's
+  SHA-256 is stored (`RegistrationInvite`), and tokens are never logged. A
+  pinned handle must be a valid registration handle and not already taken
+  when the invite is issued.
+- **`POST /api/auth/register`** checks, in the spec's order:
+  1. Closed mode → `403 registration_closed`, invite or not.
+  2. No invite, or one that is unknown, expired, used, or pinned to another
+     handle → `403 invite_required`. The body is identical in every case.
+  3. Invalid handle or password → `400`. Handle taken → `409`.
+  4. Hash, then claim the invite and create the account. Both run under one
+     in-process lock: the claim is a conditional update
+     (`used == false && expires_at > now`), and a claim whose account can't
+     be created is released. The invite therefore stays usable after a
+     failed registration, and of two registrations with one invite exactly
+     one succeeds.
+  5. `201` with a bootstrap token.
+- **Display name:** starts as the handle; the registration request carries
+  none.
+- **`recoveryEmail`** is accepted and ignored: there's no email channel yet
+  (see "Not here yet").
+- **Single instance:** the lock assumes one server process, as the replay
+  store already does.
 
 ### Passwords (§4.1.4)
 
@@ -34,19 +59,29 @@ presenting an invite is settled.
 ### Abuse resistance (§4.1.5)
 
 - **Per source address:** a token bucket of 10 at once, then 20 per minute,
-  on login and device-key registration.
-- **Choosing the address:** it comes from `CLIENT_IP_HEADER` (first entry)
-  when that's configured, otherwise the TCP peer. Set the header only behind
-  a proxy that overwrites it; otherwise clients choose their own key.
+  on registration, login and device-key registration.
+- **Choosing the address:** it comes from the **last** entry of
+  `CLIENT_IP_HEADER` (the one the trusted proxy appended) when that's
+  configured, otherwise the TCP peer. IPv6 addresses are grouped by /64, so
+  one subscriber can't mint fresh keys from its own prefix. Set the header
+  only when every request passes through that proxy.
   - **Check on the first deploy:** what jkbase's proxy sends.
-- **Per handle:** 5 free failures, then a lockout of 60 s that doubles per
-  further failure, up to 1 h. A success clears it. During a lockout even the
-  right password gets `429`, without hashing anything.
+- **Per handle:** every login attempt for a valid handle counts as a failure
+  *before* the password is checked, and a success clears the count. So
+  concurrent guesses can't all get in ahead of the first recorded failure.
+  After 5 attempts the handle is locked for 60 s, doubling per further
+  attempt up to 1 h. During a lockout even the right password gets `429`,
+  without hashing anything. Invalid handles aren't tracked: they can't
+  exist, and tracking them would let anyone fill the table.
   - **Trade-off:** someone can deliberately lock a victim out for up to an
     hour. The spec suggests this behaviour, and it's the usual trade against
     online guessing.
 - **Bounded memory:** both trackers are bounded, and they fail closed when
   full.
+- **Bounded hashing queue:** a request waits at most 5 s for a hashing slot,
+  then gets `503` with `Retry-After`, so a flood can't queue without limit.
+- **Body limit:** the three unauthenticated auth endpoints accept at most
+  16 KiB (`413` beyond).
 
 ### Bootstrap tokens (§4.2)
 
@@ -73,7 +108,9 @@ presenting an invite is settled.
   broadcast so the WebSocket layer can close sessions with `4003` (§4.7.1).
 - **Keys endpoint:** `GET /.well-known/ofscp/users/{handle}/keys` serves
   `cache_until` = now + 5 min, plus a matching `Cache-Control` header.
-  Unknown, invalid or disabled handles get `404`.
+  A valid handle without an active account (unknown or disabled) gets `200`
+  with no keys, the same as Forumall, so this public endpoint can't be used
+  to enumerate accounts. An invalid handle gets `404`.
 - **Local-account endpoints:** list and revoke refuse remote actors and
   provider signatures with `403` (security requirement 1).
 - **No relation field in the schema:** keys are stored by `handle`. At the
@@ -85,9 +122,21 @@ presenting an invite is settled.
 The steps run in this order:
 1. Set the status to `disabled`, so logins fail and keys stop verifying.
 2. Drop outstanding bootstrap tokens.
-3. Revoke every key.
-4. Clear the key cache.
-5. Broadcast the revocation.
+3. Clear the key cache.
+4. Broadcast the revocation.
+5. Revoke every key.
+
+The status change is what takes effect, so the in-process steps run as soon
+as it's stored. Only the bulk revocation can fail afterwards: if it does,
+the keys stay marked active but can't verify, and running the disable again
+finishes it.
+
+A lookup that read a key just before an invalidation can't put it back in
+the cache: every invalidation bumps an epoch, and a lookup caches its result
+only if the epoch is unchanged.
+
+If the key store is unreachable, verification answers `503` (retry), not
+`401`.
 
 ### Key resolution
 
@@ -96,18 +145,13 @@ The steps run in this order:
 store. Everything else goes to a remote resolver. Until remote resolution
 with the §8 outbound rules lands, `NoRemoteKeys` refuses every remote signer.
 
-## Open
-
-**How a client presents an invite at sign-up.** The registration schema
-forbids extra fields, so this has gone to the oracle. The proposal: a
-discovery field `authentication.registration` (`open` / `invite` /
-`closed`), an optional `inviteToken`, and a `403 registration_invite_required`.
-Until it's settled, registration stays closed.
-
 ## Not here yet
 
-- **Admin API:** admin sign-in and the admin API that calls `create_account`
-  and `disable_account` come with the next PR.
+- **Admin API:** admin sign-in and the admin API that calls
+  `create_account`, `disable_account` and `create_invite` (plus listing and
+  revoking invites) come with the next PR.
+- **Web sign-up page:** the invite link's `/register` page (served with
+  `Referrer-Policy: no-referrer`) is a client concern; it isn't served yet.
 - **Password recovery (§4.1.3):** it needs an email channel. It's a SHOULD,
   and it's not planned until there's one.
 - **Discovery and CORS:** the discovery document (§3.1) and CORS (§3.4) are a

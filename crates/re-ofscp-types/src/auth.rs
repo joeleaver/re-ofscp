@@ -16,6 +16,55 @@ pub struct LoginRequest {
     pub password: String,
 }
 
+/// `POST /api/auth/register` request (§4.1.1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegistrationRequest {
+    /// The handle to register (§2.2.1).
+    pub handle: String,
+    /// The new account's password (§4.1.4).
+    pub password: String,
+    /// Address for password recovery (§4.1.3).
+    #[serde(
+        default,
+        rename = "recoveryEmail",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub recovery_email: Option<String>,
+    /// Account invite, for a provider whose registration mode is
+    /// [`RegistrationMode::Invite`].
+    #[serde(
+        default,
+        rename = "inviteToken",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub invite_token: Option<String>,
+}
+
+/// Who may register on a provider (§4.1.1), advertised in discovery as
+/// `provider.authentication.registration`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RegistrationMode {
+    /// Anyone may register.
+    Open,
+    /// Registration needs a provider-issued account invite.
+    Invite,
+    /// No self-registration.
+    Closed,
+}
+
+impl RegistrationMode {
+    /// The wire value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Invite => "invite",
+            Self::Closed => "closed",
+        }
+    }
+}
+
 /// The bootstrap response to registration and login (§4.1, §4.2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BootstrapResponse {

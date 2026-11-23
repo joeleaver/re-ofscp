@@ -31,6 +31,23 @@ type DeviceKey {
     revoked_at: DateTime
 }
 
+// An account invite (§4.1.1, lost-conn/ofscp#18): single-use, time-limited,
+// optionally pinned to a handle. Only the token's SHA-256 is stored.
+// `used_at` and `used_by` describe the use only while `used` is true (a
+// registration that fails after claiming the invite releases it again).
+type RegistrationInvite {
+    token_hash: String @unique
+    // The pinned handle, absent when the invite is for any handle.
+    handle: String
+    // The admin who issued it.
+    created_by: String
+    created_at: DateTime
+    expires_at: DateTime @indexed
+    used: Bool
+    used_at: DateTime
+    used_by: String
+}
+
 // The persistent replay ledger (spec §4.5 "Restarts"; docs/decisions/0001).
 // One row per accepted nonce, written before the request is accepted and
 // purged once expired. `key` is SHA-256 over (signer kind, key id, nonce).

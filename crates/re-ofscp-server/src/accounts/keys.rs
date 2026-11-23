@@ -39,12 +39,24 @@ impl KeyResolver for NoRemoteKeys {
 
 type CacheKey = (String, String);
 
+/// The key cache and its invalidation epoch, under one lock.
+///
+/// A lookup notes the epoch before reading the store and inserts its result
+/// only if the epoch is unchanged. Every invalidation bumps the epoch, so a
+/// lookup that read a key just before it was revoked can never put it back
+/// into the cache after the invalidation cleared it.
+#[derive(Default)]
+struct Cache {
+    entries: HashMap<CacheKey, (VerifyingKey, Instant)>,
+    epoch: u64,
+}
+
 /// Local keys from the account store; everything else from `remote`.
 pub struct ProviderKeys {
     local: Authority,
     store: AccountStore,
     remote: Arc<dyn KeyResolver>,
-    cache: Mutex<HashMap<CacheKey, (VerifyingKey, Instant)>>,
+    cache: Mutex<Cache>,
 }
 
 impl std::fmt::Debug for ProviderKeys {
@@ -62,17 +74,20 @@ impl ProviderKeys {
             local,
             store,
             remote,
-            cache: Mutex::new(HashMap::new()),
+            cache: Mutex::new(Cache::default()),
         }
     }
 
-    fn cache(&self) -> std::sync::MutexGuard<'_, HashMap<CacheKey, (VerifyingKey, Instant)>> {
+    fn cache(&self) -> std::sync::MutexGuard<'_, Cache> {
         self.cache.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Forget cached keys of `handle` (a key revoked, the account disabled).
+    /// Forget cached keys of `handle` (a key revoked, the account disabled),
+    /// and stop any lookup already in flight from caching what it read.
     pub fn invalidate(&self, handle: &str) {
-        self.cache().retain(|(h, _), _| h != handle);
+        let mut cache = self.cache();
+        cache.epoch = cache.epoch.wrapping_add(1);
+        cache.entries.retain(|(h, _), _| h != handle);
     }
 
     async fn resolve_local(
@@ -82,17 +97,21 @@ impl ProviderKeys {
         fresh: bool,
     ) -> Result<Option<VerifyingKey>, KeyError> {
         let cache_key = (handle.to_owned(), key_id.to_owned());
-        if !fresh
-            && let Some((key, at)) = self.cache().get(&cache_key)
-            && at.elapsed() < CACHE_TTL
-        {
-            return Ok(Some(*key));
-        }
+        let epoch = {
+            let cache = self.cache();
+            if !fresh
+                && let Some((key, at)) = cache.entries.get(&cache_key)
+                && at.elapsed() < CACHE_TTL
+            {
+                return Ok(Some(*key));
+            }
+            cache.epoch
+        };
         let user = self
             .store
             .find_user(handle)
             .await
-            .map_err(|e| KeyError(e.to_string()))?;
+            .map_err(|e| KeyError::Unavailable(e.to_string()))?;
         if !user.is_some_and(|u| u.is_active()) {
             return Ok(None);
         }
@@ -100,20 +119,24 @@ impl ProviderKeys {
             .store
             .active_key(handle, key_id)
             .await
-            .map_err(|e| KeyError(e.to_string()))?
+            .map_err(|e| KeyError::Unavailable(e.to_string()))?
         else {
             return Ok(None);
         };
         let Some(key) = decode_public_key(&stored.public_key) else {
-            return Err(KeyError(format!(
+            return Err(KeyError::Unavailable(format!(
                 "stored key {key_id} is not a valid Ed25519 key"
             )));
         };
         let mut cache = self.cache();
-        if cache.len() >= CACHE_MAX {
-            cache.clear();
+        // Invalidated since we read the store: return what we read for this
+        // one request (it was valid when read), but never cache it.
+        if cache.epoch == epoch {
+            if cache.entries.len() >= CACHE_MAX {
+                cache.entries.clear();
+            }
+            cache.entries.insert(cache_key, (key, Instant::now()));
         }
-        cache.insert(cache_key, (key, Instant::now()));
         Ok(Some(key))
     }
 }

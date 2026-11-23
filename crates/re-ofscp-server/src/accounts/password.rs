@@ -34,10 +34,21 @@ pub enum PasswordError {
     /// Shorter than [`MIN_PASSWORD_LEN`] or longer than [`MAX_PASSWORD_LEN`].
     #[error("password must be {MIN_PASSWORD_LEN} to {MAX_PASSWORD_LEN} bytes")]
     Length,
+    /// Every hashing slot stayed busy for [`QUEUE_WAIT`]: answer `503`.
+    #[error("password hashing is saturated")]
+    Busy,
     /// Hashing failed or a stored hash is unreadable (a server fault).
     #[error("password hashing failed: {0}")]
     Internal(String),
 }
+
+/// Longest a request waits for a hashing slot before giving up with
+/// [`PasswordError::Busy`], so a flood queues boundedly instead of starving
+/// every sign-in indefinitely.
+pub const QUEUE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// `Retry-After` for [`PasswordError::Busy`].
+pub const BUSY_RETRY_SECS: u64 = 5;
 
 fn argon2() -> Result<Argon2<'static>, PasswordError> {
     let params = Params::new(M_COST_KIB, T_COST, P_COST, None)
@@ -95,13 +106,21 @@ fn dummy_hash() -> Result<&'static str, PasswordError> {
 #[derive(Debug, Clone)]
 pub struct Passwords {
     permits: Arc<Semaphore>,
+    queue_wait: std::time::Duration,
 }
 
 impl Passwords {
     /// Allow `concurrent` operations at once (each holds 64 MiB).
     pub fn new(concurrent: usize) -> Self {
+        Self::with_queue_wait(concurrent, QUEUE_WAIT)
+    }
+
+    /// As [`Passwords::new`], giving up with [`PasswordError::Busy`] after
+    /// `queue_wait` without a slot.
+    pub fn with_queue_wait(concurrent: usize, queue_wait: std::time::Duration) -> Self {
         Self {
             permits: Arc::new(Semaphore::new(concurrent.max(1))),
+            queue_wait,
         }
     }
 
@@ -109,10 +128,9 @@ impl Passwords {
         &self,
         f: impl FnOnce() -> Result<T, PasswordError> + Send + 'static,
     ) -> Result<T, PasswordError> {
-        let _permit = self
-            .permits
-            .acquire()
+        let _permit = tokio::time::timeout(self.queue_wait, self.permits.acquire())
             .await
+            .map_err(|_| PasswordError::Busy)?
             .map_err(|e| PasswordError::Internal(e.to_string()))?;
         tokio::task::spawn_blocking(f)
             .await
@@ -167,6 +185,20 @@ mod tests {
         assert!(!p.verify("correct horse", None).await.unwrap());
         // Salts differ.
         assert_ne!(phc, p.hash("correct horse").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_saturated_queue_answers_busy_instead_of_waiting() {
+        let p = Passwords::with_queue_wait(1, std::time::Duration::from_millis(1));
+        // Hold the only slot, as a long-running hash would.
+        let held = p.permits.clone().acquire_owned().await.unwrap();
+        assert_eq!(p.hash("correct horse").await, Err(PasswordError::Busy));
+        assert_eq!(
+            p.verify("correct horse", None).await,
+            Err(PasswordError::Busy)
+        );
+        drop(held);
+        assert!(p.hash("correct horse").await.is_ok());
     }
 
     #[tokio::test]

@@ -1,6 +1,7 @@
 //! Shared helpers for integration tests.
 #![allow(dead_code)]
 
+pub mod accounts;
 pub mod harness;
 pub mod rhypedb;
 
