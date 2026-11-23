@@ -64,7 +64,13 @@ struct Harness {
 }
 
 fn harness_with(keys: Arc<dyn KeyResolver>, now: OffsetDateTime, capacity: usize) -> Harness {
-    let replay = Arc::new(ReplayStore::new(capacity, 600, SIGNED_AT.unix_timestamp()));
+    // The store's warm-up ended exactly at SIGNED_AT.
+    let replay = Arc::new(ReplayStore::new(
+        capacity,
+        600,
+        SIGNED_AT.unix_timestamp() - 300,
+        300,
+    ));
     let verifier = Arc::new(Verifier::new(
         provider_a(),
         300,
@@ -308,13 +314,38 @@ async fn clock_skew_beyond_300s_is_refused() {
 }
 
 #[tokio::test]
-async fn signatures_from_before_startup_are_refused() {
-    // The harness's replay floor is SIGNED_AT; one second earlier was
-    // potentially recorded by a previous process.
+async fn requests_during_restart_warm_up_get_503_with_retry_after() {
+    // The store's warm-up ends at SIGNED_AT; a request timestamped one second
+    // earlier may have been recorded by a previous process.
     let h = harness();
     let mut r = Req::vector();
     r.timestamp = "2026-01-01T11:59:59Z".into();
-    assert_eq!(send(&h.app, r.build()).await.0, StatusCode::UNAUTHORIZED);
+    let (status, json, _, retry) = send(&h.app, r.build()).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(json["errorCode"], "service_unavailable");
+    assert_eq!(retry.as_deref(), Some("1"));
+}
+
+#[tokio::test]
+async fn production_state_warms_up_for_one_skew_window() {
+    let config = re_ofscp_server::Config::from_lookup(|k| match k {
+        "DOMAIN" => Some("providera.com".into()),
+        "RHYPEDB_ADDR" => Some("127.0.0.1:9".into()),
+        _ => None,
+    })
+    .unwrap();
+    // Started exactly when the vector was signed: inside the warm-up.
+    let state = re_ofscp_server::AppState::with_clock(
+        config,
+        Arc::new(alice_keys()),
+        Arc::new(FixedClock(SIGNED_AT)),
+    );
+    let app = re_ofscp_server::router(state);
+    let mut req = Req::vector().build();
+    *req.uri_mut() = "/api/health".parse().unwrap();
+    let (status, _, _, retry) = send(&app, req).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(retry.as_deref(), Some("300"));
 }
 
 #[tokio::test]
@@ -395,10 +426,13 @@ async fn production_router_rejects_signed_requests_it_cannot_verify() {
         _ => None,
     })
     .unwrap();
+    // Started 300 s before signing (the request is 300 s ahead, the most
+    // skew allows), so the warm-up ends exactly at SIGNED_AT and step 6 is
+    // reached.
     let state = re_ofscp_server::AppState::with_clock(
         config,
         Arc::new(StaticKeys::default()),
-        Arc::new(FixedClock(SIGNED_AT)),
+        Arc::new(FixedClock(SIGNED_AT - time::Duration::seconds(300))),
     );
     let app = re_ofscp_server::router(state);
     let mut req = Req::vector().build();

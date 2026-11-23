@@ -16,7 +16,7 @@ use time::format_description::well_known::Rfc3339;
 
 use super::canonical::{self, CanonicalRequest};
 use crate::problem::Problem;
-use crate::replay::{ReplayError, ReplayStore, SignerKind};
+use crate::replay::{ReplayError, ReplayStore, SignerKind, Surface};
 
 /// Header names (§4.4.1, §8.1). Lowercase, as `http` stores them.
 pub mod headers {
@@ -139,6 +139,13 @@ pub enum VerifyError {
         /// Seconds to wait.
         retry_after: u64,
     },
+    /// Step 4: the replay store is warming up after a restart and cannot yet
+    /// vouch for this timestamp (lost-conn/ofscp#17).
+    #[error("provider is warming up after a restart; retry shortly")]
+    WarmingUp {
+        /// Seconds to wait.
+        retry_after: u64,
+    },
     /// Step 5: body digest mismatch.
     #[error("X-OFSCP-Content-Digest does not match the body")]
     Digest,
@@ -154,7 +161,9 @@ impl From<VerifyError> for Problem {
     fn from(e: VerifyError) -> Self {
         let p = match e {
             VerifyError::Digest => Problem::bad_request(),
-            VerifyError::StoreFull { retry_after } => Problem::service_unavailable(retry_after),
+            VerifyError::StoreFull { retry_after } | VerifyError::WarmingUp { retry_after } => {
+                Problem::service_unavailable(retry_after)
+            }
             _ => Problem::unauthorized(),
         };
         p.with_detail(e.to_string())
@@ -247,7 +256,14 @@ impl Verifier {
         // Step 4: replay check only. Recording happens after step 7.
         let kind = h.signer.kind();
         self.replay
-            .check(kind, h.key_id, h.nonce, signed_at, now)
+            .check(
+                Surface::SignedRequest,
+                kind,
+                h.key_id,
+                h.nonce,
+                signed_at,
+                now,
+            )
             .map_err(replay_error)?;
 
         // Step 5: body digest.
@@ -275,7 +291,14 @@ impl Verifier {
 
         // Re-check and record atomically.
         self.replay
-            .record(kind, h.key_id, h.nonce, signed_at, now)
+            .record(
+                Surface::SignedRequest,
+                kind,
+                h.key_id,
+                h.nonce,
+                signed_at,
+                now,
+            )
             .map_err(replay_error)?;
 
         Ok(Verified {
@@ -310,6 +333,7 @@ fn replay_error(e: ReplayError) -> VerifyError {
     match e {
         ReplayError::Replayed => VerifyError::Replayed,
         ReplayError::Full { retry_after } => VerifyError::StoreFull { retry_after },
+        ReplayError::WarmingUp { retry_after } => VerifyError::WarmingUp { retry_after },
     }
 }
 

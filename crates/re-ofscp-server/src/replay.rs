@@ -12,11 +12,14 @@
 //! 3. The store is bounded. When full it refuses (the caller answers `503`
 //!    with `Retry-After`) instead of evicting an unexpired entry.
 //!
-//! **Restarts.** The store is in memory, so a restart forgets every nonce.
-//! To stop a request captured before the restart from being replayed after
-//! it, the store has a *floor*: a signature whose timestamp is earlier than
-//! the moment the store was created is refused. See
-//! `docs/decisions/0001-replay-store.md` and lost-conn/ofscp#17 (open).
+//! **Restarts (warm-up).** The store is in memory, so a restart forgets
+//! every nonce. A request recorded just before the restart can carry a
+//! timestamp up to one skew window *after* it (step 3 accepts timestamps
+//! that far ahead), so the store refuses every signed request timestamped
+//! before `T0 + skew`, where `T0` is when the store began, answering `503`
+//! with `Retry-After` (lost-conn/ofscp#17, open). The WebSocket
+//! `authenticate` handshake is exempt: its nonce is server-issued for one
+//! connection and dies with it. See `docs/decisions/0001-replay-store.md`.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, PoisonError};
@@ -30,12 +33,31 @@ pub enum SignerKind {
     Provider,
 }
 
+/// Which kind of signature is being checked. Decides whether the restart
+/// warm-up applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Surface {
+    /// A signed HTTP request, user- or provider-signed (§4.4, §8.1). Its
+    /// nonce is client-chosen, so the warm-up applies.
+    SignedRequest,
+    /// The WebSocket `authenticate` handshake (§7.1). Its nonce is a
+    /// server-issued per-connection challenge that cannot outlive a restart,
+    /// so the warm-up does not apply.
+    WsHandshake,
+}
+
 /// Why a nonce was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplayError {
-    /// The *(kind, key id, nonce)* triple was already used, or the signature
-    /// predates the store's floor.
+    /// The *(kind, key id, nonce)* triple was already used.
     Replayed,
+    /// The store is still warming up after a restart and cannot yet tell
+    /// whether this signature was used before it; retry after this many
+    /// seconds.
+    WarmingUp {
+        /// Seconds until the warm-up ends.
+        retry_after: u64,
+    },
     /// The store is at capacity; retry after this many seconds.
     Full {
         /// Seconds until the oldest entry expires.
@@ -79,22 +101,35 @@ pub struct ReplayStore {
     inner: Mutex<Inner>,
     capacity: usize,
     retention_secs: i64,
-    floor: i64,
+    /// `T0 + skew`: signed requests timestamped earlier are refused.
+    warm_until: i64,
 }
 
 impl ReplayStore {
-    /// Create a store holding at most `capacity` nonces for `retention_secs`
-    /// each, refusing signatures timestamped before `floor` (unix seconds).
+    /// Create a store that began at `started_at` (unix seconds), holding at
+    /// most `capacity` nonces for `retention_secs` each, for a verifier that
+    /// accepts timestamps within `skew_secs` of now.
     ///
-    /// `retention_secs` must be at least twice the clock-skew window so a
-    /// nonce outlives every moment its timestamp is acceptable.
-    pub fn new(capacity: usize, retention_secs: i64, floor: i64) -> Self {
+    /// `retention_secs` must be at least twice `skew_secs` so a nonce
+    /// outlives every moment its timestamp is acceptable.
+    pub fn new(capacity: usize, retention_secs: i64, started_at: i64, skew_secs: i64) -> Self {
+        debug_assert!(retention_secs >= 2 * skew_secs);
         Self {
             inner: Mutex::new(Inner::default()),
             capacity,
             retention_secs,
-            floor,
+            warm_until: started_at + skew_secs,
         }
+    }
+
+    /// Refuse signed requests timestamped before `T0 + skew` (see module docs).
+    fn warm_up(&self, surface: Surface, signed_at: i64, now: i64) -> Result<(), ReplayError> {
+        if surface == Surface::SignedRequest && signed_at < self.warm_until {
+            return Err(ReplayError::WarmingUp {
+                retry_after: u64::try_from(self.warm_until - now).unwrap_or(1).max(1),
+            });
+        }
+        Ok(())
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -114,15 +149,14 @@ impl ReplayStore {
     /// Step 4: has this triple been used? Does not record anything.
     pub fn check(
         &self,
+        surface: Surface,
         kind: SignerKind,
         key_id: &str,
         nonce: &str,
         signed_at: i64,
         now: i64,
     ) -> Result<(), ReplayError> {
-        if signed_at < self.floor {
-            return Err(ReplayError::Replayed);
-        }
+        self.warm_up(surface, signed_at, now)?;
         let mut inner = self.lock();
         inner.sweep(now);
         if inner.entries.contains_key(&Self::key(kind, key_id, nonce)) {
@@ -135,15 +169,14 @@ impl ReplayStore {
     /// After the signature verified: atomically re-check and record.
     pub fn record(
         &self,
+        surface: Surface,
         kind: SignerKind,
         key_id: &str,
         nonce: &str,
         signed_at: i64,
         now: i64,
     ) -> Result<(), ReplayError> {
-        if signed_at < self.floor {
-            return Err(ReplayError::Replayed);
-        }
+        self.warm_up(surface, signed_at, now)?;
         let key = Self::key(kind, key_id, nonce);
         let mut inner = self.lock();
         inner.sweep(now);
@@ -179,89 +212,141 @@ impl ReplayStore {
 mod tests {
     use super::*;
     use SignerKind::{Actor, Provider};
+    use Surface::{SignedRequest, WsHandshake};
 
     const T: i64 = 1_000_000;
+    const SKEW: i64 = 300;
+
+    /// A store whose warm-up ended exactly at `T`.
+    fn warm(capacity: usize) -> ReplayStore {
+        ReplayStore::new(capacity, 600, T - SKEW, SKEW)
+    }
 
     #[test]
     fn check_does_not_record() {
-        let s = ReplayStore::new(10, 600, 0);
-        assert_eq!(s.check(Actor, "k", "n", T, T), Ok(()));
-        assert_eq!(s.check(Actor, "k", "n", T, T), Ok(()));
+        let s = warm(10);
+        assert_eq!(s.check(SignedRequest, Actor, "k", "n", T, T), Ok(()));
+        assert_eq!(s.check(SignedRequest, Actor, "k", "n", T, T), Ok(()));
         assert!(s.is_empty(T));
     }
 
     #[test]
     fn record_then_replay_is_refused() {
-        let s = ReplayStore::new(10, 600, 0);
-        assert_eq!(s.record(Actor, "k", "n", T, T), Ok(()));
-        assert_eq!(s.check(Actor, "k", "n", T, T), Err(ReplayError::Replayed));
-        assert_eq!(s.record(Actor, "k", "n", T, T), Err(ReplayError::Replayed));
+        let s = warm(10);
+        assert_eq!(s.record(SignedRequest, Actor, "k", "n", T, T), Ok(()));
+        assert_eq!(
+            s.check(SignedRequest, Actor, "k", "n", T, T),
+            Err(ReplayError::Replayed)
+        );
+        assert_eq!(
+            s.record(SignedRequest, Actor, "k", "n", T, T),
+            Err(ReplayError::Replayed)
+        );
+    }
+
+    #[test]
+    fn surfaces_share_one_store() {
+        let s = warm(10);
+        assert_eq!(s.record(WsHandshake, Actor, "k", "n", T, T), Ok(()));
+        assert_eq!(
+            s.check(SignedRequest, Actor, "k", "n", T, T),
+            Err(ReplayError::Replayed)
+        );
     }
 
     #[test]
     fn signer_kinds_do_not_collide() {
-        let s = ReplayStore::new(10, 600, 0);
-        assert_eq!(s.record(Actor, "k", "n", T, T), Ok(()));
-        assert_eq!(s.record(Provider, "k", "n", T, T), Ok(()));
-        assert_eq!(s.record(Actor, "k2", "n", T, T), Ok(()));
+        let s = warm(10);
+        assert_eq!(s.record(SignedRequest, Actor, "k", "n", T, T), Ok(()));
+        assert_eq!(s.record(SignedRequest, Provider, "k", "n", T, T), Ok(()));
+        assert_eq!(s.record(SignedRequest, Actor, "k2", "n", T, T), Ok(()));
     }
 
     #[test]
     fn entries_expire_after_retention() {
-        let s = ReplayStore::new(10, 600, 0);
-        s.record(Actor, "k", "n", T, T).unwrap();
+        let s = warm(10);
+        s.record(SignedRequest, Actor, "k", "n", T, T).unwrap();
         assert_eq!(
-            s.check(Actor, "k", "n", T, T + 599),
+            s.check(SignedRequest, Actor, "k", "n", T, T + 599),
             Err(ReplayError::Replayed)
         );
-        assert_eq!(s.check(Actor, "k", "n", T, T + 600), Ok(()));
+        assert_eq!(s.check(SignedRequest, Actor, "k", "n", T, T + 600), Ok(()));
         assert!(s.is_empty(T + 600));
     }
 
     #[test]
     fn full_store_fails_closed_without_evicting() {
-        let s = ReplayStore::new(2, 600, 0);
-        s.record(Actor, "k", "a", T, T).unwrap();
-        s.record(Actor, "k", "b", T + 10, T + 10).unwrap();
+        let s = warm(2);
+        s.record(SignedRequest, Actor, "k", "a", T, T).unwrap();
+        s.record(SignedRequest, Actor, "k", "b", T + 10, T + 10)
+            .unwrap();
         assert_eq!(
-            s.record(Actor, "k", "c", T + 100, T + 100),
+            s.record(SignedRequest, Actor, "k", "c", T + 100, T + 100),
             Err(ReplayError::Full { retry_after: 500 })
         );
         // Nothing was evicted: both old nonces are still refused.
         assert_eq!(
-            s.check(Actor, "k", "a", T, T + 100),
+            s.check(SignedRequest, Actor, "k", "a", T, T + 100),
             Err(ReplayError::Replayed)
         );
         assert_eq!(
-            s.check(Actor, "k", "b", T, T + 100),
+            s.check(SignedRequest, Actor, "k", "b", T, T + 100),
             Err(ReplayError::Replayed)
         );
         // Once the oldest expires there is room again.
-        assert_eq!(s.record(Actor, "k", "c", T + 600, T + 600), Ok(()));
+        assert_eq!(
+            s.record(SignedRequest, Actor, "k", "c", T + 600, T + 600),
+            Ok(())
+        );
     }
 
     #[test]
-    fn floor_refuses_signatures_from_before_the_store_existed() {
-        let s = ReplayStore::new(10, 600, T);
+    fn warm_up_refuses_until_start_plus_skew_with_retry_after() {
+        // Started at T: anything timestamped before T + 300 may have been
+        // recorded by the previous process (its clock may have run ahead).
+        let s = ReplayStore::new(10, 600, T, SKEW);
+        let warming = Err(ReplayError::WarmingUp { retry_after: 300 });
+        assert_eq!(s.check(SignedRequest, Actor, "k", "n", T, T), warming);
+        assert_eq!(s.record(SignedRequest, Actor, "k", "n", T, T), warming);
+        // A timestamp 299 s ahead is still inside the window.
+        assert_eq!(s.check(SignedRequest, Actor, "k", "n", T + 299, T), warming);
+        // Retry-After counts down and never reaches zero.
         assert_eq!(
-            s.check(Actor, "k", "n", T - 1, T),
-            Err(ReplayError::Replayed)
+            s.check(SignedRequest, Actor, "k", "n", T + 10, T + 299),
+            Err(ReplayError::WarmingUp { retry_after: 1 })
         );
         assert_eq!(
-            s.record(Actor, "k", "n", T - 1, T),
+            s.check(SignedRequest, Actor, "k", "n", T + 10, T + 400),
+            Err(ReplayError::WarmingUp { retry_after: 1 })
+        );
+        // From T + 300 on, signatures are accepted.
+        assert_eq!(
+            s.record(SignedRequest, Actor, "k", "n", T + SKEW, T + SKEW),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn ws_handshake_is_exempt_from_warm_up() {
+        let s = ReplayStore::new(10, 600, T, SKEW);
+        assert_eq!(s.check(WsHandshake, Actor, "k", "n", T, T), Ok(()));
+        assert_eq!(s.record(WsHandshake, Actor, "k", "n", T, T), Ok(()));
+        assert_eq!(
+            s.record(WsHandshake, Actor, "k", "n", T, T),
             Err(ReplayError::Replayed)
         );
-        assert_eq!(s.record(Actor, "k", "n", T, T), Ok(()));
     }
 
     #[test]
     fn concurrent_records_have_exactly_one_winner() {
-        let s = std::sync::Arc::new(ReplayStore::new(100, 600, 0));
+        let s = std::sync::Arc::new(warm(100));
         let wins: usize = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..16)
                 .map(|_| {
                     let s = s.clone();
-                    scope.spawn(move || usize::from(s.record(Actor, "k", "n", T, T).is_ok()))
+                    scope.spawn(move || {
+                        usize::from(s.record(SignedRequest, Actor, "k", "n", T, T).is_ok())
+                    })
                 })
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap()).sum()

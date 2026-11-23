@@ -45,13 +45,14 @@ impl AppState {
 
     /// Build state with an explicit clock (tests).
     pub fn with_clock(config: Config, keys: Arc<dyn KeyResolver>, clock: Arc<dyn Clock>) -> Self {
-        // The replay floor is "now": signatures made before this process
-        // started may have been recorded by its predecessor, so they are
-        // refused (docs/decisions/0001-replay-store.md).
+        // The store begins now. For one skew window, signed requests get 503
+        // because a predecessor process may have recorded them
+        // (docs/decisions/0001-replay-store.md, lost-conn/ofscp#17).
         let replay = Arc::new(ReplayStore::new(
             config.replay_capacity,
             REPLAY_RETENTION_SECS,
             clock.now().unix_timestamp(),
+            MAX_SKEW_SECS,
         ));
         let verifier = Arc::new(Verifier::new(
             config.domain.clone(),
