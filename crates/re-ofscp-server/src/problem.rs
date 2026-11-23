@@ -166,8 +166,17 @@ pub const GATEWAY_TIMEOUT: ErrorCode = ErrorCode {
     description: "An upstream service did not answer in time.",
 };
 
+/// Extension code: this provider does not offer self-registration.
+pub const REGISTRATION_CLOSED: ErrorCode = ErrorCode {
+    code: "registration_closed",
+    status: 403,
+    title: "Registration Closed",
+    description: "This provider does not offer self-registration. Accounts are created by its administrators or by invitation.",
+};
+
 /// Codes this provider uses beyond the registry.
 pub const EXTENSIONS: &[ErrorCode] = &[
+    REGISTRATION_CLOSED,
     METHOD_NOT_ALLOWED,
     REQUEST_TIMEOUT,
     GONE,
@@ -228,6 +237,10 @@ impl Problem {
     /// 404 `not_found`.
     pub fn not_found() -> Self {
         Self::new(&NOT_FOUND)
+    }
+    /// 403 `registration_closed` (extension code).
+    pub fn registration_closed() -> Self {
+        Self::new(&REGISTRATION_CLOSED)
     }
     /// 405 `method_not_allowed` (extension code).
     pub fn method_not_allowed() -> Self {
@@ -468,6 +481,7 @@ mod tests {
             Problem::unauthorized(),
             Problem::forbidden(),
             Problem::not_found(),
+            Problem::registration_closed(),
             Problem::method_not_allowed(),
             Problem::request_timeout(),
             Problem::unsupported_media_type(),

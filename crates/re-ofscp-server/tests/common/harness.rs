@@ -246,3 +246,65 @@ pub async fn send(
     let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
     (status, json, text, retry)
 }
+
+/// A signed request from any key and actor (for flows where keys are
+/// registered at run time). `timestamp` is RFC 3339; the nonce is random.
+pub fn signed(
+    key: &SigningKey,
+    actor: &str,
+    key_id: &str,
+    method: &str,
+    path: &str,
+    body: &str,
+    timestamp: &str,
+) -> Request<Body> {
+    let digest = content_digest(body.as_bytes());
+    let mut raw = [0u8; 18];
+    for (i, b) in raw.iter_mut().enumerate() {
+        *b = (rand_u64() >> (i % 8 * 8)) as u8;
+    }
+    let nonce: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+    let canonical = CanonicalRequest {
+        authority: "providera.com",
+        method,
+        path,
+        query: None,
+        timestamp,
+        nonce: &nonce,
+        content_digest: &digest,
+    }
+    .render();
+    Request::builder()
+        .method(method)
+        .uri(path)
+        .header("host", "providera.com")
+        .header("content-type", "application/json")
+        .header("x-ofscp-actor", actor)
+        .header("x-ofscp-key-id", key_id)
+        .header("x-ofscp-timestamp", timestamp)
+        .header("x-ofscp-nonce", nonce)
+        .header("x-ofscp-content-digest", digest)
+        .header("x-ofscp-signature", sign(key, &canonical))
+        .body(Body::from(body.to_owned()))
+        .unwrap()
+}
+
+/// A process-unique pseudo-random number (test nonces only).
+pub fn rand_u64() -> u64 {
+    use std::sync::atomic::AtomicU64;
+    static COUNTER: AtomicU64 = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
+    let n = COUNTER.fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::Relaxed);
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    (n ^ t).wrapping_mul(0xbf58_476d_1ce4_e5b9)
+}
+
+/// A fresh Ed25519 key.
+pub fn new_key() -> SigningKey {
+    let mut seed = [0u8; 32];
+    for chunk in seed.chunks_mut(8) {
+        chunk.copy_from_slice(&rand_u64().to_le_bytes());
+    }
+    SigningKey::from_bytes(&seed)
+}

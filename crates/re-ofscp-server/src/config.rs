@@ -21,6 +21,12 @@ pub struct Config {
     /// rhypedb binary-protocol address (`RHYPEDB_ADDR`, default `127.0.0.1:4201`,
     /// where jkbase's managed `[database]` listens inside the app VM).
     pub rhypedb_addr: String,
+    /// A request header carrying the client's address, set by a trusted
+    /// reverse proxy (`CLIENT_IP_HEADER`, e.g. `x-forwarded-for`; its first
+    /// entry is used). Unset: the TCP peer address. Only set this when every
+    /// request passes through a proxy that overwrites the header, or clients
+    /// can choose their own rate-limit key.
+    pub client_ip_header: Option<String>,
     /// Replay-store bounds (spec §4.5):
     /// * `REPLAY_LOCAL_TOTAL` / `REPLAY_REMOTE_TOTAL`: live nonces from local
     ///   and from remote signers (default 250 000 each; full → `503` for that
@@ -70,10 +76,22 @@ impl Config {
             per_signer: positive(&get, "REPLAY_PER_SIGNER", 6_000)?,
             per_remote_domain: positive(&get, "REPLAY_PER_REMOTE_DOMAIN", 25_000)?,
         };
+        let client_ip_header = get("CLIENT_IP_HEADER")
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| !h.is_empty());
+        if let Some(h) = &client_ip_header
+            && axum::http::HeaderName::from_bytes(h.as_bytes()).is_err()
+        {
+            return Err(ConfigError::Invalid {
+                name: "CLIENT_IP_HEADER",
+                reason: "not a valid header name".to_owned(),
+            });
+        }
         Ok(Self {
             domain,
             bind,
             rhypedb_addr,
+            client_ip_header,
             replay,
         })
     }

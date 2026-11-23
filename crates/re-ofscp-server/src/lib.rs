@@ -3,26 +3,30 @@
 //! The binary (`src/main.rs`) only wires configuration, logging and shutdown;
 //! everything testable lives here.
 
+pub mod accounts;
 pub mod config;
 pub mod db;
 pub mod problem;
+pub mod ratelimit;
 pub mod replay;
 pub mod signing;
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::{Json, Router, extract::State, middleware, routing::get};
+use axum::routing::{delete, get, post};
+use axum::{Json, Router, extract::State, middleware};
 use problem::ProblemBase;
 use re_ofscp_types::{Health, OFSCP_VERSION};
 
 pub use config::Config;
 pub use problem::Problem;
 
+use accounts::{Accounts, NoRemoteKeys};
 use db::{Db, DbConfig};
 use replay::ReplayStore;
 use replay::ledger::{LedgerError, NonceLedger, RhypeLedger};
-use signing::{Clock, KeyResolver, StaticKeys, SystemClock, Verifier};
+use signing::{Clock, KeyResolver, SystemClock, Verifier};
 
 /// Maximum clock skew accepted on signed requests, in seconds (§4.5 step 3, §8).
 pub const MAX_SKEW_SECS: i64 = 300;
@@ -36,25 +40,38 @@ pub struct AppState {
     pub config: Arc<Config>,
     /// The rhypedb connection pool.
     pub db: Arc<Db>,
+    /// Accounts, passwords, bootstrap tokens and device keys.
+    pub accounts: Arc<Accounts>,
     /// Verifies every signed request, REST and federation alike, against the
     /// one provider-wide replay store.
     pub verifier: Arc<Verifier>,
 }
 
-/// Builds an [`AppState`]. Defaults: the wall clock, no keys, and the
-/// rhypedb-backed replay ledger.
+/// Builds an [`AppState`]. Defaults: the wall clock, local keys from the
+/// account store (remote signers refused until remote resolution lands), and
+/// the rhypedb-backed replay ledger.
 pub struct AppStateBuilder {
     config: Config,
-    keys: Arc<dyn KeyResolver>,
+    keys: Option<Arc<dyn KeyResolver>>,
+    remote_keys: Arc<dyn KeyResolver>,
     ledger: Option<Arc<dyn NonceLedger>>,
     clock: Arc<dyn Clock>,
 }
 
 impl AppStateBuilder {
-    /// Resolve signing keys with `keys`.
+    /// Resolve *every* signing key with `keys`, bypassing the account
+    /// store (tests).
     #[must_use]
     pub fn keys(mut self, keys: Arc<dyn KeyResolver>) -> Self {
-        self.keys = keys;
+        self.keys = Some(keys);
+        self
+    }
+
+    /// Resolve remote signers with `remote` (local accounts still come from
+    /// the account store).
+    #[must_use]
+    pub fn remote_keys(mut self, remote: Arc<dyn KeyResolver>) -> Self {
+        self.remote_keys = remote;
         self
     }
 
@@ -86,17 +103,24 @@ impl AppStateBuilder {
             self.clock.now().unix_timestamp(),
             config.domain.as_str(),
         ));
+        let accounts = Arc::new(Accounts::new(
+            config.domain.clone(),
+            db.clone(),
+            self.remote_keys,
+        ));
+        let keys: Arc<dyn KeyResolver> = self.keys.unwrap_or_else(|| accounts.keys.clone());
         let verifier = Arc::new(Verifier::new(
             config.domain.clone(),
             MAX_SKEW_SECS,
             replay,
             ledger,
-            self.keys,
+            keys,
             self.clock,
         ));
         AppState {
             config: Arc::new(config),
             db,
+            accounts,
             verifier,
         }
     }
@@ -107,7 +131,8 @@ impl AppState {
     pub fn builder(config: Config) -> AppStateBuilder {
         AppStateBuilder {
             config,
-            keys: Arc::new(StaticKeys::default()),
+            keys: None,
+            remote_keys: Arc::new(NoRemoteKeys),
             ledger: None,
             clock: Arc::new(SystemClock),
         }
@@ -156,6 +181,20 @@ impl AppState {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/health", get(health))
+        .route("/api/auth/register", post(accounts::routes::register))
+        .route("/api/auth/login", post(accounts::routes::login))
+        .route(
+            "/api/auth/device-keys",
+            post(accounts::routes::register_device_key).get(accounts::routes::list_device_keys),
+        )
+        .route(
+            "/api/auth/device-keys/{key_id}",
+            delete(accounts::routes::revoke_device_key),
+        )
+        .route(
+            "/.well-known/ofscp/users/{handle}/keys",
+            get(accounts::routes::user_keys),
+        )
         .route("/problems/{code}", get(problem::describe))
         .fallback(|| async { Problem::not_found() })
         .method_not_allowed_fallback(|| async { Problem::method_not_allowed() })
