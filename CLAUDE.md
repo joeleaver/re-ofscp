@@ -16,11 +16,16 @@ re-ofscp is an **enterprise-grade OFSCP provider** written in Rust. It is hosted
 
 ## Protocol questions: ask the OFSCP oracle
 
-A separate Claude session, **"OFSCP oracle"** (session id `local_a5cc84d7-2370-4fa1-8849-4687aef3e1a1`, working in `~/dev/ofscp`), owns the OFSCP spec. It audited the spec and Forumall, and it authored the open spec PRs. **The premise:** if you can't work out how to behave from the spec text (and checking against Forumall), the spec has a gap. The fix belongs in the spec, not in a private guess.
+A separate Claude session, the **OFSCP oracle**, owns the OFSCP spec. It always works in `~/dev/ofscp`. It audited the spec and Forumall, and it authors the spec PRs. The oracle is replaced by a fresh session from time to time (it hands off through a note in its own memory), so it has no fixed session id. **The premise:** if you can't work out how to behave from the spec text (and checking against Forumall), the spec has a gap. The fix belongs in the spec, not in a private guess.
 
 **When to ask:** whenever a protocol or interoperability question isn't answered unambiguously by the spec plus the open spec PRs. Examples: a field shape, an ordering, an error code, what a remote provider will send or expect, how two rules interact, or behaviour where Forumall and the spec disagree. Don't ask about Rust, rhypedb, rinch, jkbase or this server's internal design. Those are yours.
 
-**How:** send a message to the session above (`SendMessage` with `to: "local_a5cc84d7-2370-4fa1-8849-4687aef3e1a1"`). If you can't reach it, ask Joe to relay. Each question should include:
+**How:** find the oracle's current session, then message it.
+- **Find it:** call `mcp__ccd_session_mgmt__list_sessions` with a modest limit (about 20). Pick the non-archived session whose `cwd` is `/home/joe/dev/ofscp`, or a worktree under it. If several match, prefer one titled "OFSCP oracle", otherwise the most recently active one. If nothing matches, raise the limit before giving up.
+- **Message it:** use `SendMessage` with `to` set to its `local_…` id, or `send_message` with that `session_id`.
+- **If none is live,** ask Joe to start one or to relay. Don't unarchive an old session.
+
+Each question should include:
 1. the spec section(s) and the exact text you're unsure about;
 2. the concrete case: request/response or event, actors, providers;
 3. what you would do if you had to decide now, and why.
