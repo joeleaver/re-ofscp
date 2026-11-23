@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::Context;
+use re_ofscp_server::signing::StaticKeys;
 use re_ofscp_server::{AppState, Config, router};
 use tracing_subscriber::EnvFilter;
 
@@ -17,9 +18,10 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("binding {}", config.bind))?;
     tracing::info!(domain = %config.domain, bind = %config.bind, "re-ofscp listening");
 
-    let app = router(AppState {
-        config: Arc::new(config),
-    });
+    // No device keys can be registered yet, so no signed request verifies.
+    // The rhypedb-backed local resolver and the SSRF-safe remote resolver
+    // replace this as they land.
+    let app = router(AppState::new(config, Arc::new(StaticKeys::default())));
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;

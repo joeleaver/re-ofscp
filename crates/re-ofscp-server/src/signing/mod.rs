@@ -1,0 +1,132 @@
+//! OFSCP request signing (spec §4.4–§4.6, §7.1, §8.1).
+//!
+//! * [`canonical`]: byte-exact canonical strings and Ed25519 sign/verify.
+//! * [`verify`]: the §4.5 verification pipeline.
+//! * [`authenticate`]: middleware that verifies any request carrying
+//!   `X-OFSCP-*` headers and exposes the result to handlers via
+//!   [`Authenticated`].
+//!
+//! A request with **no** signing headers passes through anonymously (public
+//! endpoints such as discovery). A request with **any** signing header must
+//! verify completely, or it is rejected; a half-signed request is never
+//! treated as anonymous.
+
+pub mod canonical;
+pub mod verify;
+
+use std::sync::Arc;
+
+use axum::body::{Body, to_bytes};
+use axum::extract::{FromRequestParts, Request, State};
+use axum::http::request::Parts;
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
+use re_ofscp_types::{Actor, Authority};
+
+pub use verify::{
+    Clock, KeyError, KeyFuture, KeyResolver, RequestParts, Signer, StaticKeys, SystemClock,
+    Verified, Verifier, VerifyError,
+};
+
+use crate::problem::Problem;
+
+/// Largest request body the signature layer will buffer (it must hash the
+/// whole body before any handler runs). Larger bodies get `413`.
+pub const MAX_SIGNED_BODY: usize = 1024 * 1024;
+
+/// Middleware: verify signed requests, pass unsigned ones through.
+pub async fn authenticate(
+    State(verifier): State<Arc<Verifier>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if !verify::headers::ALL
+        .iter()
+        .any(|h| req.headers().contains_key(*h))
+    {
+        return next.run(req).await;
+    }
+    let (parts, body) = req.into_parts();
+    let bytes = match to_bytes(body, MAX_SIGNED_BODY).await {
+        Ok(b) => b,
+        Err(e) => {
+            let too_large = std::error::Error::source(&e)
+                .is_some_and(|s| s.is::<http_body_util::LengthLimitError>());
+            return if too_large {
+                Problem::payload_too_large()
+                    .with_detail(format!(
+                        "signed bodies are limited to {MAX_SIGNED_BODY} bytes"
+                    ))
+                    .into_response()
+            } else {
+                Problem::bad_request()
+                    .with_detail("could not read request body")
+                    .into_response()
+            };
+        }
+    };
+    let outcome = verifier
+        .verify(
+            RequestParts {
+                method: &parts.method,
+                uri: &parts.uri,
+                headers: &parts.headers,
+            },
+            &bytes,
+        )
+        .await;
+    match outcome {
+        Ok(verified) => {
+            let mut req = Request::from_parts(parts, Body::from(bytes));
+            req.extensions_mut().insert(verified);
+            next.run(req).await
+        }
+        Err(e) => {
+            tracing::info!(reason = %e, path = parts.uri.path(), "rejected signed request");
+            Problem::from(e).into_response()
+        }
+    }
+}
+
+/// Extractor: the request was signed and verified. `401` otherwise.
+#[derive(Debug, Clone)]
+pub struct Authenticated(pub Verified);
+
+impl<S: Send + Sync> FromRequestParts<S> for Authenticated {
+    type Rejection = Problem;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        parts
+            .extensions
+            .get::<Verified>()
+            .cloned()
+            .map(Self)
+            .ok_or_else(|| {
+                Problem::unauthorized().with_detail("this endpoint requires a signed request")
+            })
+    }
+}
+
+impl Authenticated {
+    /// The signing actor, if a user signed. Provider-signed requests get `403`.
+    pub fn actor(&self) -> Result<&Actor, Problem> {
+        match &self.0.signer {
+            Signer::Actor(a) => Ok(a),
+            Signer::Provider(_) => {
+                Err(Problem::forbidden().with_detail("this endpoint requires a user signature"))
+            }
+        }
+    }
+
+    /// The signing actor, required to be a local account of `home`. Remote
+    /// actors are refused with `403` (§4.7, security requirement 1): a remote
+    /// `alice@elsewhere` is never treated as local `alice`.
+    pub fn local_actor(&self, home: &Authority) -> Result<&Actor, Problem> {
+        let actor = self.actor()?;
+        if actor.is_local_to(home) {
+            Ok(actor)
+        } else {
+            Err(Problem::forbidden().with_detail("this endpoint is for local accounts only"))
+        }
+    }
+}

@@ -5,17 +5,23 @@
 
 use std::net::SocketAddr;
 
+use re_ofscp_types::Authority;
+
 /// Server configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
     /// The public provider domain — the OFSCP authority every signature binds
-    /// to (spec §4.4.2). MUST equal the host clients use. Required.
-    pub domain: String,
+    /// to (spec §4.4.2). MUST equal the host clients use. Required; a
+    /// non-canonical spelling (`Social.Example`, `:443`) is normalised.
+    pub domain: Authority,
     /// Address to listen on (`BIND`, default `0.0.0.0:8080`; jkbase routes to `port = 8080`).
     pub bind: SocketAddr,
     /// rhypedb binary-protocol address (`RHYPEDB_ADDR`, default `127.0.0.1:4201`,
     /// where jkbase's managed `[database]` listens inside the app VM).
     pub rhypedb_addr: String,
+    /// Maximum live nonces in the replay store (`REPLAY_CAPACITY`, default
+    /// 500 000). When full, signed requests get `503` (spec §4.5).
+    pub replay_capacity: usize,
 }
 
 /// A configuration error.
@@ -37,9 +43,11 @@ impl Config {
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
         let domain = get("DOMAIN")
             .filter(|d| !d.trim().is_empty())
-            .ok_or(ConfigError::Missing("DOMAIN"))?
-            .trim()
-            .to_ascii_lowercase();
+            .ok_or(ConfigError::Missing("DOMAIN"))?;
+        let domain = Authority::canonicalize(domain.trim()).map_err(|e| ConfigError::Invalid {
+            name: "DOMAIN",
+            reason: e.to_string(),
+        })?;
         let bind = get("BIND")
             .unwrap_or_else(|| "0.0.0.0:8080".to_owned())
             .parse()
@@ -48,10 +56,22 @@ impl Config {
                 reason: e.to_string(),
             })?;
         let rhypedb_addr = get("RHYPEDB_ADDR").unwrap_or_else(|| "127.0.0.1:4201".to_owned());
+        let replay_capacity = match get("REPLAY_CAPACITY") {
+            None => 500_000,
+            Some(v) => v
+                .parse::<usize>()
+                .ok()
+                .filter(|n| *n > 0)
+                .ok_or(ConfigError::Invalid {
+                    name: "REPLAY_CAPACITY",
+                    reason: "must be a positive integer".to_owned(),
+                })?,
+        };
         Ok(Self {
             domain,
             bind,
             rhypedb_addr,
+            replay_capacity,
         })
     }
 }
@@ -79,9 +99,27 @@ mod tests {
     #[test]
     fn defaults_and_normalisation() {
         let c = Config::from_lookup(env(&[("DOMAIN", " Social.Example ")])).unwrap();
-        assert_eq!(c.domain, "social.example");
+        assert_eq!(c.domain.as_str(), "social.example");
+        assert_eq!(c.replay_capacity, 500_000);
         assert_eq!(c.bind.to_string(), "0.0.0.0:8080");
         assert_eq!(c.rhypedb_addr, "127.0.0.1:4201");
+    }
+
+    #[test]
+    fn bad_domain_and_capacity_are_rejected() {
+        let r = Config::from_lookup(env(&[("DOMAIN", "not a host")]));
+        assert!(matches!(
+            r,
+            Err(ConfigError::Invalid { name: "DOMAIN", .. })
+        ));
+        let r = Config::from_lookup(env(&[("DOMAIN", "a.example"), ("REPLAY_CAPACITY", "0")]));
+        assert!(matches!(
+            r,
+            Err(ConfigError::Invalid {
+                name: "REPLAY_CAPACITY",
+                ..
+            })
+        ));
     }
 
     #[test]

@@ -17,6 +17,9 @@ jobs:
       # rustup reads rust-toolchain.toml (pinned 1.99.0 + rustfmt/clippy).
       - run: rustup show
       - uses: Swatinem/rust-cache@v2
+      # Conformance tests read the spec's vectors and samples from a sibling
+      # checkout (../ofscp), as Forumall's CI does.
+      - run: git clone --depth 1 https://github.com/lost-conn/ofscp "$GITHUB_WORKSPACE/../ofscp"
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all-targets

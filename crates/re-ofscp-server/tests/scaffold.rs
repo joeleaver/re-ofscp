@@ -5,6 +5,7 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
+use re_ofscp_server::signing::StaticKeys;
 use re_ofscp_server::{AppState, Config, router};
 use re_ofscp_types::Health;
 use tower::ServiceExt;
@@ -24,9 +25,7 @@ async fn health_reports_degraded_without_a_database() {
         _ => None,
     })
     .unwrap();
-    let app = router(AppState {
-        config: Arc::new(config),
-    });
+    let app = router(AppState::new(config, Arc::new(StaticKeys::default())));
 
     let res = app
         .oneshot(Request::get("/api/health").body(Body::empty()).unwrap())
