@@ -52,7 +52,7 @@ async fn hostile_strings_round_trip_and_never_become_syntax() {
     ];
     for (i, h) in hostile.iter().enumerate() {
         ledger
-            .persist(&nonce(&format!("n{i}"), h, 4_000_000_000))
+            .persist(&nonce(&format!("n{i}"), h, 4_000_000_000), 0)
             .await
             .unwrap();
     }
@@ -76,8 +76,8 @@ async fn unique_violation_is_a_conflict_and_a_ledger_duplicate() {
     let db = db(&server);
     let ledger = RhypeLedger::new(db.clone());
     let n = nonce("dup", "a@b.example", 4_000_000_000);
-    ledger.persist(&n).await.unwrap();
-    assert_eq!(ledger.persist(&n).await, Err(LedgerError::Duplicate));
+    ledger.persist(&n, 0).await.unwrap();
+    assert_eq!(ledger.persist(&n, 0).await, Err(LedgerError::Duplicate));
     // The raw error is classified as a conflict.
     let q = Ql::new("ReplayNonce.create({ key: ")
         .str(&n.ledger_key())
@@ -97,13 +97,13 @@ async fn ledger_loads_live_nonces_in_pages_and_purges_expired_ones() {
     let now = 2_000_000_000;
     for i in 0..7 {
         ledger
-            .persist(&nonce(&format!("live{i}"), "a@b.example", now + 1 + i))
+            .persist(&nonce(&format!("live{i}"), "a@b.example", now + 1 + i), 0)
             .await
             .unwrap();
     }
     for i in 0..4 {
         ledger
-            .persist(&nonce(&format!("dead{i}"), "a@b.example", now - i))
+            .persist(&nonce(&format!("dead{i}"), "a@b.example", now - i), 0)
             .await
             .unwrap();
     }
@@ -111,18 +111,34 @@ async fn ledger_loads_live_nonces_in_pages_and_purges_expired_ones() {
         .load(now)
         .await
         .unwrap()
+        .nonces
         .into_iter()
         .map(|n| n.nonce)
         .collect();
     live.sort();
     assert_eq!(live, (0..7).map(|i| format!("live{i}")).collect::<Vec<_>>());
     let loaded = ledger.load(now).await.unwrap();
-    assert!(loaded.iter().all(|n| n.signed_at == n.expires - 301));
+    assert!(loaded.nonces.iter().all(|n| n.signed_at == n.expires - 301));
+    assert_eq!(loaded.clock, None);
 
     ledger.purge(now).await.unwrap();
-    // Purged rows are gone (not merely filtered out by `load`).
-    let everything = ledger.load(0).await.unwrap();
-    assert_eq!(everything.len(), 7);
+    // The clock was persisted before anything was deleted...
+    let after = ledger.load(0).await.unwrap();
+    assert_eq!(after.clock, Some(now));
+    // ...so `load(0)` uses it as the cutoff: still exactly the 7 live rows.
+    assert_eq!(after.nonces.len(), 7);
+    // And the purged rows are really gone, not merely filtered out.
+    #[derive(Deserialize)]
+    struct Nonce {
+        #[allow(dead_code)]
+        nonce: String,
+    }
+    let db = db(&server);
+    let rows = db.fetch::<Nonce>(&Ql::new("ReplayNonce")).await.unwrap();
+    assert_eq!(rows.len(), 7);
+    // The clock never moves backwards.
+    ledger.purge(now - 1000).await.unwrap();
+    assert_eq!(ledger.load(0).await.unwrap().clock, Some(now));
 }
 
 /// With idle connections pinged before reuse, a database restart costs no
@@ -213,6 +229,15 @@ async fn nonces_survive_a_restart_and_the_warm_up_is_skipped() {
     assert!(after.verifier.replay_store().warming_up());
     assert_eq!(after.restore_replay().await.unwrap(), 1);
     assert!(!after.verifier.replay_store().warming_up());
+    // The restored nonce is in memory (the 401 below must not rely only on
+    // the ledger's unique key).
+    assert_eq!(
+        after
+            .verifier
+            .replay_store()
+            .len(SIGNED_AT.unix_timestamp()),
+        1
+    );
     let app = router(after);
 
     // The same request is a replay...
@@ -247,4 +272,84 @@ async fn an_unwritable_ledger_fails_closed() {
     server.restart();
     // Re-sending the same signed request is still a replay.
     assert_eq!(send(&app, req()).await.0, StatusCode::UNAUTHORIZED);
+}
+
+/// A query future dropped mid-flight (a timeout, a disconnected client)
+/// must not poison its connection for the next write.
+#[tokio::test]
+async fn a_cancelled_query_does_not_poison_the_next_write() {
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+    let server = RhypeServer::start();
+    let mut cfg = DbConfig::new(server.tcp_addr());
+    cfg.pool_size = 1;
+    let db = Db::new(cfg);
+    db.execute(&Ql::new("ReplayNonce")).await.unwrap();
+    {
+        let q = Ql::new("ReplayNonce");
+        let mut fut = Box::pin(db.execute(&q));
+        let mut cx = Context::from_waker(Waker::noop());
+        // Start it, then abandon it.
+        for _ in 0..3 {
+            if let Poll::Ready(_) = fut.as_mut().poll(&mut cx) {
+                break;
+            }
+        }
+    }
+    let q = Ql::new("ReplayClock.create({ name: \"x\", high_water: 0 })");
+    db.execute(&q).await.unwrap();
+}
+
+/// Clock steps forward, the purge deletes a nonce it believes expired, the
+/// clock is corrected, the process restarts. The persisted replay clock
+/// keeps the purged nonce expired, so the replay is still refused.
+#[tokio::test]
+async fn forward_clock_step_purge_then_restart_still_refuses_the_replay() {
+    let server = RhypeServer::start();
+    let clock = SettableClock::at(SIGNED_AT - time::Duration::seconds(400));
+    let first = AppState::builder(config(&server))
+        .keys(Arc::new(alice_keys()))
+        .clock(clock.clone())
+        .build();
+    first.restore_replay().await.unwrap();
+    clock.set(SIGNED_AT);
+    let app = router(first.clone());
+    assert_eq!(send(&app, Req::health().build()).await.0, StatusCode::OK);
+
+    // NTP steps the clock 600 s forward; the purge runs by the store clock.
+    clock.set(SIGNED_AT + time::Duration::seconds(600));
+    let store_clock = first.verifier.replay_store().clock(first.verifier.now());
+    first.verifier.ledger().purge(store_clock).await.unwrap();
+
+    // Corrected, then restarted, 30 s after signing.
+    clock.set(SIGNED_AT + time::Duration::seconds(30));
+    let second = AppState::builder(config(&server))
+        .keys(Arc::new(alice_keys()))
+        .clock(clock.clone())
+        .build();
+    assert_eq!(second.restore_replay().await.unwrap(), 0);
+    let app = router(second);
+    let (status, json, _, _) = send(&app, Req::health().build()).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{json}");
+}
+
+/// A nonce reused after its window (allowed by §4.5) replaces the stale,
+/// not-yet-purged row; a live row is still a duplicate.
+#[tokio::test]
+async fn an_expired_unpurged_row_is_replaced_not_a_replay() {
+    let server = RhypeServer::start();
+    let ledger = RhypeLedger::new(db(&server));
+    let old = nonce("reuse", "a@b.example", 1_000);
+    ledger.persist(&old, 500).await.unwrap();
+    let again = nonce("reuse", "a@b.example", 2_000);
+    // Still live at 900: a replay.
+    assert_eq!(
+        ledger.persist(&again, 900).await,
+        Err(LedgerError::Duplicate)
+    );
+    // Expired at 1_500: replaced.
+    ledger.persist(&again, 1_500).await.unwrap();
+    let live = ledger.load(1_500).await.unwrap().nonces;
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].expires, 2_000);
 }

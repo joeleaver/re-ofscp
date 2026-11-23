@@ -119,11 +119,16 @@ impl AppState {
     /// after startup), which is safe.
     pub async fn restore_replay(&self) -> Result<usize, LedgerError> {
         let now = self.verifier.now();
-        let nonces = self.verifier.ledger().load(now).await?;
+        let restored = self.verifier.ledger().load(now).await?;
         let store = self.verifier.replay_store();
-        let restored = store.restore(nonces, now);
+        // First the previous process's clock: anything it purged as expired
+        // must stay expired here, whatever our wall clock reads.
+        if let Some(clock) = restored.clock {
+            store.raise_clock(clock);
+        }
+        let count = store.restore(restored.nonces, now);
         store.end_warm_up();
-        Ok(restored)
+        Ok(count)
     }
 
     /// Delete expired nonces from the ledger, every
@@ -133,7 +138,10 @@ impl AppState {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            if let Err(e) = self.verifier.ledger().purge(self.verifier.now()).await {
+            // Purge by the store's clock (never decreasing), which the ledger
+            // persists before deleting anything.
+            let clock = self.verifier.replay_store().clock(self.verifier.now());
+            if let Err(e) = self.verifier.ledger().purge(clock).await {
                 tracing::warn!(error = %e, "purging expired nonces failed");
             }
         }

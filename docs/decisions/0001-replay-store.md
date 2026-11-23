@@ -113,7 +113,20 @@ The spec says a provider SHOULD persist the store, and we do
   pages, and only then ends the warm-up. If the ledger can't be read within
   30 s, the warm-up stays in force. That's safe, and it means one skew
   window of `503`s.
-- **Cleanup:** a background task deletes expired rows every 60 s.
+- **Cleanup:** a background task purges expired rows every 60 s, in
+  bounded batches (1 000 rows per statement, at most 100 statements per
+  run).
+- **Purge by the store's clock, and save that clock first.** The purge uses
+  the store's never-decreasing clock, and writes it to a `ReplayClock` row
+  before deleting anything. At startup, `restore_replay` raises the new
+  store's clock to the saved one before restoring.
+  - **Why:** without this, a forward clock jump, then a purge, then a
+    correction and a restart would bring back a nonce the purge had already
+    deleted. The independent review confirmed that sequence, and
+    `forward_clock_step_purge_then_restart_still_refuses_the_replay` pins it.
+- **Expired rows are replaced.** A nonce reused after its window (§4.5
+  allows this) can hit a stale row that hasn't been purged yet. That row is
+  replaced, so the request isn't refused as a replay.
 
 ## Consequences
 

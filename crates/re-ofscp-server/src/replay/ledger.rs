@@ -115,14 +115,28 @@ pub enum LedgerError {
 /// Boxed future returned by ledger methods.
 pub type LedgerFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, LedgerError>> + Send + 'a>>;
 
+/// What the ledger held at startup.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Restored {
+    /// Every nonce still live.
+    pub nonces: Vec<StoredNonce>,
+    /// The replay clock the previous process persisted, if any.
+    pub clock: Option<i64>,
+}
+
 /// Durable storage for recorded nonces.
 pub trait NonceLedger: Send + Sync {
-    /// Durably record `n`. [`LedgerError::Duplicate`] if it is already there.
-    fn persist<'a>(&'a self, n: &'a StoredNonce) -> LedgerFuture<'a, ()>;
-    /// Every nonce still live at `now`.
-    fn load(&self, now: i64) -> LedgerFuture<'_, Vec<StoredNonce>>;
-    /// Delete nonces expired at `now`.
-    fn purge(&self, now: i64) -> LedgerFuture<'_, ()>;
+    /// Durably record `n`. A row with the same identity that already
+    /// expired by `now` is replaced; a live one is
+    /// [`LedgerError::Duplicate`].
+    fn persist<'a>(&'a self, n: &'a StoredNonce, now: i64) -> LedgerFuture<'a, ()>;
+    /// Every nonce still live at `now`, and the persisted replay clock.
+    fn load(&self, now: i64) -> LedgerFuture<'_, Restored>;
+    /// Persist the replay clock as at least `clock`, then delete nonces
+    /// expired by it. Pass the store's clock ([`super::ReplayStore::clock`]),
+    /// never a raw wall-clock reading: what is deleted must stay expired
+    /// after a restart, which the persisted clock guarantees.
+    fn purge(&self, clock: i64) -> LedgerFuture<'_, ()>;
 }
 
 /// A ledger that persists nothing: the in-memory store alone, with the
@@ -131,18 +145,19 @@ pub trait NonceLedger: Send + Sync {
 pub struct NoLedger;
 
 impl NonceLedger for NoLedger {
-    fn persist<'a>(&'a self, _n: &'a StoredNonce) -> LedgerFuture<'a, ()> {
+    fn persist<'a>(&'a self, _n: &'a StoredNonce, _now: i64) -> LedgerFuture<'a, ()> {
         Box::pin(async { Ok(()) })
     }
-    fn load(&self, _now: i64) -> LedgerFuture<'_, Vec<StoredNonce>> {
+    fn load(&self, _now: i64) -> LedgerFuture<'_, Restored> {
         Box::pin(async { Err(LedgerError::NotPersistent) })
     }
-    fn purge(&self, _now: i64) -> LedgerFuture<'_, ()> {
+    fn purge(&self, _clock: i64) -> LedgerFuture<'_, ()> {
         Box::pin(async { Ok(()) })
     }
 }
 
-/// The rhypedb-backed ledger (`ReplayNonce` in `schema.rhype`).
+/// The rhypedb-backed ledger (`ReplayNonce` and `ReplayClock` in
+/// `schema.rhype`).
 #[derive(Debug, Clone)]
 pub struct RhypeLedger {
     db: Arc<Db>,
@@ -152,14 +167,33 @@ pub struct RhypeLedger {
 /// Rows read per page when restoring.
 const LOAD_PAGE: u64 = 5_000;
 
+/// Rows deleted per purge statement, and statements per purge run, so one
+/// purge never becomes a single unbounded delete (each statement stays well
+/// inside the query timeout; a backlog drains over successive runs).
+const PURGE_BATCH: u64 = 1_000;
+const PURGE_MAX_BATCHES: usize = 100;
+
+/// The `ReplayClock` row's name.
+const CLOCK_NAME: &str = "replay";
+
 #[derive(Deserialize)]
-struct Row {
+struct NonceRow {
     kind: String,
     signer: String,
     domain: String,
     key_id: String,
     nonce: String,
     signed_at: String,
+    expires_at: String,
+}
+
+#[derive(Deserialize)]
+struct ClockRow {
+    high_water: String,
+}
+
+#[derive(Deserialize)]
+struct ExpiryRow {
     expires_at: String,
 }
 
@@ -187,29 +221,104 @@ impl RhypeLedger {
             page: page.max(1),
         }
     }
+
+    async fn create(&self, n: &StoredNonce, key: &str) -> Result<(), DbError> {
+        let q = Ql::new("ReplayNonce.create({ key: ")
+            .str(key)
+            .raw(", kind: ")
+            .str(kind_str(n.kind))
+            .raw(", signer: ")
+            .str(&n.signer)
+            .raw(", domain: ")
+            .str(&n.domain)
+            .raw(", key_id: ")
+            .str(&n.key_id)
+            .raw(", nonce: ")
+            .str(&n.nonce)
+            .raw(", signed_at: ")
+            .unix_seconds(n.signed_at)
+            .raw(", expires_at: ")
+            .unix_seconds(n.expires)
+            .raw(" })");
+        self.db.execute(&q).await
+    }
+
+    /// The persisted replay clock, if any.
+    async fn read_clock(&self) -> Result<Option<(u64, i64)>, LedgerError> {
+        let q = Ql::new("ReplayClock.filter(.name == ")
+            .str(CLOCK_NAME)
+            .raw(")");
+        let rows = self.db.fetch::<ClockRow>(&q).await.map_err(unavailable)?;
+        match rows.first() {
+            Some(r) => Ok(Some((r.id, unix(&r.data.high_water)?))),
+            None => Ok(None),
+        }
+    }
+
+    /// Persist the replay clock as at least `clock` (never lowering it).
+    async fn advance_clock(&self, clock: i64) -> Result<(), LedgerError> {
+        // Two attempts: if the row is created concurrently between our read
+        // and our create, the second pass raises that row instead.
+        for _ in 0..2 {
+            match self.read_clock().await? {
+                Some((_, saved)) if saved >= clock => return Ok(()),
+                Some((id, _)) => {
+                    let q = Ql::new("ReplayClock.get(")
+                        .uint(id)
+                        .raw(").update({ high_water: ")
+                        .unix_seconds(clock)
+                        .raw(" })");
+                    return self.db.execute(&q).await.map_err(unavailable);
+                }
+                None => {
+                    let q = Ql::new("ReplayClock.create({ name: ")
+                        .str(CLOCK_NAME)
+                        .raw(", high_water: ")
+                        .unix_seconds(clock)
+                        .raw(" })");
+                    match self.db.execute(&q).await {
+                        Ok(()) => return Ok(()),
+                        Err(DbError::Conflict(_)) => continue,
+                        Err(e) => return Err(unavailable(e)),
+                    }
+                }
+            }
+        }
+        Err(LedgerError::Unavailable(
+            "replay clock row could not be created or raised".to_owned(),
+        ))
+    }
 }
 
 impl NonceLedger for RhypeLedger {
-    fn persist<'a>(&'a self, n: &'a StoredNonce) -> LedgerFuture<'a, ()> {
+    fn persist<'a>(&'a self, n: &'a StoredNonce, now: i64) -> LedgerFuture<'a, ()> {
         Box::pin(async move {
-            let q = Ql::new("ReplayNonce.create({ key: ")
-                .str(&n.ledger_key())
-                .raw(", kind: ")
-                .str(kind_str(n.kind))
-                .raw(", signer: ")
-                .str(&n.signer)
-                .raw(", domain: ")
-                .str(&n.domain)
-                .raw(", key_id: ")
-                .str(&n.key_id)
-                .raw(", nonce: ")
-                .str(&n.nonce)
-                .raw(", signed_at: ")
-                .unix_seconds(n.signed_at)
-                .raw(", expires_at: ")
-                .unix_seconds(n.expires)
-                .raw(" })");
-            match self.db.execute(&q).await {
+            let key = n.ledger_key();
+            match self.create(n, &key).await {
+                Ok(()) => return Ok(()),
+                Err(DbError::Conflict(_)) => {}
+                Err(e) => return Err(unavailable(e)),
+            }
+            // Same identity already stored. Live: a replay. Expired but not
+            // yet purged (a client reusing a nonce after its window, which
+            // §4.5 permits): replace it.
+            let q = Ql::new("ReplayNonce.filter(.key == ").str(&key).raw(")");
+            let rows = self.db.fetch::<ExpiryRow>(&q).await.map_err(unavailable)?;
+            let expired = match rows.first() {
+                Some(r) => unix(&r.data.expires_at)? <= now,
+                // Purged between the two queries: try again below.
+                None => true,
+            };
+            if !expired {
+                return Err(LedgerError::Duplicate);
+            }
+            let q = Ql::new("ReplayNonce.filter(.key == ")
+                .str(&key)
+                .raw(" && .expires_at <= ")
+                .unix_seconds(now)
+                .raw(").delete()");
+            self.db.execute(&q).await.map_err(unavailable)?;
+            match self.create(n, &key).await {
                 Ok(()) => Ok(()),
                 Err(DbError::Conflict(_)) => Err(LedgerError::Duplicate),
                 Err(e) => Err(unavailable(e)),
@@ -217,26 +326,29 @@ impl NonceLedger for RhypeLedger {
         })
     }
 
-    fn load(&self, now: i64) -> LedgerFuture<'_, Vec<StoredNonce>> {
+    fn load(&self, now: i64) -> LedgerFuture<'_, Restored> {
         Box::pin(async move {
-            let mut out = Vec::new();
+            let clock = self.read_clock().await?.map(|(_, c)| c);
+            // Live by the later of our clock and the persisted one.
+            let cutoff = clock.map_or(now, |c| c.max(now));
+            let mut nonces = Vec::new();
             let mut offset = 0u64;
             loop {
                 let q = Ql::new("ReplayNonce.filter(.expires_at > ")
-                    .unix_seconds(now)
+                    .unix_seconds(cutoff)
                     .raw(").offset(")
                     .uint(offset)
                     .raw(").limit(")
                     .uint(self.page)
                     .raw(")");
-                let rows = self.db.fetch::<Row>(&q).await.map_err(unavailable)?;
+                let rows = self.db.fetch::<NonceRow>(&q).await.map_err(unavailable)?;
                 let n = rows.len();
                 for r in rows {
                     let r = r.data;
                     let kind = parse_kind(&r.kind).ok_or_else(|| {
                         LedgerError::Unavailable(format!("bad signer kind {:?}", r.kind))
                     })?;
-                    out.push(StoredNonce {
+                    nonces.push(StoredNonce {
                         kind,
                         signer: r.signer,
                         domain: r.domain,
@@ -247,19 +359,38 @@ impl NonceLedger for RhypeLedger {
                     });
                 }
                 if (n as u64) < self.page {
-                    return Ok(out);
+                    return Ok(Restored { nonces, clock });
                 }
                 offset += self.page;
             }
         })
     }
 
-    fn purge(&self, now: i64) -> LedgerFuture<'_, ()> {
+    fn purge(&self, clock: i64) -> LedgerFuture<'_, ()> {
         Box::pin(async move {
-            let q = Ql::new("ReplayNonce.filter(.expires_at <= ")
-                .unix_seconds(now)
-                .raw(").delete()");
-            self.db.execute(&q).await.map_err(unavailable)
+            // The clock first: if it cannot be saved, delete nothing.
+            self.advance_clock(clock).await?;
+            for _ in 0..PURGE_MAX_BATCHES {
+                let q = Ql::new("ReplayNonce.filter(.expires_at <= ")
+                    .unix_seconds(clock)
+                    .raw(").limit(")
+                    .uint(PURGE_BATCH)
+                    .raw(").delete()");
+                self.db.execute(&q).await.map_err(unavailable)?;
+                let probe = Ql::new("ReplayNonce.filter(.expires_at <= ")
+                    .unix_seconds(clock)
+                    .raw(").limit(1)");
+                if self
+                    .db
+                    .fetch::<ExpiryRow>(&probe)
+                    .await
+                    .map_err(unavailable)?
+                    .is_empty()
+                {
+                    break;
+                }
+            }
+            Ok(())
         })
     }
 }

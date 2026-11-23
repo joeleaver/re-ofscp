@@ -23,6 +23,9 @@ use tokio::sync::Mutex;
 
 pub use ql::Ql;
 
+/// How rhypedb begins the message for a violated `@unique` constraint.
+const UNIQUE_VIOLATION_PREFIX: &str = "engine error: unique constraint violated: ";
+
 /// A data-layer failure.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DbError {
@@ -50,8 +53,9 @@ impl DbError {
             ClientError::Server(msg) => {
                 // rhypedb reports a violated `@unique` as
                 // "engine error: unique constraint violated: Type.field = value".
+                // Match the prefix only: the tail echoes stored values.
                 // `tests/db.rs` pins this against a real server.
-                if msg.contains("unique constraint violated") {
+                if msg.starts_with(UNIQUE_VIOLATION_PREFIX) {
                     Self::Conflict(msg)
                 } else {
                     Self::Query(msg)
@@ -195,29 +199,53 @@ impl Db {
     /// `client` itself is forgotten, so a replacement another task already
     /// opened there survives.
     async fn discard_all(&self, slot: usize, client: &Arc<AsyncClient>) {
-        {
-            let mut guard = self.slots[slot].lock().await;
-            if guard
-                .as_ref()
-                .is_some_and(|p| Arc::ptr_eq(&p.client, client))
-            {
-                *guard = None;
-            }
-        }
+        self.discard_slot(slot, client).await;
         self.clear_others(slot).await;
     }
 
-    /// Run `q` once, returning the untyped result.
+    /// Send `q` once. The round trip runs in its own task, so a caller that
+    /// is cancelled (a timeout, a disconnected HTTP client) cannot abandon a
+    /// half-finished exchange and poison the connection for the next query.
+    /// A connection found already closed is replaced and the query sent
+    /// once more, even for a write: nothing was sent on it.
     async fn query_once(&self, q: &Ql) -> Result<QueryResult, DbError> {
-        let (slot, client) = self.client().await?;
-        match client.query(q.as_str()).await.map_err(DbError::from_client) {
-            Ok(r) => Ok(r),
-            Err(e) => {
-                if e.breaks_connection() {
-                    self.discard_all(slot, &client).await;
+        for _ in 0..2 {
+            let (slot, client) = self.client().await?;
+            let text = q.as_str().to_owned();
+            let task_client = client.clone();
+            let outcome = tokio::spawn(async move { task_client.query(&text).await }).await;
+            let result = match outcome {
+                Ok(r) => r,
+                Err(join) => {
+                    return Err(DbError::Unavailable(format!("query task failed: {join}")));
                 }
-                Err(e)
+            };
+            match result {
+                Ok(r) => return Ok(r),
+                Err(ClientError::Closed) => {
+                    self.discard_slot(slot, &client).await;
+                }
+                Err(e) => {
+                    let e = DbError::from_client(e);
+                    if e.breaks_connection() {
+                        self.discard_all(slot, &client).await;
+                    }
+                    return Err(e);
+                }
             }
+        }
+        Err(DbError::Unavailable("connection closed".to_owned()))
+    }
+
+    /// Forget slot `slot`'s connection if it is still `client` (the others
+    /// are healthy: this one was closed by a cancelled exchange).
+    async fn discard_slot(&self, slot: usize, client: &Arc<AsyncClient>) {
+        let mut guard = self.slots[slot].lock().await;
+        if guard
+            .as_ref()
+            .is_some_and(|p| Arc::ptr_eq(&p.client, client))
+        {
+            *guard = None;
         }
     }
 
@@ -277,13 +305,21 @@ impl Db {
     }
 
     /// Whether the database answers a ping (retried once, like a read).
+    /// Like queries, the ping runs in its own task, so a caller's timeout
+    /// cannot poison the connection.
     pub async fn ping(&self) -> bool {
         for _ in 0..2 {
             match self.client().await {
-                Ok((slot, client)) => match client.ping().await {
-                    Ok(()) => return true,
-                    Err(_) => self.discard_all(slot, &client).await,
-                },
+                Ok((slot, client)) => {
+                    let task_client = client.clone();
+                    let ok = tokio::spawn(async move { task_client.ping().await })
+                        .await
+                        .is_ok_and(|r| r.is_ok());
+                    if ok {
+                        return true;
+                    }
+                    self.discard_all(slot, &client).await;
+                }
                 Err(_) => return false,
             }
         }

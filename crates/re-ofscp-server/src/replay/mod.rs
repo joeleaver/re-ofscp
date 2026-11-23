@@ -347,6 +347,20 @@ impl ReplayStore {
         self.warm_until.store(i64::MIN, Ordering::SeqCst);
     }
 
+    /// Advance the store's clock to at least `now` and return it: the
+    /// never-decreasing "now" every decision uses (see `Inner::high_water`).
+    /// The ledger purges by this clock, and persists it.
+    pub fn clock(&self, now: i64) -> i64 {
+        self.lock().advance(now)
+    }
+
+    /// Raise the store's clock to at least `t` (the clock a previous process
+    /// persisted), so a nonce it already purged as expired stays expired here
+    /// even if this process's wall clock reads earlier.
+    pub fn raise_clock(&self, t: i64) {
+        self.lock().advance(t);
+    }
+
     /// Whether the restart warm-up is still in force.
     pub fn warming_up(&self) -> bool {
         self.warm_until.load(Ordering::SeqCst) != i64::MIN

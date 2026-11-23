@@ -37,11 +37,16 @@ fn free_port() -> u16 {
 impl RhypeServer {
     /// Start a server with the repository's `schema.rhype`.
     pub fn start() -> Self {
+        let http_port = free_port();
+        let mut tcp_port = free_port();
+        while tcp_port == http_port {
+            tcp_port = free_port();
+        }
         let mut s = Self {
             child: None,
             dir: tempfile::tempdir().expect("tempdir"),
-            http_port: free_port(),
-            tcp_port: free_port(),
+            http_port,
+            tcp_port,
         };
         s.spawn();
         s

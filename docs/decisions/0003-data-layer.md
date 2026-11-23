@@ -34,8 +34,9 @@ Three facts shape the data layer:
 - **Errors are classified once.** `DbError` has four kinds:
   - `Unavailable`: connect or I/O failure, and the outcome of a write is
     unknown.
-  - `Conflict`: a `@unique` violation, detected by the message above, which
-    a test pins against the real server.
+  - `Conflict`: a `@unique` violation, matched on the message's fixed
+    *prefix* only (the rest echoes stored values). A test pins it against
+    the real server.
   - `Query`: a rejected query, which means a bug.
   - `Decode`: an unexpected result shape or field type.
 - **Pool:** `Db` keeps 4 lazily opened connections, used round-robin, with a
@@ -45,8 +46,16 @@ Three facts shape the data layer:
     stale. A connection idle for 5 s or more is pinged before reuse, so a
     restart while the app was quiet costs no query at all.
   - **Retries:** reads (`fetch`, `one`, `ping`) retry once on a fresh
-    connection. Writes (`execute`, `write_one`) never retry, because the
-    caller knows whether repeating one is safe.
+    connection. Writes (`execute`, `write_one`) never retry after a failure
+    mid-exchange, because the caller knows whether repeating one is safe. A
+    connection found *already* closed before anything was sent is replaced,
+    and the query sent once more, writes included.
+  - **Cancellation-safe:** every round trip runs in its own task. A caller
+    that is cancelled (a timeout, a disconnected HTTP client) can't abandon
+    a half-finished exchange. Otherwise rhypedb-client would mark the
+    connection dead and the next genuine write would fail; the independent
+    review confirmed that bug, and
+    `a_cancelled_query_does_not_poison_the_next_write` pins it.
 - **Tests use the real thing.** Integration tests start the actual
   `rhypedb-server`, at the commit `Cargo.toml` pins, with the repository's
   own `schema.rhype`, in a temporary directory on free ports

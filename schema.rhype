@@ -32,3 +32,11 @@ type ReplayNonce {
     signed_at: DateTime
     expires_at: DateTime @indexed
 }
+
+// The replay store's clock, persisted when the ledger is purged, so a nonce
+// purged as expired stays expired after a restart even if the wall clock had
+// stepped forward and was corrected (docs/decisions/0001). One row, "replay".
+type ReplayClock {
+    name: String @unique
+    high_water: DateTime
+}

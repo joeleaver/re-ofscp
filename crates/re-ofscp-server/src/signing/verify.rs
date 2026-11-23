@@ -387,7 +387,7 @@ impl Verifier {
         // this fails, so the nonce remains burned either way.
         match self
             .ledger
-            .persist(&StoredNonce::from_use(&pre.nonce_use(), expires))
+            .persist(&StoredNonce::from_use(&pre.nonce_use(), expires), now)
             .await
         {
             Ok(()) => {}
