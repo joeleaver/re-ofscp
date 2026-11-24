@@ -16,11 +16,21 @@ re-ofscp is an **enterprise-grade OFSCP provider** written in Rust. It is hosted
 
 ## Protocol questions: ask the OFSCP oracle
 
-A separate Claude session, **"OFSCP oracle"** (session id `local_a5cc84d7-2370-4fa1-8849-4687aef3e1a1`, working in `~/dev/ofscp`), owns the OFSCP spec. It audited the spec and Forumall, and it authored the open spec PRs. **The premise:** if you can't work out how to behave from the spec text (and checking against Forumall), the spec has a gap. The fix belongs in the spec, not in a private guess.
+A separate Claude session, the **OFSCP oracle**, owns the OFSCP spec. It always works in `~/dev/ofscp`. It audited the spec and Forumall, and it authors the spec PRs. The oracle is replaced by a fresh session from time to time (it hands off through a note in its own memory), so it has no fixed session id. **The premise:** if you can't work out how to behave from the spec text (and checking against Forumall), the spec has a gap. The fix belongs in the spec, not in a private guess.
 
 **When to ask:** whenever a protocol or interoperability question isn't answered unambiguously by the spec plus the open spec PRs. Examples: a field shape, an ordering, an error code, what a remote provider will send or expect, how two rules interact, or behaviour where Forumall and the spec disagree. Don't ask about Rust, rhypedb, rinch, jkbase or this server's internal design. Those are yours.
 
-**How:** send a message to the session above (`SendMessage` with `to: "local_a5cc84d7-2370-4fa1-8849-4687aef3e1a1"`). If you can't reach it, ask Joe to relay. Each question should include:
+**How:** find the oracle's current session, then message it.
+- **Find it:** call `mcp__ccd_session_mgmt__list_sessions` with a modest limit (about 20). Archived sessions are left out by default; don't pass `include_archived`.
+  1. Prefer a session whose `cwd` is exactly `/home/joe/dev/ofscp` and whose title contains "OFSCP oracle". If several match, take the most recently active.
+  2. Failing that, any session whose `cwd` is exactly `/home/joe/dev/ofscp`, again the most recently active. (Don't filter on `startedBy`: the oracle is often started by the previous oracle, so it has one too.)
+  3. Don't pick a session in a worktree under `~/dev/ofscp` (for example `.claude/worktrees/...`). Those are short-lived spec-PR workers, not the oracle.
+  4. If nothing matches, raise the limit and try once more.
+- **Idle is fine:** the oracle usually shows `isRunning: false` between questions. A non-archived match is the oracle whether or not it is running; message it anyway.
+- **Message it:** use `SendMessage` with `to` set to its `local_…` id, or `send_message` with that `session_id`.
+- **If no non-archived session matches,** ask Joe to start one or to relay. Don't unarchive an old session.
+
+Each question should include:
 1. the spec section(s) and the exact text you're unsure about;
 2. the concrete case: request/response or event, actors, providers;
 3. what you would do if you had to decide now, and why.
