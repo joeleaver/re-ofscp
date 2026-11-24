@@ -1,7 +1,10 @@
 //! Shared helpers for integration tests.
 #![allow(dead_code)]
 
+pub mod accounts;
+pub mod admin;
 pub mod harness;
+pub mod rhypedb;
 
 use std::path::PathBuf;
 

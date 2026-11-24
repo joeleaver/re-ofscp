@@ -3,63 +3,189 @@
 //! The binary (`src/main.rs`) only wires configuration, logging and shutdown;
 //! everything testable lives here.
 
+pub mod accounts;
+pub mod admin;
+pub mod client;
 pub mod config;
+pub mod db;
 pub mod problem;
+pub mod ratelimit;
 pub mod replay;
 pub mod signing;
+pub mod timefmt;
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::{Json, Router, extract::State, middleware, routing::get};
+use axum::routing::{delete, get, post};
+use axum::{Json, Router, extract::State, middleware};
 use problem::ProblemBase;
 use re_ofscp_types::{Health, OFSCP_VERSION};
 
 pub use config::Config;
 pub use problem::Problem;
 
+use accounts::{Accounts, NoRemoteKeys};
+use admin::{AdminSecrets, Admins};
+use db::{Db, DbConfig};
 use replay::ReplayStore;
+use replay::ledger::{LedgerError, NonceLedger, RhypeLedger};
 use signing::{Clock, KeyResolver, SystemClock, Verifier};
 
 /// Maximum clock skew accepted on signed requests, in seconds (§4.5 step 3, §8).
 pub const MAX_SKEW_SECS: i64 = 300;
 
+/// How often expired nonces are deleted from the persistent ledger.
+pub const LEDGER_PURGE_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Shared application state.
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
+    /// The rhypedb connection pool.
+    pub db: Arc<Db>,
+    /// Accounts, passwords, bootstrap tokens and device keys.
+    pub accounts: Arc<Accounts>,
+    /// Admin identity, sessions and the audit log.
+    pub admins: Arc<Admins>,
     /// Verifies every signed request, REST and federation alike, against the
     /// one provider-wide replay store.
     pub verifier: Arc<Verifier>,
 }
 
-impl AppState {
-    /// Build state with the wall clock.
-    pub fn new(config: Config, keys: Arc<dyn KeyResolver>) -> Self {
-        Self::with_clock(config, keys, Arc::new(SystemClock))
+/// Builds an [`AppState`]. Defaults: the wall clock, local keys from the
+/// account store (remote signers refused until remote resolution lands), and
+/// the rhypedb-backed replay ledger.
+pub struct AppStateBuilder {
+    config: Config,
+    keys: Option<Arc<dyn KeyResolver>>,
+    remote_keys: Arc<dyn KeyResolver>,
+    ledger: Option<Arc<dyn NonceLedger>>,
+    clock: Arc<dyn Clock>,
+}
+
+impl AppStateBuilder {
+    /// Resolve *every* signing key with `keys`, bypassing the account
+    /// store (tests).
+    #[must_use]
+    pub fn keys(mut self, keys: Arc<dyn KeyResolver>) -> Self {
+        self.keys = Some(keys);
+        self
     }
 
-    /// Build state with an explicit clock (tests).
-    pub fn with_clock(config: Config, keys: Arc<dyn KeyResolver>, clock: Arc<dyn Clock>) -> Self {
-        // The store begins now. For one skew window, signed requests get 503
-        // because a predecessor process may have recorded them
-        // (docs/decisions/0001-replay-store.md, lost-conn/ofscp#17).
+    /// Resolve remote signers with `remote` (local accounts still come from
+    /// the account store).
+    #[must_use]
+    pub fn remote_keys(mut self, remote: Arc<dyn KeyResolver>) -> Self {
+        self.remote_keys = remote;
+        self
+    }
+
+    /// Persist nonces to `ledger` instead of rhypedb.
+    #[must_use]
+    pub fn ledger(mut self, ledger: Arc<dyn NonceLedger>) -> Self {
+        self.ledger = Some(ledger);
+        self
+    }
+
+    /// Use `clock` instead of the wall clock.
+    #[must_use]
+    pub fn clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Build the state. The replay store starts in its restart warm-up;
+    /// [`AppState::restore_replay`] ends it once the ledger is reloaded.
+    pub fn build(self) -> AppState {
+        let config = self.config;
+        let db = Arc::new(Db::new(DbConfig::new(config.rhypedb_addr.clone())));
+        let ledger = self
+            .ledger
+            .unwrap_or_else(|| Arc::new(RhypeLedger::new(db.clone())));
         let replay = Arc::new(ReplayStore::new(
             config.replay,
             MAX_SKEW_SECS,
-            clock.now().unix_timestamp(),
+            self.clock.now().unix_timestamp(),
             config.domain.as_str(),
         ));
+        let accounts = Arc::new(Accounts::new(
+            config.domain.clone(),
+            config.registration,
+            db.clone(),
+            self.remote_keys,
+        ));
+        let admins = Arc::new(Admins::new(
+            config.domain.clone(),
+            db.clone(),
+            accounts.passwords.clone(),
+            AdminSecrets {
+                secret_key: config.admin_secret_key.as_ref().map(|k| k.0),
+                setup_token: config.admin_setup_token.as_ref().map(|t| t.0.clone()),
+            },
+        ));
+        let keys: Arc<dyn KeyResolver> = self.keys.unwrap_or_else(|| accounts.keys.clone());
         let verifier = Arc::new(Verifier::new(
             config.domain.clone(),
             MAX_SKEW_SECS,
             replay,
+            ledger,
             keys,
-            clock,
+            self.clock,
         ));
-        Self {
+        AppState {
             config: Arc::new(config),
+            db,
+            accounts,
+            admins,
             verifier,
+        }
+    }
+}
+
+impl AppState {
+    /// Start building state for `config`.
+    pub fn builder(config: Config) -> AppStateBuilder {
+        AppStateBuilder {
+            config,
+            keys: None,
+            remote_keys: Arc::new(NoRemoteKeys),
+            ledger: None,
+            clock: Arc::new(SystemClock),
+        }
+    }
+
+    /// Reload every live nonce from the persistent ledger into the replay
+    /// store and end its restart warm-up. Call before serving. On error the
+    /// warm-up stays in force (signed requests get `503` for one skew window
+    /// after startup), which is safe.
+    pub async fn restore_replay(&self) -> Result<usize, LedgerError> {
+        let now = self.verifier.now();
+        let restored = self.verifier.ledger().load(now).await?;
+        let store = self.verifier.replay_store();
+        // First the previous process's clock: anything it purged as expired
+        // must stay expired here, whatever our wall clock reads.
+        if let Some(clock) = restored.clock {
+            store.raise_clock(clock);
+        }
+        let count = store.restore(restored.nonces, now);
+        store.end_warm_up();
+        Ok(count)
+    }
+
+    /// Delete expired nonces from the ledger, every
+    /// [`LEDGER_PURGE_INTERVAL`], until the task is dropped.
+    pub async fn purge_ledger_forever(self) {
+        let mut tick = tokio::time::interval(LEDGER_PURGE_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            // Purge by the store's clock (never decreasing), which the ledger
+            // persists before deleting anything.
+            let clock = self.verifier.replay_store().clock(self.verifier.now());
+            if let Err(e) = self.verifier.ledger().purge(clock).await {
+                tracing::warn!(error = %e, "purging expired nonces failed");
+            }
         }
     }
 }
@@ -68,10 +194,32 @@ impl AppState {
 ///
 /// Layer order, outermost first: tracing, problem rendering (so every
 /// [`Problem`], including the signature layer's and extractors' rejections,
-/// gets its body), signature verification, routes.
+/// gets its body), signature verification (OFSCP routes only), routes.
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/health", get(health))
+        .route(
+            "/api/auth/register",
+            post(accounts::routes::register).layer(auth_body_limit()),
+        )
+        .route(
+            "/api/auth/login",
+            post(accounts::routes::login).layer(auth_body_limit()),
+        )
+        .route(
+            "/api/auth/device-keys",
+            post(accounts::routes::register_device_key)
+                .layer(auth_body_limit())
+                .get(accounts::routes::list_device_keys),
+        )
+        .route(
+            "/api/auth/device-keys/{key_id}",
+            delete(accounts::routes::revoke_device_key),
+        )
+        .route(
+            "/.well-known/ofscp/users/{handle}/keys",
+            get(accounts::routes::user_keys),
+        )
         .route("/problems/{code}", get(problem::describe))
         .fallback(|| async { Problem::not_found() })
         .method_not_allowed_fallback(|| async { Problem::method_not_allowed() })
@@ -79,33 +227,48 @@ pub fn router(state: AppState) -> Router {
             state.verifier.clone(),
             signing::authenticate,
         ))
+        // Added after the signature layer, so it does not wrap them: admin
+        // requests are authenticated by the admin session, never by OFSCP
+        // signatures (docs/decisions/0005).
+        .merge(admin::routes::router())
         .layer(middleware::map_response_with_state(
             ProblemBase::new(&state.config.domain),
             problem::render,
         ))
-        .layer(tower_http::trace::TraceLayer::new_for_http())
+        .layer(
+            tower_http::trace::TraceLayer::new_for_http().make_span_with(
+                // The path only: query strings can carry secrets (invite
+                // tokens in `?invite=`, §4.1.1 "SHOULD NOT log invite
+                // tokens").
+                |req: &axum::http::Request<axum::body::Body>| {
+                    tracing::info_span!(
+                        "request",
+                        method = %req.method(),
+                        path = %req.uri().path(),
+                    )
+                },
+            ),
+        )
         .with_state(state)
+}
+
+/// Body limit for the unauthenticated auth endpoints, whose bodies are a
+/// handle, a password (at most 1 KiB) and similar: far below axum's 2 MiB
+/// default, so nobody can make the provider buffer and parse megabytes
+/// before any check.
+fn auth_body_limit() -> axum::extract::DefaultBodyLimit {
+    axum::extract::DefaultBodyLimit::max(accounts::routes::AUTH_BODY_LIMIT)
 }
 
 /// `GET /api/health` — liveness plus a database reachability probe.
 async fn health(State(state): State<AppState>) -> Json<Health> {
-    let database = database_reachable(&state.config.rhypedb_addr).await;
+    let database = tokio::time::timeout(Duration::from_secs(2), state.db.ping())
+        .await
+        .unwrap_or(false);
     Json(Health {
         status: if database { "ok" } else { "degraded" }.to_owned(),
         ofscp: OFSCP_VERSION.to_owned(),
         domain: state.config.domain.to_string(),
         database,
     })
-}
-
-/// Whether rhypedb accepts a connection within a short timeout.
-async fn database_reachable(addr: &str) -> bool {
-    matches!(
-        tokio::time::timeout(
-            Duration::from_secs(2),
-            rhypedb_client::AsyncClient::connect(addr)
-        )
-        .await,
-        Ok(Ok(_))
-    )
 }

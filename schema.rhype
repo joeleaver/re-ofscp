@@ -1,20 +1,125 @@
 // re-ofscp database schema (rhypedb SDL). Deployed by jkbase via `[database]`.
 // Starter types only — the build grows this to the full OFSCP data model.
 
+// An OFSCP account on this provider (spec §5.1). Admins are a separate
+// identity system (CLAUDE.md) and are not stored here. Accounts are created
+// by admins or by invitation only (docs/decisions/0004).
 type User {
     handle: String @unique
     display_name: String
+    // Argon2id PHC string (§4.1.4).
     password_hash: String
-    is_admin: Bool
+    // "active" or "disabled". A disabled account cannot log in and its keys
+    // do not verify.
+    status: String
     created_at: DateTime @indexed
-    device_keys: [DeviceKey] @on_delete(cascade)
 }
 
+// A device key (§4.3.2), owned by the account with `handle`. Keys are found
+// by (handle, key_id) with one indexed lookup. (No relation field: rhypedb at
+// the pinned commit cannot link an object inside `create`, and linking
+// afterwards would be a second, non-atomic statement. Accounts are disabled,
+// not deleted; deleting one later removes its keys by handle.)
 type DeviceKey {
     key_id: String @unique
-    user: User @inverse(User.device_keys)
+    handle: String @indexed
     public_key: String
+    algorithm: String
     device_name: String
     created_at: DateTime
     revoked: Bool
+    revoked_at: DateTime
+}
+
+// An account invite (§4.1.1, lost-conn/ofscp#18): single-use, time-limited,
+// optionally pinned to a handle. Only the token's SHA-256 is stored.
+// `used_at` and `used_by` describe the use only while `used` is true (a
+// registration that fails after claiming the invite releases it again).
+type RegistrationInvite {
+    token_hash: String @unique
+    // The pinned handle, absent when the invite is for any handle.
+    handle: String
+    // The admin who issued it.
+    created_by: String
+    created_at: DateTime
+    expires_at: DateTime @indexed
+    used: Bool
+    used_at: DateTime
+    used_by: String
+}
+
+// The persistent replay ledger (spec §4.5 "Restarts"; docs/decisions/0001).
+// One row per accepted nonce, written before the request is accepted and
+// purged once expired. `key` is SHA-256 over (signer kind, key id, nonce).
+type ReplayNonce {
+    key: String @unique
+    kind: String
+    signer: String
+    domain: String
+    key_id: String
+    nonce: String
+    signed_at: DateTime
+    expires_at: DateTime @indexed
+}
+
+// The replay store's clock, persisted when the ledger is purged, so a nonce
+// purged as expired stays expired after a restart even if the wall clock had
+// stepped forward and was corrected (docs/decisions/0001). One row, "replay".
+type ReplayClock {
+    name: String @unique
+    high_water: DateTime
+}
+
+// An admin of this provider (docs/decisions/0005). Admins are a separate
+// identity system from `User`: they are not OFSCP actors, are never
+// federated and never sign OFSCP requests.
+type Admin {
+    username: String @unique
+    // Argon2id PHC string.
+    password_hash: String
+    // "owner", "operator" or "read_only".
+    role: String
+    // "active" or "disabled". Disabling is final.
+    status: String
+    // The TOTP secret, sealed with ADMIN_SECRET_KEY (XChaCha20-Poly1305,
+    // bound to the username). Empty until enrollment is confirmed.
+    totp_secret: String
+    // A secret awaiting confirmation (sealed likewise), or empty.
+    totp_pending: String
+    // The last accepted TOTP time step; a code is accepted only for a later
+    // step, so each code works once.
+    totp_last_step: i64
+    // Set when another admin chose the password.
+    password_change_required: Bool
+    // Bumped whenever the admin's credentials change (TOTP confirmed or
+    // reset, password changed). Each session records the value it was
+    // opened under and ends once it differs.
+    credential_epoch: i64
+    // The admin who created this one, or "setup".
+    created_by: String
+    created_at: DateTime
+}
+
+// A signed-in admin's session. Only the token's SHA-256 is stored.
+type AdminSession {
+    token_hash: String @unique
+    username: String @indexed
+    // The admin's credential_epoch when the session was opened.
+    credential_epoch: i64
+    created_at: DateTime
+    last_seen_at: DateTime
+    // Absolute end, whatever the activity.
+    expires_at: DateTime @indexed
+}
+
+// The admin audit log: one entry per admin action, written before the
+// action runs (outcome "pending") and completed after it.
+type AdminAudit {
+    at: DateTime @indexed
+    admin: String @indexed
+    action: String
+    target: String
+    outcome: String
+    source: String
+    detail: String
 }

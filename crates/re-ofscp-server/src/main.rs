@@ -1,9 +1,9 @@
-use std::sync::Arc;
-
 use anyhow::Context;
-use re_ofscp_server::signing::StaticKeys;
 use re_ofscp_server::{AppState, Config, router};
 use tracing_subscriber::EnvFilter;
+
+/// How long startup waits for the replay ledger before serving in warm-up.
+const RESTORE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -18,13 +18,40 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("binding {}", config.bind))?;
     tracing::info!(domain = %config.domain, bind = %config.bind, "re-ofscp listening");
 
-    // No device keys can be registered yet, so no signed request verifies.
-    // The rhypedb-backed local resolver and the SSRF-safe remote resolver
-    // replace this as they land.
-    let app = router(AppState::new(config, Arc::new(StaticKeys::default())));
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    // Local accounts' keys come from rhypedb. Remote signers are refused
+    // until the SSRF-safe remote resolver lands.
+    let state = AppState::builder(config).build();
+    match tokio::time::timeout(RESTORE_TIMEOUT, state.restore_replay()).await {
+        Ok(Ok(n)) => tracing::info!(restored = n, "replay store restored from the ledger"),
+        Ok(Err(e)) => tracing::warn!(
+            error = %e,
+            "replay ledger unavailable at startup; signed requests get 503 for one skew window"
+        ),
+        Err(_) => tracing::warn!(
+            "replay ledger restore timed out; signed requests get 503 for one skew window"
+        ),
+    }
+    let purge = tokio::spawn(state.clone().purge_ledger_forever());
+    if state.admins.enabled() {
+        tracing::info!("admin console enabled");
+    } else {
+        tracing::warn!("ADMIN_SECRET_KEY is not set; the admin API is off");
+    }
+    let purge_sessions = tokio::spawn(
+        state
+            .admins
+            .clone()
+            .purge_sessions_forever(std::sync::Arc::new(re_ofscp_server::signing::SystemClock)),
+    );
+    let app = router(state);
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
+    purge.abort();
+    purge_sessions.abort();
     Ok(())
 }
 

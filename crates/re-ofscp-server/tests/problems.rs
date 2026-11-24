@@ -8,7 +8,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use http_body_util::BodyExt;
 use re_ofscp_server::problem::{EXTENSIONS, REGISTRY};
-use re_ofscp_server::signing::StaticKeys;
+use re_ofscp_server::replay::NoLedger;
 use re_ofscp_server::{AppState, Config, router};
 use tower::ServiceExt;
 
@@ -19,7 +19,7 @@ fn app() -> axum::Router {
         _ => None,
     })
     .unwrap();
-    router(AppState::new(config, Arc::new(StaticKeys::default())))
+    router(AppState::builder(config).ledger(Arc::new(NoLedger)).build())
 }
 
 async fn call(req: Request<Body>) -> (StatusCode, String, Vec<u8>) {

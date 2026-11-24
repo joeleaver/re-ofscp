@@ -33,6 +33,13 @@ ed25519-dalek = { workspace = true }
 time = { workspace = true }
 http-body-util = { workspace = true }
 psl = { workspace = true }
+argon2 = { workspace = true }
+getrandom = { workspace = true }
+hmac = { workspace = true }
+sha1 = { workspace = true }
+chacha20poly1305 = { workspace = true }
+subtle = { workspace = true }
+data-encoding = { workspace = true }
 
 [dev-dependencies]
 rhypedb-schema = { workspace = true }
@@ -40,3 +47,4 @@ tower = { version = "0.5", features = ["util"] }
 time = { workspace = true, features = ["macros"] }
 serde_json = { workspace = true }
 jsonschema = { version = "0.60", default-features = false }
+tempfile = "3"

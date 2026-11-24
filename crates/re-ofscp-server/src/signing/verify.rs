@@ -16,7 +16,9 @@ use time::format_description::well_known::Rfc3339;
 
 use super::canonical::{self, CanonicalRequest};
 use crate::problem::Problem;
-use crate::replay::{NonceUse, ReplayError, ReplayStore, SignerKind, Surface};
+use crate::replay::{
+    LedgerError, NonceLedger, NonceUse, ReplayError, ReplayStore, SignerKind, StoredNonce, Surface,
+};
 
 /// Header names (§4.4.1, §8.1). Lowercase, as `http` stores them.
 pub mod headers {
@@ -80,11 +82,20 @@ pub struct Verified {
     pub key_id: String,
 }
 
-/// A failure to resolve keys (network error, malformed key document, denied
-/// by federation policy, …). §4.5 step 6 answers all of them with `401`.
+/// A failure to resolve keys.
 #[derive(Debug, Clone, thiserror::Error)]
-#[error("{0}")]
-pub struct KeyError(pub String);
+pub enum KeyError {
+    /// The signer's keys could not be obtained from *them* (their provider
+    /// unreachable, a malformed key document, denied by federation policy).
+    /// §4.5 step 6: `401`.
+    #[error("keys unresolvable: {0}")]
+    Unresolvable(String),
+    /// *This* provider could not look the key up (its own database is
+    /// down). Not the client's fault: `503`, so it retries rather than
+    /// concluding its credentials are bad.
+    #[error("key store unavailable: {0}")]
+    Unavailable(String),
+}
 
 /// Boxed future returned by [`KeyResolver::resolve`].
 pub type KeyFuture<'a> =
@@ -156,12 +167,20 @@ pub enum VerifyError {
         /// Seconds to wait.
         retry_after: u64,
     },
+    /// Record: the persistent replay ledger could not be written, so the
+    /// nonce cannot be vouched for across a restart.
+    #[error("replay ledger unavailable; re-sign and retry shortly")]
+    LedgerUnavailable,
     /// Step 5: body digest mismatch.
     #[error("X-OFSCP-Content-Digest does not match the body")]
     Digest,
-    /// Step 6: no active key with that id (or lookup failed).
+    /// Step 6: no active key with that id (or the signer's keys could not
+    /// be obtained).
     #[error("unknown or revoked key")]
     UnknownKey,
+    /// Step 6: this provider's own key store is unavailable.
+    #[error("key store unavailable; retry shortly")]
+    KeysUnavailable,
     /// Step 7: bad signature.
     #[error("signature does not verify")]
     Signature,
@@ -174,6 +193,9 @@ impl From<VerifyError> for Problem {
             VerifyError::StoreFull { retry_after } | VerifyError::WarmingUp { retry_after } => {
                 Problem::service_unavailable(retry_after)
             }
+            VerifyError::LedgerUnavailable | VerifyError::KeysUnavailable => {
+                Problem::service_unavailable(LEDGER_RETRY_SECS)
+            }
             VerifyError::RateLimited { retry_after } => Problem::too_many_requests(retry_after),
             _ => Problem::unauthorized(),
         };
@@ -181,12 +203,16 @@ impl From<VerifyError> for Problem {
     }
 }
 
+/// `Retry-After` when the replay ledger cannot be written.
+const LEDGER_RETRY_SECS: u64 = 2;
+
 /// Verifies signed requests for one provider.
 #[derive(Clone)]
 pub struct Verifier {
     authority: Authority,
     skew_secs: i64,
     replay: Arc<ReplayStore>,
+    ledger: Arc<dyn NonceLedger>,
     keys: Arc<dyn KeyResolver>,
     clock: Arc<dyn Clock>,
 }
@@ -236,10 +262,13 @@ impl Precheck {
 
 impl Verifier {
     /// Create a verifier for `authority` (this provider's canonical host).
+    /// Every recorded nonce is also written to `ledger` before a request is
+    /// accepted.
     pub fn new(
         authority: Authority,
         skew_secs: i64,
         replay: Arc<ReplayStore>,
+        ledger: Arc<dyn NonceLedger>,
         keys: Arc<dyn KeyResolver>,
         clock: Arc<dyn Clock>,
     ) -> Self {
@@ -247,6 +276,7 @@ impl Verifier {
             authority,
             skew_secs,
             replay,
+            ledger,
             keys,
             clock,
         }
@@ -255,6 +285,16 @@ impl Verifier {
     /// The shared replay store (the WebSocket handshake records into it too).
     pub fn replay_store(&self) -> &Arc<ReplayStore> {
         &self.replay
+    }
+
+    /// The persistent replay ledger.
+    pub fn ledger(&self) -> &Arc<dyn NonceLedger> {
+        &self.ledger
+    }
+
+    /// Now, on this verifier's clock (unix seconds).
+    pub fn now(&self) -> i64 {
+        self.clock.now().unix_timestamp()
     }
 
     /// Run §4.5 steps 1–7 and record the nonce.
@@ -353,9 +393,28 @@ impl Verifier {
         // freshness under its lock on a clock that never runs backwards, so
         // a slow or stale copy cannot record a nonce a sibling already used.
         let now = self.clock.now().unix_timestamp();
-        self.replay
+        let recorded = self
+            .replay
             .record(Surface::SignedRequest, &pre.nonce_use(), now)
             .map_err(replay_error)?;
+
+        // Make it durable before accepting. The in-memory entry stays even if
+        // this fails, so the nonce remains burned either way.
+        match self
+            .ledger
+            .persist(
+                &StoredNonce::from_use(&pre.nonce_use(), recorded.expires),
+                recorded.clock,
+            )
+            .await
+        {
+            Ok(()) => {}
+            Err(LedgerError::Duplicate) => return Err(VerifyError::Replayed),
+            Err(e) => {
+                tracing::error!(error = %e, "replay ledger write failed");
+                return Err(VerifyError::LedgerUnavailable);
+            }
+        }
 
         Ok(Verified {
             signer: pre.signer,
@@ -372,9 +431,13 @@ impl Verifier {
         let key = match self.keys.resolve(&pre.signer, &pre.key_id, fresh).await {
             Ok(Some(key)) => key,
             Ok(None) => return Err(VerifyError::UnknownKey),
-            Err(e) => {
+            Err(KeyError::Unresolvable(e)) => {
                 tracing::debug!(error = %e, key_id = pre.key_id, "key resolution failed");
                 return Err(VerifyError::UnknownKey);
+            }
+            Err(KeyError::Unavailable(e)) => {
+                tracing::error!(error = %e, key_id = pre.key_id, "key store unavailable");
+                return Err(VerifyError::KeysUnavailable);
             }
         };
         if canonical::verify(&key, canonical, &pre.signature) {
