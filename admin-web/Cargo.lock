@@ -1059,7 +1059,7 @@ checksum = "d902046e6a28a1e4c3cab97258a0ce11e994903f01c2d97a9447a0b3df85f4f6"
 [[package]]
 name = "rinch"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch?rev=7b9e92a9fd0c221b1fd41c8d19fbd500763258b6#7b9e92a9fd0c221b1fd41c8d19fbd500763258b6"
+source = "git+https://github.com/joeleaver/rinch?rev=23dc8cc634bd57834081f92ea1a56465cca680d9#23dc8cc634bd57834081f92ea1a56465cca680d9"
 dependencies = [
  "js-sys",
  "log",
@@ -1079,7 +1079,7 @@ dependencies = [
 [[package]]
 name = "rinch-android"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch?rev=7b9e92a9fd0c221b1fd41c8d19fbd500763258b6#7b9e92a9fd0c221b1fd41c8d19fbd500763258b6"
+source = "git+https://github.com/joeleaver/rinch?rev=23dc8cc634bd57834081f92ea1a56465cca680d9#23dc8cc634bd57834081f92ea1a56465cca680d9"
 dependencies = [
  "android-activity",
  "base64 0.22.1",
@@ -1092,7 +1092,7 @@ dependencies = [
 [[package]]
 name = "rinch-clipboard"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch?rev=7b9e92a9fd0c221b1fd41c8d19fbd500763258b6#7b9e92a9fd0c221b1fd41c8d19fbd500763258b6"
+source = "git+https://github.com/joeleaver/rinch?rev=23dc8cc634bd57834081f92ea1a56465cca680d9#23dc8cc634bd57834081f92ea1a56465cca680d9"
 dependencies = [
  "arboard",
  "js-sys",
@@ -1105,7 +1105,7 @@ dependencies = [
 [[package]]
 name = "rinch-components"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch?rev=7b9e92a9fd0c221b1fd41c8d19fbd500763258b6#7b9e92a9fd0c221b1fd41c8d19fbd500763258b6"
+source = "git+https://github.com/joeleaver/rinch?rev=23dc8cc634bd57834081f92ea1a56465cca680d9#23dc8cc634bd57834081f92ea1a56465cca680d9"
 dependencies = [
  "rinch-core",
  "rinch-macros",
@@ -1117,7 +1117,7 @@ dependencies = [
 [[package]]
 name = "rinch-core"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch?rev=7b9e92a9fd0c221b1fd41c8d19fbd500763258b6#7b9e92a9fd0c221b1fd41c8d19fbd500763258b6"
+source = "git+https://github.com/joeleaver/rinch?rev=23dc8cc634bd57834081f92ea1a56465cca680d9#23dc8cc634bd57834081f92ea1a56465cca680d9"
 dependencies = [
  "thiserror 1.0.69",
  "tracing",
@@ -1127,7 +1127,7 @@ dependencies = [
 [[package]]
 name = "rinch-editable"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch?rev=7b9e92a9fd0c221b1fd41c8d19fbd500763258b6#7b9e92a9fd0c221b1fd41c8d19fbd500763258b6"
+source = "git+https://github.com/joeleaver/rinch?rev=23dc8cc634bd57834081f92ea1a56465cca680d9#23dc8cc634bd57834081f92ea1a56465cca680d9"
 dependencies = [
  "rinch-words",
 ]
@@ -1135,7 +1135,7 @@ dependencies = [
 [[package]]
 name = "rinch-editor-core"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch?rev=7b9e92a9fd0c221b1fd41c8d19fbd500763258b6#7b9e92a9fd0c221b1fd41c8d19fbd500763258b6"
+source = "git+https://github.com/joeleaver/rinch?rev=23dc8cc634bd57834081f92ea1a56465cca680d9#23dc8cc634bd57834081f92ea1a56465cca680d9"
 dependencies = [
  "regex",
  "rinch-core",
@@ -1146,7 +1146,7 @@ dependencies = [
 [[package]]
 name = "rinch-editor-view"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch?rev=7b9e92a9fd0c221b1fd41c8d19fbd500763258b6#7b9e92a9fd0c221b1fd41c8d19fbd500763258b6"
+source = "git+https://github.com/joeleaver/rinch?rev=23dc8cc634bd57834081f92ea1a56465cca680d9#23dc8cc634bd57834081f92ea1a56465cca680d9"
 dependencies = [
  "rinch-core",
  "rinch-editor-core",
@@ -1156,7 +1156,7 @@ dependencies = [
 [[package]]
 name = "rinch-macros"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch?rev=7b9e92a9fd0c221b1fd41c8d19fbd500763258b6#7b9e92a9fd0c221b1fd41c8d19fbd500763258b6"
+source = "git+https://github.com/joeleaver/rinch?rev=23dc8cc634bd57834081f92ea1a56465cca680d9#23dc8cc634bd57834081f92ea1a56465cca680d9"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1166,7 +1166,7 @@ dependencies = [
 [[package]]
 name = "rinch-platform"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch?rev=7b9e92a9fd0c221b1fd41c8d19fbd500763258b6#7b9e92a9fd0c221b1fd41c8d19fbd500763258b6"
+source = "git+https://github.com/joeleaver/rinch?rev=23dc8cc634bd57834081f92ea1a56465cca680d9#23dc8cc634bd57834081f92ea1a56465cca680d9"
 dependencies = [
  "web-time",
 ]
@@ -1174,18 +1174,23 @@ dependencies = [
 [[package]]
 name = "rinch-spell"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch?rev=7b9e92a9fd0c221b1fd41c8d19fbd500763258b6#7b9e92a9fd0c221b1fd41c8d19fbd500763258b6"
+source = "git+https://github.com/joeleaver/rinch?rev=23dc8cc634bd57834081f92ea1a56465cca680d9#23dc8cc634bd57834081f92ea1a56465cca680d9"
 dependencies = [
+ "dispatch2",
  "icu_normalizer",
  "icu_properties",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
  "spellbook",
  "unicode-segmentation",
+ "windows",
 ]
 
 [[package]]
 name = "rinch-tabler-icons"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch?rev=7b9e92a9fd0c221b1fd41c8d19fbd500763258b6#7b9e92a9fd0c221b1fd41c8d19fbd500763258b6"
+source = "git+https://github.com/joeleaver/rinch?rev=23dc8cc634bd57834081f92ea1a56465cca680d9#23dc8cc634bd57834081f92ea1a56465cca680d9"
 dependencies = [
  "heck",
  "rinch-core",
@@ -1197,12 +1202,12 @@ dependencies = [
 [[package]]
 name = "rinch-theme"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch?rev=7b9e92a9fd0c221b1fd41c8d19fbd500763258b6#7b9e92a9fd0c221b1fd41c8d19fbd500763258b6"
+source = "git+https://github.com/joeleaver/rinch?rev=23dc8cc634bd57834081f92ea1a56465cca680d9#23dc8cc634bd57834081f92ea1a56465cca680d9"
 
 [[package]]
 name = "rinch-web"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch?rev=7b9e92a9fd0c221b1fd41c8d19fbd500763258b6#7b9e92a9fd0c221b1fd41c8d19fbd500763258b6"
+source = "git+https://github.com/joeleaver/rinch?rev=23dc8cc634bd57834081f92ea1a56465cca680d9#23dc8cc634bd57834081f92ea1a56465cca680d9"
 dependencies = [
  "js-sys",
  "rinch",
@@ -1218,7 +1223,7 @@ dependencies = [
 [[package]]
 name = "rinch-words"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch?rev=7b9e92a9fd0c221b1fd41c8d19fbd500763258b6#7b9e92a9fd0c221b1fd41c8d19fbd500763258b6"
+source = "git+https://github.com/joeleaver/rinch?rev=23dc8cc634bd57834081f92ea1a56465cca680d9#23dc8cc634bd57834081f92ea1a56465cca680d9"
 dependencies = [
  "regex",
  "unicode-segmentation",
@@ -1882,10 +1887,105 @@ dependencies = [
 ]
 
 [[package]]
+name = "windows"
+version = "0.62.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "527fadee13e0c05939a6a05d5bd6eec6cd2e3dbd648b9f8e447c6518133d8580"
+dependencies = [
+ "windows-collections",
+ "windows-core",
+ "windows-future",
+ "windows-numerics",
+]
+
+[[package]]
+name = "windows-collections"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23b2d95af1a8a14a3c7367e1ed4fc9c20e0a26e79551b1454d72583c97cc6610"
+dependencies = [
+ "windows-core",
+]
+
+[[package]]
+name = "windows-core"
+version = "0.62.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8e83a14d34d0623b51dce9581199302a221863196a1dde71a7663a4c2be9deb"
+dependencies = [
+ "windows-implement",
+ "windows-interface",
+ "windows-link",
+ "windows-result",
+ "windows-strings",
+]
+
+[[package]]
+name = "windows-future"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1d6f90251fe18a279739e78025bd6ddc52a7e22f921070ccdc67dde84c605cb"
+dependencies = [
+ "windows-core",
+ "windows-link",
+ "windows-threading",
+]
+
+[[package]]
+name = "windows-implement"
+version = "0.60.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "053e2e040ab57b9dc951b72c264860db7eb3b0200ba345b4e4c3b14f67855ddf"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "windows-interface"
+version = "0.59.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f316c4a2570ba26bbec722032c4099d8c8bc095efccdc15688708623367e358"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "windows-link"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
+
+[[package]]
+name = "windows-numerics"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e2e40844ac143cdb44aead537bbf727de9b044e107a0f1220392177d15b0f26"
+dependencies = [
+ "windows-core",
+ "windows-link",
+]
+
+[[package]]
+name = "windows-result"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7781fa89eaf60850ac3d2da7af8e5242a5ea78d1a11c49bf2910bb5a73853eb5"
+dependencies = [
+ "windows-link",
+]
+
+[[package]]
+name = "windows-strings"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7837d08f69c77cf6b07689544538e017c1bfcf57e34b4c0ff58e6c2cd3b37091"
+dependencies = [
+ "windows-link",
+]
 
 [[package]]
 name = "windows-sys"
@@ -1952,6 +2052,15 @@ dependencies = [
  "windows_x86_64_gnu 0.52.6",
  "windows_x86_64_gnullvm 0.52.6",
  "windows_x86_64_msvc 0.52.6",
+]
+
+[[package]]
+name = "windows-threading"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3949bd5b99cafdf1c7ca86b43ca564028dfe27d66958f2470940f73d86d75b37"
+dependencies = [
+ "windows-link",
 ]
 
 [[package]]
