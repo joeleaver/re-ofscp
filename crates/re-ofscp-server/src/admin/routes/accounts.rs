@@ -24,11 +24,9 @@ use crate::timefmt::{rfc3339, unix};
 /// Most accounts one listing returns.
 pub const MAX_ACCOUNTS_LISTED: usize = 100;
 
-/// Longest audit window one listing covers: 31 days.
-pub const MAX_AUDIT_WINDOW_SECS: i64 = 31 * 86_400;
-
-/// Default audit window: the last day.
-pub const DEFAULT_AUDIT_WINDOW_SECS: i64 = 86_400;
+pub use re_ofscp_types::admin::{
+    DEFAULT_AUDIT_WINDOW_SECS, MAX_ACCOUNT_QUERY_LEN, MAX_AUDIT_WINDOW_SECS,
+};
 
 fn view(a: AccountSummary) -> AccountView {
     AccountView {
@@ -57,8 +55,9 @@ pub async fn list_accounts(
     ctx.require(&state, AdminRole::ReadOnly, "account.list", "")
         .await?;
     let q = query.q.as_deref().map(str::trim).filter(|q| !q.is_empty());
-    if q.is_some_and(|q| q.len() > 64) {
-        return Err(Problem::bad_request().with_detail("q is at most 64 bytes"));
+    if q.is_some_and(|q| q.len() > MAX_ACCOUNT_QUERY_LEN) {
+        return Err(Problem::bad_request()
+            .with_detail(format!("q is at most {MAX_ACCOUNT_QUERY_LEN} bytes")));
     }
     let mut found = state
         .accounts

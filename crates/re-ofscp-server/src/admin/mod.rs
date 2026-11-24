@@ -27,6 +27,8 @@ pub use sessions::{Session, SessionStore};
 pub use store::{Admin, AdminStore, AdminStoreError, NewAdmin};
 pub use totp::SecretBox;
 
+pub use auth::ConsoleOrigins;
+
 use crate::accounts::{PasswordError, Passwords};
 use crate::db::{Db, DbError};
 use crate::ratelimit::{FailureBackoff, Limited, RateLimiter};
@@ -104,8 +106,10 @@ pub enum LoginError {
 /// Admin services shared by the admin routes.
 #[derive(Debug)]
 pub struct Admins {
-    /// This provider's authority (the TOTP issuer, the allowed `Origin`).
+    /// This provider's authority (the TOTP issuer).
     pub domain: Authority,
+    /// The origins state-changing admin requests may come from.
+    pub origins: ConsoleOrigins,
     /// Admins.
     pub store: AdminStore,
     /// Sessions.
@@ -151,15 +155,17 @@ fn sha256(s: &str) -> [u8; 32] {
 }
 
 impl Admins {
-    /// Admin services over `db` for `domain`.
+    /// Admin services over `db` for `domain`, used from `origins`.
     pub fn new(
         domain: Authority,
+        origins: ConsoleOrigins,
         db: Arc<Db>,
         passwords: Passwords,
         secrets: AdminSecrets,
     ) -> Self {
         Self {
             domain,
+            origins,
             store: AdminStore::new(db.clone()),
             sessions: SessionStore::new(db.clone()),
             audit: AuditLog::new(db),

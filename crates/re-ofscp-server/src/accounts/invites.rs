@@ -22,11 +22,7 @@ use crate::db::{Db, DbError, Ql};
 /// Prefix of every account invite.
 pub const INVITE_PREFIX: &str = "ai_";
 
-/// Lifetime of an invite when the issuer does not choose one: 7 days.
-pub const DEFAULT_INVITE_TTL_SECS: i64 = 7 * 86_400;
-
-/// Longest lifetime an issuer may choose: 30 days.
-pub const MAX_INVITE_TTL_SECS: i64 = 30 * 86_400;
+pub use re_ofscp_types::admin::{DEFAULT_INVITE_TTL_SECS, MAX_INVITE_TTL_SECS};
 
 /// Longest token accepted from a client. Ours are 46 characters; anything
 /// much longer is not one of ours and is refused without a lookup.

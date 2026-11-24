@@ -34,6 +34,13 @@ async fn main() -> anyhow::Result<()> {
     let purge = tokio::spawn(state.clone().purge_ledger_forever());
     if state.admins.enabled() {
         tracing::info!("admin console enabled");
+        if state.config.admin_loopback_http {
+            tracing::warn!(
+                "ADMIN_LOOPBACK_HTTP is on: the admin console also accepts http://{} \
+                 (local development only)",
+                state.config.domain
+            );
+        }
     } else {
         tracing::warn!("ADMIN_SECRET_KEY is not set; the admin API is off");
     }
