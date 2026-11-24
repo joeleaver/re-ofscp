@@ -95,8 +95,9 @@ fn fallback(status: u16) -> &'static str {
     }
 }
 
-/// `text` with an initial capital and a final full stop.
-fn sentence(text: &str) -> String {
+/// `text` with an initial capital and a final full stop (kept when it
+/// already ends in `.`, `!` or `?`).
+pub fn sentence(text: &str) -> String {
     let mut chars = text.chars();
     let mut out: String = match chars.next() {
         Some(c) => c.to_uppercase().chain(chars).collect(),

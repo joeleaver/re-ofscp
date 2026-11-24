@@ -12,6 +12,7 @@ use serde::de::DeserializeOwned;
 use crate::api;
 use crate::logic::problem::ApiError;
 use crate::logic::request::{self, ApiCall};
+use crate::logic::transition::{self, Transition};
 
 /// Where the session stands.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,15 +71,25 @@ impl Session {
         self.status.set(Status::SignedOut);
     }
 
+    /// Whether the console holds a session, without subscribing.
+    fn holds_session(&self) -> bool {
+        untracked(|| self.info()).is_some()
+    }
+
+    /// Make the change `t` says.
+    fn apply(&self, t: Transition) {
+        match t {
+            Transition::Keep => {}
+            Transition::SignIn(info) => self.signed_in(info),
+            Transition::SignOut(notice) => self.signed_out(notice),
+            Transition::Unreachable(why) => self.status.set(Status::Unreachable(why)),
+        }
+    }
+
     /// Sign out if `result` says the session is gone.
     fn watch<T>(&self, result: Result<T, ApiError>) -> Result<T, ApiError> {
-        if let Err(e) = &result
-            && e.is_unauthorized()
-            && untracked(|| self.info()).is_some()
-        {
-            self.signed_out(Some(
-                "Your session ended. Sign in again to continue.".to_owned(),
-            ));
+        if let Err(e) = &result {
+            self.apply(transition::after_request(e, self.holds_session()));
         }
         result
     }
@@ -101,19 +112,8 @@ impl Session {
     /// Ask the server for the current session and record the answer: used
     /// at start-up and after each set-up step.
     pub async fn refresh(self) {
-        match api::json::<AdminSessionInfo>(request::session(), None).await {
-            Ok(info) => self.signed_in(info),
-            Err(e) if e.is_unauthorized() => {
-                if untracked(|| self.info()).is_some() {
-                    self.signed_out(Some(
-                        "Your session ended. Sign in again to continue.".to_owned(),
-                    ));
-                } else {
-                    self.signed_out(None);
-                }
-            }
-            Err(e) => self.status.set(Status::Unreachable(e.message())),
-        }
+        let answer = api::json::<AdminSessionInfo>(request::session(), None).await;
+        self.apply(transition::after_refresh(answer, self.holds_session()));
     }
 
     /// End the session on the server, then here. If the server can't be

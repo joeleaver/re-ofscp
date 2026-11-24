@@ -8,7 +8,7 @@ use super::common::{ErrorAlert, Load, Loading, StatusBadge, failure};
 use super::tasks::Tasks;
 use crate::browser;
 use crate::logic::forms;
-use crate::logic::problem::ApiError;
+use crate::logic::problem::{ApiError, sentence};
 use crate::logic::request::{self, AuditFilter};
 use crate::logic::time::{audit_window, default_window, display};
 use crate::session::Session;
@@ -18,7 +18,10 @@ use crate::session::Session;
 fn listing_failure(e: &ApiError) -> Option<String> {
     let m = failure(e)?;
     Some(if e.status() == Some(400) {
-        format!("{m}. Narrow the window, or filter by one admin.")
+        format!(
+            "{} Narrow the window, or filter by one admin.",
+            sentence(&m)
+        )
     } else {
         m
     })
@@ -151,14 +154,25 @@ mod tests {
 
     #[test]
     fn a_refused_listing_says_to_narrow_the_window() {
+        // Problem messages arrive as sentences (`problem::sentence`), so
+        // the advice follows the server's full stop without adding another.
         let too_many = ApiError::Status {
             status: 400,
-            message: "more than 1000 entries in that window; narrow it".to_owned(),
+            message: "More than 1000 entries in that window.".to_owned(),
         };
-        let m = listing_failure(&too_many).unwrap_or_default();
-        assert!(
-            m.ends_with("Narrow the window, or filter by one admin."),
-            "{m}"
+        assert_eq!(
+            listing_failure(&too_many).as_deref(),
+            Some(
+                "More than 1000 entries in that window. Narrow the window, or filter by one admin."
+            )
+        );
+        let bare = ApiError::Status {
+            status: 400,
+            message: "more than 1000 entries".to_owned(),
+        };
+        assert_eq!(
+            listing_failure(&bare).as_deref(),
+            Some("More than 1000 entries. Narrow the window, or filter by one admin.")
         );
         let down = ApiError::Network("offline".to_owned());
         assert_eq!(listing_failure(&down), Some(down.message()));

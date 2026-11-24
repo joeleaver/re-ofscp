@@ -6,6 +6,7 @@ use rinch::prelude::*;
 use super::common::{
     ErrorAlert, Load, Loading, Pending, StatusBadge, SuccessAlert, confirm_dialog, failure,
 };
+use super::field::{Credential, CredentialInput};
 use super::shell::current_role;
 use super::tasks::Tasks;
 use crate::logic::roles::{Action, can, unavailable_reason};
@@ -65,16 +66,15 @@ pub fn AccountsScreen() -> NodeHandle {
     let pending_error = Signal::new(None::<String>);
     search(tasks, session, None, list);
 
-    let run_search = move || match forms::account_query(&query.get()) {
+    // Search for what the query field holds. It also reloads the list after
+    // a change, so an invalid query is reported there too rather than
+    // quietly listing every account.
+    let run_search = move || match forms::account_query(&untracked(|| query.get())) {
         Ok(q) => {
             query_error.set(None);
             search(tasks, session, q, list);
         }
         Err(e) => query_error.set(Some(e.0)),
-    };
-    let reload = move || {
-        let q = forms::account_query(&untracked(|| query.get())).unwrap_or(None);
-        search(tasks, session, q, list);
     };
     let disable = move |handle: String| {
         pending_busy.set(true);
@@ -87,7 +87,7 @@ pub fn AccountsScreen() -> NodeHandle {
                     if untracked(|| shown.get()).is_some() {
                         view(tasks, session, handle, shown);
                     }
-                    reload();
+                    run_search();
                 }
                 Err(e) => {
                     if let Some(m) = failure(&e) {
@@ -134,7 +134,7 @@ pub fn AccountsScreen() -> NodeHandle {
                     on_created: move |handle: String| {
                         creating.set(false);
                         notice.set(Some(format!("Account {handle} created.")));
-                        reload();
+                        run_search();
                     },
                 }
             }
@@ -294,12 +294,11 @@ fn CreateAccountForm(on_close: Callback, on_created: InputCallback) -> NodeHandl
                 value_fn: move || display_name.get(),
                 oninput: move |v: String| display_name.set(v),
             }
-            TextInput {
+            CredentialInput {
                 label: "Initial password",
                 description: "At least 8 characters. Share it with the account's owner securely.",
-                input_type: "password",
-                value_fn: move || password.get(),
-                oninput: move |v: String| password.set(v),
+                kind: Credential::NewPassword,
+                value: password,
                 onsubmit: submit.clone(),
             }
             ErrorAlert { message: error }

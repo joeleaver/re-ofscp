@@ -131,8 +131,11 @@ change the password, and log out; everything else is 403 and audited as a
   any other `DOMAIN` the setting is a configuration error, so it can't
   weaken a real deployment. It is off unless set, and the server warns at
   start-up when it is on. Nothing else changes: the cookie keeps its
-  `__Secure-` name and `Secure` flag, which browsers accept from
-  `http://localhost` because they treat it as a secure context.
+  `__Secure-` name and `Secure` flag. Chrome and Firefox accept such a
+  cookie from `http://localhost` (and `*.localhost`), which they treat as
+  a secure context; Safari does not, and drops it, so in Safari the
+  sign-in succeeds but the session is never sent back. Develop the
+  console in Chrome or Firefox.
   `scripts/dev-admin.sh` runs the whole stack this way (rhypedb, the
   provider, and `trunk serve` proxying `/api/` so the browser sees one
   origin), with the throwaway values in `scripts/dev-admin.env`.

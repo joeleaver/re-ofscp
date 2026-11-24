@@ -7,6 +7,7 @@ use rinch::prelude::*;
 use super::common::{
     ErrorAlert, Load, Loading, Pending, StatusBadge, SuccessAlert, confirm_dialog, failure,
 };
+use super::field::{Credential, CredentialInput};
 use super::shell::current_role;
 use super::tasks::Tasks;
 use crate::logic::roles::{Action, ROLES, can, role_label, unavailable_reason};
@@ -96,11 +97,12 @@ impl Row {
     fn key(&self) -> String {
         let a = &self.admin;
         format!(
-            "{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}",
             a.username,
             a.role.as_str(),
             a.status,
-            a.totp_enabled
+            a.totp_enabled,
+            a.password_change_required
         )
     }
 }
@@ -399,12 +401,12 @@ fn CreateAdminForm(on_close: Callback, on_created: InputCallback) -> NodeHandle 
                 oninput: move |v: String| username.set(v),
                 spellcheck: false,
             }
-            TextInput {
+            CredentialInput {
                 label: "Initial password",
                 description: "At least 8 characters. They must replace it at first sign-in.",
-                input_type: "password",
-                value_fn: move || password.get(),
-                oninput: move |v: String| password.set(v),
+                kind: Credential::NewPassword,
+                value: password,
+                onsubmit: submit.clone(),
             }
             Select {
                 label: "Role",
@@ -465,6 +467,21 @@ mod tests {
         let a = rows(&[admin("ops", "active", true)], "me").remove(0);
         let b = rows(&[admin("ops", "disabled", true)], "me").remove(0);
         assert_ne!(a.key(), b.key());
+        // `totp_label` shows `password_change_required` for an admin
+        // without TOTP, so the key must change with it too.
+        let new = admin("ops", "active", false);
+        let settled = AdminView {
+            password_change_required: false,
+            ..new.clone()
+        };
+        let fresh = AdminView {
+            password_change_required: true,
+            ..new
+        };
+        assert_ne!(totp_label(&settled), totp_label(&fresh));
+        let settled = rows(&[settled], "me").remove(0);
+        let fresh = rows(&[fresh], "me").remove(0);
+        assert_ne!(settled.key(), fresh.key());
     }
 
     #[test]

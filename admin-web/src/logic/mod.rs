@@ -1,6 +1,7 @@
 //! The console's logic that isn't UI: building API requests, reading
 //! problem responses, role gating, form validation, the restricted-session
-//! flow, time windows and the enrollment QR code.
+//! flow, what an answer does to the session, time windows and the
+//! enrollment QR code.
 //!
 //! Nothing here touches the DOM, the network or a rinch signal, so it
 //! compiles and is unit-tested natively (`cargo test` in `admin-web`),
@@ -13,6 +14,7 @@ pub mod qr;
 pub mod request;
 pub mod roles;
 pub mod time;
+pub mod transition;
 
 /// A form value the console refuses to send, with a message for the user.
 #[derive(Debug, Clone, PartialEq, Eq)]

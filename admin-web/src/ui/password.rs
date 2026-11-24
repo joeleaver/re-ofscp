@@ -4,6 +4,7 @@
 use rinch::prelude::*;
 
 use super::common::{ErrorAlert, SuccessAlert, failure};
+use super::field::{Credential, CredentialInput};
 use super::tasks::Tasks;
 use crate::logic::{forms, request};
 use crate::session::Session;
@@ -63,26 +64,23 @@ pub fn PasswordForm(done_message: String) -> NodeHandle {
 
     rsx! {
         Stack { gap: "sm",
-            TextInput {
+            CredentialInput {
                 label: "Current password",
-                input_type: "password",
-                value_fn: move || current.get(),
-                oninput: move |v: String| current.set(v),
+                kind: Credential::CurrentPassword,
+                value: current,
                 onsubmit: submit.clone(),
             }
-            TextInput {
+            CredentialInput {
                 label: "New password",
                 description: "At least 8 characters.",
-                input_type: "password",
-                value_fn: move || new.get(),
-                oninput: move |v: String| new.set(v),
+                kind: Credential::NewPassword,
+                value: new,
                 onsubmit: submit.clone(),
             }
-            TextInput {
+            CredentialInput {
                 label: "Repeat the new password",
-                input_type: "password",
-                value_fn: move || confirm.get(),
-                oninput: move |v: String| confirm.set(v),
+                kind: Credential::NewPassword,
+                value: confirm,
                 onsubmit: submit.clone(),
             }
             ErrorAlert { message: error }

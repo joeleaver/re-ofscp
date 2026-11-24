@@ -4,6 +4,7 @@ use re_ofscp_types::admin::AdminSessionInfo;
 use rinch::prelude::*;
 
 use super::common::{CodeInput, ErrorAlert};
+use super::field::{Credential, CredentialInput};
 use super::tasks::Tasks;
 use crate::logic::{forms, request};
 use crate::session::Session;
@@ -62,18 +63,16 @@ pub fn SignIn() -> NodeHandle {
                     if let Some(n) = session.notice.get() {
                         Alert { color: "blue", variant: "light", {n} }
                     }
-                    TextInput {
+                    CredentialInput {
                         label: "Username",
-                        value_fn: move || username.get(),
-                        oninput: move |v: String| username.set(v),
+                        kind: Credential::Username,
+                        value: username,
                         onsubmit: submit,
-                        spellcheck: false,
                     }
-                    TextInput {
+                    CredentialInput {
                         label: "Password",
-                        input_type: "password",
-                        value_fn: move || password.get(),
-                        oninput: move |v: String| password.set(v),
+                        kind: Credential::CurrentPassword,
+                        value: password,
                         onsubmit: submit,
                     }
                     CodeInput {

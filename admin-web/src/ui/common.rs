@@ -2,9 +2,11 @@
 //! confirmation dialog, the copy button and the TOTP code field.
 
 use std::rc::Rc;
+use std::time::Duration;
 
 use rinch::prelude::*;
 
+use super::field::{Credential, CredentialInput};
 use super::tasks::Tasks;
 use crate::browser;
 use crate::logic::problem::ApiError;
@@ -126,10 +128,17 @@ enum Copied {
     Failed,
 }
 
-/// A button that copies `text` to the clipboard.
+/// How long a copy button says what it did before it reads "Copy" again.
+const COPIED_SHOWN_FOR: Duration = Duration::from_secs(2);
+
+/// A button that copies `text` to the clipboard. It says whether the copy
+/// worked for [`COPIED_SHOWN_FOR`], then offers to copy again.
 #[component]
 pub fn CopyButton(text: String) -> NodeHandle {
     let state = Signal::new(Copied::Idle);
+    // Counts clicks, so only the latest click's timer resets the label: an
+    // earlier one must not cut a later "Copied" short.
+    let clicks = Signal::new(0u64);
     let tasks = Tasks::here();
     rsx! {
         Button {
@@ -137,9 +146,15 @@ pub fn CopyButton(text: String) -> NodeHandle {
             size: "xs",
             onclick: move || {
                 let text = text.clone();
+                let click = untracked(|| clicks.get()).wrapping_add(1);
+                clicks.set(click);
                 tasks.spawn(async move {
                     let done = browser::copy_text(&text).await;
                     state.set(if done.is_ok() { Copied::Done } else { Copied::Failed });
+                    sleep(COPIED_SHOWN_FOR).await;
+                    if untracked(|| clicks.get()) == click {
+                        state.set(Copied::Idle);
+                    }
                 });
             },
             {|| match state.get() {
@@ -155,13 +170,12 @@ pub fn CopyButton(text: String) -> NodeHandle {
 #[component]
 pub fn CodeInput(label: String, value: Signal<String>, onsubmit: Callback) -> NodeHandle {
     rsx! {
-        TextInput {
+        CredentialInput {
             label: label.clone(),
             placeholder: "123 456",
-            value_fn: move || value.get(),
-            oninput: move |v: String| value.set(v),
+            kind: Credential::OneTimeCode,
+            value: value,
             onsubmit: move || onsubmit.invoke(),
-            spellcheck: false,
         }
     }
 }
