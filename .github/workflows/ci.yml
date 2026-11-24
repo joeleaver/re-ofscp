@@ -36,7 +36,7 @@ jobs:
       - run: cargo test --all-targets
 
   admin-web:
-    name: admin-web (trunk build)
+    name: admin-web (fmt, clippy, test, trunk build)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -50,5 +50,11 @@ jobs:
       # The jkbase builder fetches with --locked: a stale lockfile must fail here.
       - run: cargo fetch --locked --manifest-path admin-web/Cargo.toml
       - run: cargo fmt --manifest-path admin-web/Cargo.toml --check
+      # The UI's logic (request building, validation, roles, the set-up flow,
+      # time windows) is plain Rust with no browser in it, so its tests run
+      # natively; the browser-only parts are linted for the wasm target too.
+      - run: cargo clippy --manifest-path admin-web/Cargo.toml --all-targets -- -D warnings
+      - run: cargo clippy --manifest-path admin-web/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
+      - run: cargo test --manifest-path admin-web/Cargo.toml
       - run: trunk build --release
         working-directory: admin-web
