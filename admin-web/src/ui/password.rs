@@ -61,30 +61,27 @@ pub fn PasswordForm(done_message: String) -> NodeHandle {
 
     rsx! {
         Stack { gap: "sm",
-            TextInput {
+            PasswordInput {
                 label: "Current password",
-                input_type: "password",
+                toggle_visibility: false,
                 autocomplete: "current-password",
-                spellcheck: false,
                 value_fn: move || current.get(),
                 oninput: move |v: String| current.set(v),
                 onsubmit: submit.clone(),
             }
-            TextInput {
+            PasswordInput {
                 label: "New password",
+                toggle_visibility: false,
                 description: "At least 8 characters.",
-                input_type: "password",
                 autocomplete: "new-password",
-                spellcheck: false,
                 value_fn: move || new.get(),
                 oninput: move |v: String| new.set(v),
                 onsubmit: submit.clone(),
             }
-            TextInput {
+            PasswordInput {
                 label: "Repeat the new password",
-                input_type: "password",
+                toggle_visibility: false,
                 autocomplete: "new-password",
-                spellcheck: false,
                 value_fn: move || confirm.get(),
                 oninput: move |v: String| confirm.set(v),
                 onsubmit: submit.clone(),

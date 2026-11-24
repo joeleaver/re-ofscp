@@ -240,17 +240,23 @@ change the password, and log out; everything else is 403 and audited as a
   `match` arm belongs to that row or arm; where its request would replace
   the arm (retry, start over) or outlive the row (open an account, reload
   after a form closes), the handler writes a signal and an effect of the
-  screen spawns the request instead. Such an effect tracks only that
-  signal and does its writes under `untracked`: otherwise the renders its
-  writes trigger add dependencies, and each request went out twice.
+  screen spawns the request instead. Such an effect tracks that signal,
+  and nothing the request is not meant to follow (the admins roster reads
+  the role untracked, so refreshing the session after changing one's own
+  role does not list it a second time). The renders its writes trigger
+  no longer add to its dependencies (rinch#3047), so its writes need no
+  `untracked`.
 - **The newest request wins.** Listings and the account panel keep the
   `TaskHandle` of their request and abort it when a new one starts, so an
   older, slower answer never replaces a newer one.
-- **Credential fields** are rinch `TextInput`s with an `autocomplete`
-  token (`username`, `current-password`, `new-password`, `one-time-code`;
-  rinch#3028) so that password managers fill and save them. rinch's
-  `TextInput` has no `inputmode` prop, so the code field gets no numeric
-  keypad on phones.
+- **Credential fields** carry an `autocomplete` token (`username`,
+  `current-password`, `new-password`, `one-time-code`; rinch#3028) so that
+  password managers fill and save them. Passwords are rinch
+  `PasswordInput`s, whose `onsubmit` (rinch#3048) submits on Enter, with
+  `toggle_visibility: false` (its reveal button does nothing unless the
+  field is given a visibility signal, and these fields never had one). The
+  code field is a `TextInput` with `inputmode: "numeric"` (rinch#3048), so
+  phones show a numeric keypad.
 
 ### Single instance
 
