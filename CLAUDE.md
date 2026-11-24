@@ -41,6 +41,8 @@ A separate Claude session, **"OFSCP oracle"** (session id `local_a5cc84d7-2370-4
 - `crates/re-ofscp-types` holds wire types shared with the admin UI. **It must have no I/O and no tokio**, because it also compiles for `wasm32-unknown-unknown`.
 - `admin-web` is the rinch admin UI. It is **not** a root-workspace member: it has its own empty `[workspace]` and is built with `trunk`. jkbase builds it with `context = "."` so it can path-depend on `crates/re-ofscp-types`. It is served under `/admin` (`public_url = "/admin/"`).
 - `schema.rhype` is the rhypedb schema; jkbase applies it on deploy. `tests/scaffold.rs` parses it with rhypedb's own parser, so a bad schema fails CI rather than the deploy.
+- **Data layer:** `crates/re-ofscp-server/src/db/` (see `docs/decisions/0003-data-layer.md`). Build every query with `db::Ql`, which only takes static text plus escaped typed literals. **Never format runtime values into query text by any other means.**
+- **Integration tests need the real `rhypedb-server`** at the pinned commit. Run `export RHYPEDB_SERVER_BIN=$(scripts/install-rhypedb.sh)` once; tests fail, not skip, without it.
 
 ## Platform facts (verified while scaffolding)
 

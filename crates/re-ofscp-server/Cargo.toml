@@ -40,3 +40,4 @@ tower = { version = "0.5", features = ["util"] }
 time = { workspace = true, features = ["macros"] }
 serde_json = { workspace = true }
 jsonschema = { version = "0.60", default-features = false }
+tempfile = "3"

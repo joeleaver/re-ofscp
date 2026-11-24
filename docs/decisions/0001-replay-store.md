@@ -97,18 +97,59 @@ surface:
   deploy:** if every signed request gets `401` with "request authority does
   not match", that's the cause.
 
+## Persistence (the ledger)
+
+The spec says a provider SHOULD persist the store, and we do
+(`replay/ledger.rs`, `ReplayNonce` in `schema.rhype`).
+
+- **Write before accepting:** after the in-memory store records a nonce,
+  it is written to rhypedb under a `@unique` key, SHA-256 over
+  (kind, key-id length, key id, nonce), *before* the request is accepted.
+  - A duplicate in the ledger is a replay (`401`).
+  - An unreachable ledger fails closed with `503` and `Retry-After: 2`. The
+    in-memory entry stays, so the nonce is burned either way, and the client
+    re-signs.
+- **Startup:** `AppState::restore_replay` reloads every live nonce, in
+  pages, and only then ends the warm-up. If the ledger can't be read within
+  30 s, the warm-up stays in force. That's safe, and it means one skew
+  window of `503`s.
+- **Cleanup:** a background task purges expired rows every 60 s, in
+  bounded batches (1 000 rows per statement, at most 100 statements per
+  run).
+- **Purge by the store's clock, and save that clock first.** The purge uses
+  the store's never-decreasing clock, and writes it to a `ReplayClock` row
+  before deleting anything. At startup, `restore_replay` raises the new
+  store's clock to the saved one before restoring.
+  - **Why:** without this, a forward clock jump, then a purge, then a
+    correction and a restart would bring back a nonce the purge had already
+    deleted. The independent review confirmed that sequence, and
+    `forward_clock_step_purge_then_restart_still_refuses_the_replay` pins it.
+- **Expired rows are replaced in place.** A nonce reused after its window
+  (§4.5 allows this) can hit a stale row that hasn't been purged yet.
+  - **How:** that row is overwritten with one conditional update, matching
+    `key` and `expires_at ≤ store clock`. There's never a moment without a
+    row covering the identity; a delete-then-create could lose it to a crash
+    or a failed create.
+  - **Which clock:** expiries are judged by the store's clock (what
+    `record` returns), not a raw wall-clock reading.
+- **The clock only goes up.** The persisted clock is raised by a conditional
+  update (`high_water < X`). Within one process it is never lowered, because
+  purges run one at a time.
+- **Purges and overwrites are serialized.** rhypedb's filtered writes aren't
+  compare-and-set (see 0003), so purge batches and the expired-row overwrite
+  are serialized by an in-process lock. Otherwise a purge could delete a row
+  that was just overwritten with a live nonce. A review found this by
+  running 8 concurrent re-persists against a purge.
+
 ## Consequences
 
-- **The warm-up costs about five minutes per restart.** For roughly 300 s
-  after each start or deploy, signed requests get `503` and clients re-sign
-  and retry. That's conformant, but not good enough for an enterprise
-  deployment.
-- **Persistence comes next.** The spec says a provider SHOULD persist the
-  store, which removes the warm-up. The rhypedb data layer is the next PR,
-  and with it the store becomes write-through: each nonce is created in
-  rhypedb, under a `@unique` key, before the request is accepted, and
-  unexpired entries are reloaded at startup. The warm-up then applies only
-  if that reload fails. `check` plus `record` is the seam that stays the
-  same.
-- **Single instance only:** persistence in rhypedb is also what would let
-  more than one server process share the store.
+- **Normal restarts are invisible.** With the ledger reachable at startup,
+  nonces survive a restart and signed requests are served at once. The
+  warm-up only applies when the ledger can't be read.
+- **Each signed request costs one write.** That's a rhypedb write on
+  loopback, done after verification, so only authenticated requests pay it.
+- **Single instance only.** The in-memory store and the purge lock are
+  still the source of atomicity, so this design doesn't extend to several
+  server processes sharing one database, and that includes two processes
+  briefly overlapping during a deploy. Scaling out would make the ledger's `@unique` create
+  the atomic step, with the memory store as a cache in front of it.
