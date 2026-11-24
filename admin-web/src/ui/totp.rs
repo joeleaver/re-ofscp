@@ -60,11 +60,16 @@ pub fn TotpEnroll() -> NodeHandle {
     let mut enrolling: Option<TaskHandle> = None;
     Effect::new(move || {
         restart.get();
-        if let Some(previous) = enrolling.take() {
-            previous.abort();
-        }
-        state.set(Load::Loading);
-        enrolling = Some(spawn_local(enroll(session, state)));
+        // Only the request signal is tracked. The writes below re-render
+        // what shows the result, and those renders' reads must not become
+        // this effect's dependencies (they made each request go out twice).
+        untracked(|| {
+            if let Some(previous) = enrolling.take() {
+                previous.abort();
+            }
+            state.set(Load::Loading);
+            enrolling = Some(spawn_local(enroll(session, state)));
+        });
     });
 
     let confirm = move || {

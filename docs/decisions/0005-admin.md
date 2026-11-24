@@ -240,7 +240,9 @@ change the password, and log out; everything else is 403 and audited as a
   `match` arm belongs to that row or arm; where its request would replace
   the arm (retry, start over) or outlive the row (open an account, reload
   after a form closes), the handler writes a signal and an effect of the
-  screen spawns the request instead.
+  screen spawns the request instead. Such an effect tracks only that
+  signal and does its writes under `untracked`: otherwise the renders its
+  writes trigger add dependencies, and each request went out twice.
 - **The newest request wins.** Listings and the account panel keep the
   `TaskHandle` of their request and abort it when a new one starts, so an
   older, slower answer never replaces a newer one.

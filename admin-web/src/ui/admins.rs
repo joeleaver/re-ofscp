@@ -172,14 +172,19 @@ pub fn AdminsScreen() -> NodeHandle {
     let mut loading: Option<TaskHandle> = None;
     Effect::new(move || {
         reload.get();
-        if !can(untracked(|| current_role(session)), Action::ManageAdmins) {
-            return;
-        }
-        if let Some(previous) = loading.take() {
-            previous.abort();
-        }
-        list.set(Load::Loading);
-        loading = Some(spawn_local(load(session, list)));
+        // Only the request signal is tracked. The writes below re-render
+        // what shows the result, and those renders' reads must not become
+        // this effect's dependencies (they made each request go out twice).
+        untracked(|| {
+            if !can(current_role(session), Action::ManageAdmins) {
+                return;
+            }
+            if let Some(previous) = loading.take() {
+                previous.abort();
+            }
+            list.set(Load::Loading);
+            loading = Some(spawn_local(load(session, list)));
+        });
     });
 
     let me = move || session.info().map(|i| i.username).unwrap_or_default();

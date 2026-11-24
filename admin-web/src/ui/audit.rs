@@ -73,11 +73,16 @@ pub fn AuditScreen() -> NodeHandle {
     let mut current: Option<TaskHandle> = None;
     Effect::new(move || {
         let Some(filter) = wanted.get() else { return };
-        if let Some(previous) = current.take() {
-            previous.abort();
-        }
-        list.set(Load::Loading);
-        current = Some(spawn_local(load(session, filter, list)));
+        // Only the request signal is tracked. The writes below re-render
+        // what shows the result, and those renders' reads must not become
+        // this effect's dependencies (they made each request go out twice).
+        untracked(|| {
+            if let Some(previous) = current.take() {
+                previous.abort();
+            }
+            list.set(Load::Loading);
+            current = Some(spawn_local(load(session, filter, list)));
+        });
     });
 
     let run = move || {

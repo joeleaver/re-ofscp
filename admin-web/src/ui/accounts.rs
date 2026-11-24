@@ -76,25 +76,35 @@ pub fn AccountsScreen() -> NodeHandle {
     let mut searching: Option<TaskHandle> = None;
     Effect::new(move || {
         let q = searched.get();
-        if let Some(previous) = searching.take() {
-            previous.abort();
-        }
-        list.set(Load::Loading);
-        searching = Some(spawn_local(search(session, q, list)));
+        // Only the request signal is tracked. The writes below re-render
+        // what shows the result, and those renders' reads must not become
+        // this effect's dependencies (they made each request go out twice).
+        untracked(|| {
+            if let Some(previous) = searching.take() {
+                previous.abort();
+            }
+            list.set(Load::Loading);
+            searching = Some(spawn_local(search(session, q, list)));
+        });
     });
     let mut fetching: Option<TaskHandle> = None;
     Effect::new(move || {
         let handle = viewing.get();
-        if let Some(previous) = fetching.take() {
-            previous.abort();
-        }
-        match handle {
-            Some(handle) => {
-                shown.set(Some(Load::Loading));
-                fetching = Some(spawn_local(view(session, handle, shown)));
+        // Only the request signal is tracked. The writes below re-render
+        // what shows the result, and those renders' reads must not become
+        // this effect's dependencies (they made each request go out twice).
+        untracked(|| {
+            if let Some(previous) = fetching.take() {
+                previous.abort();
             }
-            None => shown.set(None),
-        }
+            match handle {
+                Some(handle) => {
+                    shown.set(Some(Load::Loading));
+                    fetching = Some(spawn_local(view(session, handle, shown)));
+                }
+                None => shown.set(None),
+            }
+        });
     });
 
     // Search for what the query field holds. It also reloads the list after
