@@ -3,6 +3,12 @@
 //! Keep this crate free of I/O and async runtimes: it compiles for both the
 //! host (server) and `wasm32-unknown-unknown` (admin UI).
 
+pub mod actor;
+pub mod dm;
+
+pub use actor::{Actor, Authority, IdentError, is_valid_handle};
+pub use dm::dm_id;
+
 use serde::{Deserialize, Serialize};
 
 /// `GET /api/health` response.

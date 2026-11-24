@@ -5,17 +5,31 @@
 
 use std::net::SocketAddr;
 
+use re_ofscp_types::Authority;
+
+use crate::replay::ReplayLimits;
+
 /// Server configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
     /// The public provider domain — the OFSCP authority every signature binds
-    /// to (spec §4.4.2). MUST equal the host clients use. Required.
-    pub domain: String,
+    /// to (spec §4.4.2). MUST equal the host clients use. Required; a
+    /// non-canonical spelling (`Social.Example`, `:443`) is normalised.
+    pub domain: Authority,
     /// Address to listen on (`BIND`, default `0.0.0.0:8080`; jkbase routes to `port = 8080`).
     pub bind: SocketAddr,
     /// rhypedb binary-protocol address (`RHYPEDB_ADDR`, default `127.0.0.1:4201`,
     /// where jkbase's managed `[database]` listens inside the app VM).
     pub rhypedb_addr: String,
+    /// Replay-store bounds (spec §4.5):
+    /// * `REPLAY_LOCAL_TOTAL` / `REPLAY_REMOTE_TOTAL`: live nonces from local
+    ///   and from remote signers (default 250 000 each; full → `503` for that
+    ///   side only);
+    /// * `REPLAY_PER_SIGNER`: per signer (default 6 000, about 10 signed
+    ///   requests/s sustained; over → `429`);
+    /// * `REPLAY_PER_REMOTE_DOMAIN`: per remote registrable domain (default
+    ///   25 000; over → `429`).
+    pub replay: ReplayLimits,
 }
 
 /// A configuration error.
@@ -37,9 +51,11 @@ impl Config {
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
         let domain = get("DOMAIN")
             .filter(|d| !d.trim().is_empty())
-            .ok_or(ConfigError::Missing("DOMAIN"))?
-            .trim()
-            .to_ascii_lowercase();
+            .ok_or(ConfigError::Missing("DOMAIN"))?;
+        let domain = Authority::canonicalize(domain.trim()).map_err(|e| ConfigError::Invalid {
+            name: "DOMAIN",
+            reason: e.to_string(),
+        })?;
         let bind = get("BIND")
             .unwrap_or_else(|| "0.0.0.0:8080".to_owned())
             .parse()
@@ -48,11 +64,38 @@ impl Config {
                 reason: e.to_string(),
             })?;
         let rhypedb_addr = get("RHYPEDB_ADDR").unwrap_or_else(|| "127.0.0.1:4201".to_owned());
+        let replay = ReplayLimits {
+            local_total: positive(&get, "REPLAY_LOCAL_TOTAL", 250_000)?,
+            remote_total: positive(&get, "REPLAY_REMOTE_TOTAL", 250_000)?,
+            per_signer: positive(&get, "REPLAY_PER_SIGNER", 6_000)?,
+            per_remote_domain: positive(&get, "REPLAY_PER_REMOTE_DOMAIN", 25_000)?,
+        };
         Ok(Self {
             domain,
             bind,
             rhypedb_addr,
+            replay,
         })
+    }
+}
+
+/// A positive integer variable, or `default` when unset.
+fn positive(
+    get: &impl Fn(&str) -> Option<String>,
+    name: &'static str,
+    default: usize,
+) -> Result<usize, ConfigError> {
+    match get(name) {
+        None => Ok(default),
+        Some(v) => v
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n > 0)
+            .ok_or(ConfigError::Invalid {
+                name,
+                reason: "must be a positive integer".to_owned(),
+            }),
     }
 }
 
@@ -79,9 +122,35 @@ mod tests {
     #[test]
     fn defaults_and_normalisation() {
         let c = Config::from_lookup(env(&[("DOMAIN", " Social.Example ")])).unwrap();
-        assert_eq!(c.domain, "social.example");
+        assert_eq!(c.domain.as_str(), "social.example");
+        assert_eq!(
+            c.replay,
+            ReplayLimits {
+                local_total: 250_000,
+                remote_total: 250_000,
+                per_signer: 6_000,
+                per_remote_domain: 25_000,
+            }
+        );
         assert_eq!(c.bind.to_string(), "0.0.0.0:8080");
         assert_eq!(c.rhypedb_addr, "127.0.0.1:4201");
+    }
+
+    #[test]
+    fn bad_domain_and_capacity_are_rejected() {
+        let r = Config::from_lookup(env(&[("DOMAIN", "not a host")]));
+        assert!(matches!(
+            r,
+            Err(ConfigError::Invalid { name: "DOMAIN", .. })
+        ));
+        let r = Config::from_lookup(env(&[("DOMAIN", "a.example"), ("REPLAY_PER_SIGNER", "0")]));
+        assert!(matches!(
+            r,
+            Err(ConfigError::Invalid {
+                name: "REPLAY_PER_SIGNER",
+                ..
+            })
+        ));
     }
 
     #[test]

@@ -5,12 +5,15 @@ re-ofscp is an **enterprise-grade OFSCP provider** written in Rust. It is hosted
 ## Sources of truth
 
 - **The spec:** `~/dev/ofscp`, upstream at `lost-conn/ofscp`. Read `docs/ofscp_spec.md`. The JSON Schemas are in `schemas/v0.1`, and the samples and signing vectors are in `tests/`.
-  - **Build against the open spec PRs, not just `main`.** These PRs write down behaviour the reference implementation already settled, and fix gaps in v0.1:
-    - [lost-conn/ofscp#11](https://github.com/lost-conn/ofscp/pull/11) (**merged**) covers what Forumall already settled: identifier forms, handle grammar, CORS, the replay store, device-key endpoints, paging, "losing access", the effective-read-access rule, and tiers.
+  - **Spec `main` now includes the Forumall-settled behaviour and the v0.1 gap fixes.** These PRs are all merged (as of 2026-11-23), so build against `main`:
+    - [lost-conn/ofscp#11](https://github.com/lost-conn/ofscp/pull/11) covers what Forumall already settled: identifier forms, handle grammar, CORS, the replay store, device-key endpoints, paging, "losing access", the effective-read-access rule, and tiers.
     - [lost-conn/ofscp#12](https://github.com/lost-conn/ofscp/pull/12): security hardening (contacts accept, replay store, outbound SSRF rules).
     - [lost-conn/ofscp#13](https://github.com/lost-conn/ofscp/pull/13): notifications, mentions, Web Push, nicknames, guest upgrade.
     - [lost-conn/ofscp#14](https://github.com/lost-conn/ofscp/pull/14): private groups are invite-only, and read markers use message ids.
     - [lost-conn/ofscp#15](https://github.com/lost-conn/ofscp/pull/15): DMs across devices (`to`, conversation pointers).
+    - [lost-conn/ofscp#16](https://github.com/lost-conn/ofscp/pull/16): read-marker and conversation-pointer hardening; canonical actors and provider authorities on everything received.
+    - [lost-conn/ofscp#17](https://github.com/lost-conn/ofscp/pull/17): the `errorCode` registry, `type` = `https://{authority}/problems/{errorCode}`, nonce retention (timestamp + skew), and the replay-store restart warm-up.
+    - Still open: [lost-conn/ofscp#10](https://github.com/lost-conn/ofscp/pull/10) (actor identity is `(handle, domain)`). We implement it regardless; see security requirement 1.
   - Where the spec is still ambiguous, choose the conservative, interoperable reading. Write the choice down in `docs/decisions/`, and propose a spec PR rather than diverging silently.
 - **Reference implementation:** Forumall, at `~/dev/forumall` (a worktree is at `~/dev/forumall-wt`), upstream `lost-conn/forumall`. It's in Bun/TypeScript. Use it to check wire behaviour and to interoperate-test against. It's a reference, not a template, and it has known bugs; see the security list below.
 

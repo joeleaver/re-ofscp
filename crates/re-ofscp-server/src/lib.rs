@@ -4,25 +4,85 @@
 //! everything testable lives here.
 
 pub mod config;
+pub mod problem;
+pub mod replay;
+pub mod signing;
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::{Json, Router, extract::State, routing::get};
+use axum::{Json, Router, extract::State, middleware, routing::get};
+use problem::ProblemBase;
 use re_ofscp_types::{Health, OFSCP_VERSION};
 
 pub use config::Config;
+pub use problem::Problem;
+
+use replay::ReplayStore;
+use signing::{Clock, KeyResolver, SystemClock, Verifier};
+
+/// Maximum clock skew accepted on signed requests, in seconds (§4.5 step 3, §8).
+pub const MAX_SKEW_SECS: i64 = 300;
 
 /// Shared application state.
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
+    /// Verifies every signed request, REST and federation alike, against the
+    /// one provider-wide replay store.
+    pub verifier: Arc<Verifier>,
+}
+
+impl AppState {
+    /// Build state with the wall clock.
+    pub fn new(config: Config, keys: Arc<dyn KeyResolver>) -> Self {
+        Self::with_clock(config, keys, Arc::new(SystemClock))
+    }
+
+    /// Build state with an explicit clock (tests).
+    pub fn with_clock(config: Config, keys: Arc<dyn KeyResolver>, clock: Arc<dyn Clock>) -> Self {
+        // The store begins now. For one skew window, signed requests get 503
+        // because a predecessor process may have recorded them
+        // (docs/decisions/0001-replay-store.md, lost-conn/ofscp#17).
+        let replay = Arc::new(ReplayStore::new(
+            config.replay,
+            MAX_SKEW_SECS,
+            clock.now().unix_timestamp(),
+            config.domain.as_str(),
+        ));
+        let verifier = Arc::new(Verifier::new(
+            config.domain.clone(),
+            MAX_SKEW_SECS,
+            replay,
+            keys,
+            clock,
+        ));
+        Self {
+            config: Arc::new(config),
+            verifier,
+        }
+    }
 }
 
 /// Build the HTTP router.
+///
+/// Layer order, outermost first: tracing, problem rendering (so every
+/// [`Problem`], including the signature layer's and extractors' rejections,
+/// gets its body), signature verification, routes.
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/health", get(health))
+        .route("/problems/{code}", get(problem::describe))
+        .fallback(|| async { Problem::not_found() })
+        .method_not_allowed_fallback(|| async { Problem::method_not_allowed() })
+        .layer(middleware::from_fn_with_state(
+            state.verifier.clone(),
+            signing::authenticate,
+        ))
+        .layer(middleware::map_response_with_state(
+            ProblemBase::new(&state.config.domain),
+            problem::render,
+        ))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -33,7 +93,7 @@ async fn health(State(state): State<AppState>) -> Json<Health> {
     Json(Health {
         status: if database { "ok" } else { "degraded" }.to_owned(),
         ofscp: OFSCP_VERSION.to_owned(),
-        domain: state.config.domain.clone(),
+        domain: state.config.domain.to_string(),
         database,
     })
 }

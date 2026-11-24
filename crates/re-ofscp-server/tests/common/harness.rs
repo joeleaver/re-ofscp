@@ -1,0 +1,224 @@
+//! Shared harness for the signed-request integration tests: the spec
+//! vector's key and request, a router with the signature and problem
+//! layers, and controllable clocks.
+#![allow(dead_code)]
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
+
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use axum::routing::post;
+use axum::{Router, middleware};
+use ed25519_dalek::SigningKey;
+use http_body_util::BodyExt;
+use re_ofscp_server::problem::{self, ProblemBase};
+use re_ofscp_server::replay::{ReplayLimits, ReplayStore};
+use re_ofscp_server::signing::canonical::{CanonicalRequest, content_digest, sign};
+use re_ofscp_server::signing::{
+    Authenticated, Clock, KeyResolver, Signer, StaticKeys, Verifier, authenticate,
+};
+use re_ofscp_types::{Actor, Authority};
+use time::OffsetDateTime;
+use time::macros::datetime;
+use tower::ServiceExt;
+
+use super::{spec_json, vector_key};
+
+pub const PATH: &str = "/api/groups/grp_1/channels/chn_general/messages";
+
+pub const SIGNED_AT: OffsetDateTime = datetime!(2026-01-01 12:00:00 UTC);
+
+pub struct FixedClock(pub OffsetDateTime);
+impl Clock for FixedClock {
+    fn now(&self) -> OffsetDateTime {
+        self.0
+    }
+}
+
+/// A clock tests can move.
+pub struct SettableClock(AtomicI64);
+impl SettableClock {
+    pub fn at(t: OffsetDateTime) -> Arc<Self> {
+        Arc::new(Self(AtomicI64::new(t.unix_timestamp())))
+    }
+    pub fn set(&self, t: OffsetDateTime) {
+        self.0.store(t.unix_timestamp(), Ordering::SeqCst);
+    }
+}
+
+impl Clock for SettableClock {
+    fn now(&self) -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(self.0.load(Ordering::SeqCst)).unwrap()
+    }
+}
+
+/// Only the pool bounds apply.
+pub fn limits(capacity: usize) -> ReplayLimits {
+    ReplayLimits {
+        local_total: capacity,
+        remote_total: capacity,
+        per_signer: usize::MAX,
+        per_remote_domain: usize::MAX,
+    }
+}
+
+pub fn alice() -> Actor {
+    Actor::parse_canonical("alice@providera.com").unwrap()
+}
+
+pub fn provider_a() -> Authority {
+    Authority::parse_canonical("providera.com").unwrap()
+}
+
+pub fn key() -> SigningKey {
+    vector_key(&spec_json("signing-vector.json"))
+}
+
+pub fn alice_keys() -> StaticKeys {
+    StaticKeys::default()
+        .with(
+            Signer::Actor(alice()),
+            "dk_abc123xyz",
+            key().verifying_key(),
+        )
+        .with(
+            Signer::Provider(provider_a()),
+            "dk_abc123xyz",
+            key().verifying_key(),
+        )
+}
+
+pub struct Harness {
+    pub app: Router,
+    pub replay: Arc<ReplayStore>,
+}
+
+pub fn harness_with(
+    keys: Arc<dyn KeyResolver>,
+    now: OffsetDateTime,
+    limits: ReplayLimits,
+) -> Harness {
+    // The store began 301 s before SIGNED_AT, so its warm-up covers
+    // timestamps up to SIGNED_AT - 1.
+    let replay = Arc::new(ReplayStore::new(
+        limits,
+        300,
+        SIGNED_AT.unix_timestamp() - 301,
+        "providera.com",
+    ));
+    let verifier = Arc::new(Verifier::new(
+        provider_a(),
+        300,
+        replay.clone(),
+        keys,
+        Arc::new(FixedClock(now)),
+    ));
+    let app = Router::new()
+        .route(
+            PATH,
+            post(|auth: Authenticated| async move {
+                match auth.0.signer {
+                    Signer::Actor(a) => format!("actor {a} {}", auth.0.key_id),
+                    Signer::Provider(p) => format!("provider {p} {}", auth.0.key_id),
+                }
+            }),
+        )
+        .layer(middleware::from_fn_with_state(verifier, authenticate))
+        .layer(middleware::map_response_with_state(
+            ProblemBase::new(&provider_a()),
+            problem::render,
+        ));
+    Harness { app, replay }
+}
+
+pub fn harness() -> Harness {
+    harness_with(Arc::new(alice_keys()), SIGNED_AT, limits(1000))
+}
+
+/// A request signed like the spec vector, with knobs for breaking it.
+#[derive(Clone)]
+pub struct Req {
+    pub host: &'static str,
+    pub identity: (&'static str, String),
+    pub nonce: String,
+    pub body: String,
+    pub send_body: Option<String>,
+    pub timestamp: String,
+    pub drop_header: Option<&'static str>,
+    pub extra_header: Option<(&'static str, String)>,
+    pub signature: Option<String>,
+}
+
+impl Req {
+    pub fn vector() -> Self {
+        Self {
+            host: "providera.com",
+            identity: ("x-ofscp-actor", "alice@providera.com".into()),
+            nonce: "8wQk2mJ0r5sV1xZ3aB6cDg".into(),
+            body: r#"{"content":{"text":"hi","mime":"text/plain"}}"#.into(),
+            send_body: None,
+            timestamp: "2026-01-01T12:00:00Z".into(),
+            drop_header: None,
+            extra_header: None,
+            signature: None,
+        }
+    }
+
+    pub fn build(&self) -> Request<Body> {
+        let digest = content_digest(self.body.as_bytes());
+        let canonical = CanonicalRequest {
+            authority: "providera.com",
+            method: "POST",
+            path: PATH,
+            query: Some("foo=1"),
+            timestamp: &self.timestamp,
+            nonce: &self.nonce,
+            content_digest: &digest,
+        }
+        .render();
+        let signature = self
+            .signature
+            .clone()
+            .unwrap_or_else(|| sign(&key(), &canonical));
+        let mut headers = vec![
+            ("host", self.host.to_owned()),
+            (self.identity.0, self.identity.1.clone()),
+            ("x-ofscp-key-id", "dk_abc123xyz".into()),
+            ("x-ofscp-timestamp", self.timestamp.clone()),
+            ("x-ofscp-nonce", self.nonce.clone()),
+            ("x-ofscp-content-digest", digest),
+            ("x-ofscp-signature", signature),
+        ];
+        if let Some(drop) = self.drop_header {
+            headers.retain(|(k, _)| *k != drop);
+        }
+        if let Some(extra) = &self.extra_header {
+            headers.push((extra.0, extra.1.clone()));
+        }
+        let mut b = Request::post(format!("{PATH}?foo=1"));
+        for (k, v) in headers {
+            b = b.header(k, v);
+        }
+        b.body(Body::from(
+            self.send_body.clone().unwrap_or_else(|| self.body.clone()),
+        ))
+        .unwrap()
+    }
+}
+
+pub async fn send(
+    app: &Router,
+    req: Request<Body>,
+) -> (StatusCode, serde_json::Value, String, Option<String>) {
+    let res = app.clone().oneshot(req).await.unwrap();
+    let status = res.status();
+    let retry = res
+        .headers()
+        .get("retry-after")
+        .map(|v| v.to_str().unwrap().to_owned());
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, json, text, retry)
+}
