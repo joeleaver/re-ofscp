@@ -232,10 +232,23 @@ change the password, and log out; everything else is 403 and audited as a
 - **Logic is plain Rust** (`admin-web/src/logic`: request building, form
   validation, roles, the set-up flow, time windows, the QR code) with no
   browser in it, so CI tests it natively; the screens (`src/ui`) are thin.
-- **Requests belong to their screen.** A request is spawned under the
-  screen's owner (`ui/tasks.rs`), not under the button that started it: a
-  rinch component with a reactive prop renders again when the prop changes,
-  and would otherwise cancel the request whose `loading` state it shows.
+- **Requests belong to their screen.** rinch ends a task with the owner
+  of the handler that spawned it (rinch's async guide, "Lifetime"). A
+  handler written at a screen's top level is the screen's, even on a
+  component that re-renders (`Button { loading: … }`, rinch#3027), so
+  those spawn directly. A handler written in a `for` row, `if` branch or
+  `match` arm belongs to that row or arm; where its request would replace
+  the arm (retry, start over) or outlive the row (open an account, reload
+  after a form closes), the handler writes a signal and an effect of the
+  screen spawns the request instead.
+- **The newest request wins.** Listings and the account panel keep the
+  `TaskHandle` of their request and abort it when a new one starts, so an
+  older, slower answer never replaces a newer one.
+- **Credential fields** are rinch `TextInput`s with an `autocomplete`
+  token (`username`, `current-password`, `new-password`, `one-time-code`;
+  rinch#3028) so that password managers fill and save them. rinch's
+  `TextInput` has no `inputmode` prop, so the code field gets no numeric
+  keypad on phones.
 
 ### Single instance
 

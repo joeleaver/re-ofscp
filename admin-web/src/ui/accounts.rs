@@ -2,59 +2,59 @@
 
 use re_ofscp_types::admin::{AccountList, AccountView};
 use rinch::prelude::*;
+use rinch::reactive::Effect;
 
 use super::common::{
     ErrorAlert, Load, Loading, Pending, StatusBadge, SuccessAlert, confirm_dialog, failure,
 };
-use super::field::{Credential, CredentialInput};
 use super::shell::current_role;
-use super::tasks::Tasks;
 use crate::logic::roles::{Action, can, unavailable_reason};
 use crate::logic::time::display;
 use crate::logic::{forms, request};
 use crate::session::Session;
 
 /// Fetch the accounts matching `q` into `list`.
-fn search(tasks: Tasks, session: Session, q: Option<String>, list: Signal<Load<AccountList>>) {
-    list.set(Load::Loading);
-    tasks.spawn(async move {
-        match session
-            .call::<AccountList>(request::list_accounts(q.as_deref()))
-            .await
-        {
-            Ok(found) => list.set(Load::Ready(found)),
-            Err(e) => {
-                if let Some(m) = failure(&e) {
-                    list.set(Load::Failed(m));
-                }
+async fn search(session: Session, q: Option<String>, list: Signal<Load<AccountList>>) {
+    match session
+        .call::<AccountList>(request::list_accounts(q.as_deref()))
+        .await
+    {
+        Ok(found) => list.set(Load::Ready(found)),
+        Err(e) => {
+            if let Some(m) = failure(&e) {
+                list.set(Load::Failed(m));
             }
         }
-    });
+    }
 }
 
 /// Fetch one account into `shown`.
-fn view(tasks: Tasks, session: Session, handle: String, shown: Signal<Option<Load<AccountView>>>) {
-    shown.set(Some(Load::Loading));
-    tasks.spawn(async move {
-        match session
-            .call::<AccountView>(request::get_account(&handle))
-            .await
-        {
-            Ok(a) => shown.set(Some(Load::Ready(a))),
-            Err(e) => {
-                if let Some(m) = failure(&e) {
-                    shown.set(Some(Load::Failed(m)));
-                }
+async fn view(session: Session, handle: String, shown: Signal<Option<Load<AccountView>>>) {
+    match session
+        .call::<AccountView>(request::get_account(&handle))
+        .await
+    {
+        Ok(a) => shown.set(Some(Load::Ready(a))),
+        Err(e) => {
+            if let Some(m) = failure(&e) {
+                shown.set(Some(Load::Failed(m)));
             }
         }
-    });
+    }
+}
+
+/// Whether disabling `disabled` should reload the detail panel, which is
+/// showing (or loading) `viewing`: only when it is that same account. The
+/// panel may have moved on to another account while the disable ran, and
+/// reloading the disabled one would replace the newer choice.
+fn reload_panel_after_disable(viewing: Option<&str>, disabled: &str) -> bool {
+    viewing == Some(disabled)
 }
 
 /// The accounts screen.
 #[component]
 pub fn AccountsScreen() -> NodeHandle {
     let session = use_store::<Session>();
-    let tasks = Tasks::here();
     let query = Signal::new(String::new());
     let query_error = Signal::new(None::<String>);
     let list = Signal::new(Load::<AccountList>::Loading);
@@ -64,7 +64,38 @@ pub fn AccountsScreen() -> NodeHandle {
     let pending = Signal::new(None::<Pending<String>>);
     let pending_busy = Signal::new(false);
     let pending_error = Signal::new(None::<String>);
-    search(tasks, session, None, list);
+
+    // The search last asked for, and the account the detail panel is for.
+    // Each write starts its request and aborts the previous one of its
+    // kind, so an older, slower answer never replaces a newer one. The
+    // requests are spawned by this component's effects, so they belong to
+    // the screen whichever handler asked (a table row, the new-account
+    // form, a finished disable) and end when the screen does.
+    let searched = Signal::new(None::<String>);
+    let viewing = Signal::new(None::<String>);
+    let mut searching: Option<TaskHandle> = None;
+    Effect::new(move || {
+        let q = searched.get();
+        if let Some(previous) = searching.take() {
+            previous.abort();
+        }
+        list.set(Load::Loading);
+        searching = Some(spawn_local(search(session, q, list)));
+    });
+    let mut fetching: Option<TaskHandle> = None;
+    Effect::new(move || {
+        let handle = viewing.get();
+        if let Some(previous) = fetching.take() {
+            previous.abort();
+        }
+        match handle {
+            Some(handle) => {
+                shown.set(Some(Load::Loading));
+                fetching = Some(spawn_local(view(session, handle, shown)));
+            }
+            None => shown.set(None),
+        }
+    });
 
     // Search for what the query field holds. It also reloads the list after
     // a change, so an invalid query is reported there too rather than
@@ -72,20 +103,20 @@ pub fn AccountsScreen() -> NodeHandle {
     let run_search = move || match forms::account_query(&untracked(|| query.get())) {
         Ok(q) => {
             query_error.set(None);
-            search(tasks, session, q, list);
+            searched.set(q);
         }
         Err(e) => query_error.set(Some(e.0)),
     };
     let disable = move |handle: String| {
         pending_busy.set(true);
-        tasks.spawn(async move {
+        spawn_local(async move {
             match session.call_empty(request::disable_account(&handle)).await {
                 Ok(()) => {
                     pending_busy.set(false);
                     pending.set(None);
                     notice.set(Some(format!("{handle} is disabled.")));
-                    if untracked(|| shown.get()).is_some() {
-                        view(tasks, session, handle, shown);
+                    if reload_panel_after_disable(untracked(|| viewing.get()).as_deref(), &handle) {
+                        viewing.set(Some(handle));
                     }
                     run_search();
                 }
@@ -156,7 +187,7 @@ pub fn AccountsScreen() -> NodeHandle {
                 div { class: "panel",
                     Group { justify: "space-between",
                         Title { order: 4, "Account" }
-                        Button { variant: "subtle", size: "xs", onclick: move || shown.set(None), "Close" }
+                        Button { variant: "subtle", size: "xs", onclick: move || viewing.set(None), "Close" }
                     }
                     match detail.clone() {
                         Load::Loading => Loading { caption: "Loading the account…" },
@@ -202,7 +233,7 @@ pub fn AccountsScreen() -> NodeHandle {
                                                     class: "link-button",
                                                     onclick: {
                                                         let h = a.handle.clone();
-                                                        move || view(tasks, session, h.clone(), shown)
+                                                        move || viewing.set(Some(h.clone()))
                                                     },
                                                     {a.handle.clone()}
                                                 }
@@ -242,7 +273,6 @@ pub fn AccountsScreen() -> NodeHandle {
 #[component]
 fn CreateAccountForm(on_close: Callback, on_created: InputCallback) -> NodeHandle {
     let session = use_store::<Session>();
-    let tasks = Tasks::here();
     let handle = Signal::new(String::new());
     let display_name = Signal::new(String::new());
     let password = Signal::new(String::new());
@@ -263,7 +293,7 @@ fn CreateAccountForm(on_close: Callback, on_created: InputCallback) -> NodeHandl
         error.set(None);
         busy.set(true);
         let on_created = on_created.clone();
-        tasks.spawn(async move {
+        spawn_local(async move {
             match session.call::<AccountView>(call).await {
                 Ok(a) => {
                     busy.set(false);
@@ -294,11 +324,14 @@ fn CreateAccountForm(on_close: Callback, on_created: InputCallback) -> NodeHandl
                 value_fn: move || display_name.get(),
                 oninput: move |v: String| display_name.set(v),
             }
-            CredentialInput {
+            TextInput {
                 label: "Initial password",
                 description: "At least 8 characters. Share it with the account's owner securely.",
-                kind: Credential::NewPassword,
-                value: password,
+                input_type: "password",
+                autocomplete: "new-password",
+                spellcheck: false,
+                value_fn: move || password.get(),
+                oninput: move |v: String| password.set(v),
                 onsubmit: submit.clone(),
             }
             ErrorAlert { message: error }
@@ -315,5 +348,19 @@ fn CreateAccountForm(on_close: Callback, on_created: InputCallback) -> NodeHandl
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_disable_reloads_the_panel_only_for_the_account_it_shows() {
+        assert!(reload_panel_after_disable(Some("alice"), "alice"));
+        // The admin opened another account while the disable ran.
+        assert!(!reload_panel_after_disable(Some("bob"), "alice"));
+        // The panel is closed.
+        assert!(!reload_panel_after_disable(None, "alice"));
     }
 }

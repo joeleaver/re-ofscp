@@ -6,8 +6,6 @@ use std::time::Duration;
 
 use rinch::prelude::*;
 
-use super::field::{Credential, CredentialInput};
-use super::tasks::Tasks;
 use crate::browser;
 use crate::logic::problem::ApiError;
 
@@ -139,7 +137,6 @@ pub fn CopyButton(text: String) -> NodeHandle {
     // Counts clicks, so only the latest click's timer resets the label: an
     // earlier one must not cut a later "Copied" short.
     let clicks = Signal::new(0u64);
-    let tasks = Tasks::here();
     rsx! {
         Button {
             variant: "light",
@@ -148,7 +145,7 @@ pub fn CopyButton(text: String) -> NodeHandle {
                 let text = text.clone();
                 let click = untracked(|| clicks.get()).wrapping_add(1);
                 clicks.set(click);
-                tasks.spawn(async move {
+                spawn_local(async move {
                     let done = browser::copy_text(&text).await;
                     state.set(if done.is_ok() { Copied::Done } else { Copied::Failed });
                     sleep(COPIED_SHOWN_FOR).await;
@@ -166,15 +163,20 @@ pub fn CopyButton(text: String) -> NodeHandle {
     }
 }
 
-/// The six-digit authenticator code field.
+/// The six-digit authenticator code field. Its `autocomplete` token lets
+/// the browser offer a code it has received. rinch's `TextInput` has no
+/// `inputmode` prop, so phones show their full keyboard here rather than a
+/// numeric keypad.
 #[component]
 pub fn CodeInput(label: String, value: Signal<String>, onsubmit: Callback) -> NodeHandle {
     rsx! {
-        CredentialInput {
+        TextInput {
             label: label.clone(),
             placeholder: "123 456",
-            kind: Credential::OneTimeCode,
-            value: value,
+            autocomplete: "one-time-code",
+            spellcheck: false,
+            value_fn: move || value.get(),
+            oninput: move |v: String| value.set(v),
             onsubmit: move || onsubmit.invoke(),
         }
     }

@@ -4,8 +4,6 @@ use re_ofscp_types::admin::AdminSessionInfo;
 use rinch::prelude::*;
 
 use super::common::{CodeInput, ErrorAlert};
-use super::field::{Credential, CredentialInput};
-use super::tasks::Tasks;
 use crate::logic::{forms, request};
 use crate::session::Session;
 
@@ -13,7 +11,6 @@ use crate::session::Session;
 #[component]
 pub fn SignIn() -> NodeHandle {
     let session = use_store::<Session>();
-    let tasks = Tasks::here();
     let username = Signal::new(String::new());
     let password = Signal::new(String::new());
     let code = Signal::new(String::new());
@@ -36,7 +33,7 @@ pub fn SignIn() -> NodeHandle {
         session.notice.set(None);
         error.set(None);
         busy.set(true);
-        tasks.spawn(async move {
+        spawn_local(async move {
             match session.call::<AdminSessionInfo>(call).await {
                 Ok(info) => {
                     // Clear the form first: signing in replaces this screen.
@@ -63,16 +60,21 @@ pub fn SignIn() -> NodeHandle {
                     if let Some(n) = session.notice.get() {
                         Alert { color: "blue", variant: "light", {n} }
                     }
-                    CredentialInput {
+                    TextInput {
                         label: "Username",
-                        kind: Credential::Username,
-                        value: username,
+                        autocomplete: "username",
+                        spellcheck: false,
+                        value_fn: move || username.get(),
+                        oninput: move |v: String| username.set(v),
                         onsubmit: submit,
                     }
-                    CredentialInput {
+                    TextInput {
                         label: "Password",
-                        kind: Credential::CurrentPassword,
-                        value: password,
+                        input_type: "password",
+                        autocomplete: "current-password",
+                        spellcheck: false,
+                        value_fn: move || password.get(),
+                        oninput: move |v: String| password.set(v),
                         onsubmit: submit,
                     }
                     CodeInput {

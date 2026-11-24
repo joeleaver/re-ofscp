@@ -3,13 +3,12 @@
 
 use re_ofscp_types::admin::{AdminList, AdminRole, AdminView, UpdateAdmin};
 use rinch::prelude::*;
+use rinch::reactive::Effect;
 
 use super::common::{
     ErrorAlert, Load, Loading, Pending, StatusBadge, SuccessAlert, confirm_dialog, failure,
 };
-use super::field::{Credential, CredentialInput};
 use super::shell::current_role;
-use super::tasks::Tasks;
 use crate::logic::roles::{Action, ROLES, can, role_label, unavailable_reason};
 use crate::logic::time::display;
 use crate::logic::{forms, request};
@@ -140,25 +139,21 @@ fn role_options() -> Vec<SelectOption> {
 }
 
 /// Fetch every admin into `list`.
-fn load(tasks: Tasks, session: Session, list: Signal<Load<AdminList>>) {
-    list.set(Load::Loading);
-    tasks.spawn(async move {
-        match session.call::<AdminList>(request::list_admins()).await {
-            Ok(found) => list.set(Load::Ready(found)),
-            Err(e) => {
-                if let Some(m) = failure(&e) {
-                    list.set(Load::Failed(m));
-                }
+async fn load(session: Session, list: Signal<Load<AdminList>>) {
+    match session.call::<AdminList>(request::list_admins()).await {
+        Ok(found) => list.set(Load::Ready(found)),
+        Err(e) => {
+            if let Some(m) = failure(&e) {
+                list.set(Load::Failed(m));
             }
         }
-    });
+    }
 }
 
 /// The admins screen.
 #[component]
 pub fn AdminsScreen() -> NodeHandle {
     let session = use_store::<Session>();
-    let tasks = Tasks::here();
     let list = Signal::new(Load::<AdminList>::Loading);
     let notice = Signal::new(None::<String>);
     let creating = Signal::new(false);
@@ -168,9 +163,24 @@ pub fn AdminsScreen() -> NodeHandle {
     let pending = Signal::new(None::<Pending<Change>>);
     let pending_busy = Signal::new(false);
     let pending_error = Signal::new(None::<String>);
-    if can(current_role(session), Action::ManageAdmins) {
-        load(tasks, session, list);
-    }
+    // Each write reloads the list (the effect's first run is the initial
+    // load), aborting a listing still in flight so that an older answer
+    // never replaces a newer one. Spawned by this component's effect, the
+    // listing belongs to the screen even when the new-admin form, which
+    // closes as it asks, is what asked.
+    let reload = Signal::new(());
+    let mut loading: Option<TaskHandle> = None;
+    Effect::new(move || {
+        reload.get();
+        if !can(untracked(|| current_role(session)), Action::ManageAdmins) {
+            return;
+        }
+        if let Some(previous) = loading.take() {
+            previous.abort();
+        }
+        list.set(Load::Loading);
+        loading = Some(spawn_local(load(session, list)));
+    });
 
     let me = move || session.info().map(|i| i.username).unwrap_or_default();
     let apply = move |change: Change| {
@@ -196,7 +206,7 @@ pub fn AdminsScreen() -> NodeHandle {
             Err(e) => return pending_error.set(Some(e.message())),
         };
         pending_busy.set(true);
-        tasks.spawn(async move {
+        spawn_local(async move {
             match session.call_empty(call).await {
                 Ok(()) => {
                     pending_busy.set(false);
@@ -208,9 +218,7 @@ pub fn AdminsScreen() -> NodeHandle {
                         // role (or their session) is different now.
                         session.refresh().await;
                     }
-                    if can(current_role(session), Action::ManageAdmins) {
-                        load(tasks, session, list);
-                    }
+                    reload.set(());
                 }
                 Err(e) => {
                     if let Some(m) = failure(&e) {
@@ -259,7 +267,7 @@ pub fn AdminsScreen() -> NodeHandle {
                             "Admin {username} created. They choose their own password and set up \
                              two-factor sign-in when they first sign in."
                         )));
-                        load(tasks, session, list);
+                        reload.set(());
                     },
                 }
             }
@@ -355,7 +363,6 @@ pub fn AdminsScreen() -> NodeHandle {
 #[component]
 fn CreateAdminForm(on_close: Callback, on_created: InputCallback) -> NodeHandle {
     let session = use_store::<Session>();
-    let tasks = Tasks::here();
     let username = Signal::new(String::new());
     let password = Signal::new(String::new());
     let role = Signal::new(AdminRole::Operator.as_str().to_owned());
@@ -376,7 +383,7 @@ fn CreateAdminForm(on_close: Callback, on_created: InputCallback) -> NodeHandle 
         error.set(None);
         busy.set(true);
         let on_created = on_created.clone();
-        tasks.spawn(async move {
+        spawn_local(async move {
             match session.call::<AdminView>(call).await {
                 Ok(a) => {
                     busy.set(false);
@@ -401,11 +408,14 @@ fn CreateAdminForm(on_close: Callback, on_created: InputCallback) -> NodeHandle 
                 oninput: move |v: String| username.set(v),
                 spellcheck: false,
             }
-            CredentialInput {
+            TextInput {
                 label: "Initial password",
                 description: "At least 8 characters. They must replace it at first sign-in.",
-                kind: Credential::NewPassword,
-                value: password,
+                input_type: "password",
+                autocomplete: "new-password",
+                spellcheck: false,
+                value_fn: move || password.get(),
+                oninput: move |v: String| password.set(v),
                 onsubmit: submit.clone(),
             }
             Select {

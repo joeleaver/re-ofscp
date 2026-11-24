@@ -4,8 +4,6 @@
 use rinch::prelude::*;
 
 use super::common::{ErrorAlert, SuccessAlert, failure};
-use super::field::{Credential, CredentialInput};
-use super::tasks::Tasks;
 use crate::logic::{forms, request};
 use crate::session::Session;
 
@@ -15,7 +13,6 @@ use crate::session::Session;
 #[component]
 pub fn PasswordForm(done_message: String) -> NodeHandle {
     let session = use_store::<Session>();
-    let tasks = Tasks::here();
     let current = Signal::new(String::new());
     let new = Signal::new(String::new());
     let confirm = Signal::new(String::new());
@@ -39,7 +36,7 @@ pub fn PasswordForm(done_message: String) -> NodeHandle {
         error.set(None);
         busy.set(true);
         let message = done_message.clone();
-        tasks.spawn(async move {
+        spawn_local(async move {
             match session.call_empty(call).await {
                 Ok(()) => {
                     current.set(String::new());
@@ -64,23 +61,32 @@ pub fn PasswordForm(done_message: String) -> NodeHandle {
 
     rsx! {
         Stack { gap: "sm",
-            CredentialInput {
+            TextInput {
                 label: "Current password",
-                kind: Credential::CurrentPassword,
-                value: current,
+                input_type: "password",
+                autocomplete: "current-password",
+                spellcheck: false,
+                value_fn: move || current.get(),
+                oninput: move |v: String| current.set(v),
                 onsubmit: submit.clone(),
             }
-            CredentialInput {
+            TextInput {
                 label: "New password",
                 description: "At least 8 characters.",
-                kind: Credential::NewPassword,
-                value: new,
+                input_type: "password",
+                autocomplete: "new-password",
+                spellcheck: false,
+                value_fn: move || new.get(),
+                oninput: move |v: String| new.set(v),
                 onsubmit: submit.clone(),
             }
-            CredentialInput {
+            TextInput {
                 label: "Repeat the new password",
-                kind: Credential::NewPassword,
-                value: confirm,
+                input_type: "password",
+                autocomplete: "new-password",
+                spellcheck: false,
+                value_fn: move || confirm.get(),
+                oninput: move |v: String| confirm.set(v),
                 onsubmit: submit.clone(),
             }
             ErrorAlert { message: error }

@@ -10,7 +10,6 @@ use super::audit::AuditScreen;
 use super::common::ErrorAlert;
 use super::invites::InvitesScreen;
 use super::password::PasswordForm;
-use super::tasks::Tasks;
 use crate::logic::roles::{SECTIONS, Section, role_label, unavailable_reason};
 use crate::session::Session;
 
@@ -25,13 +24,12 @@ pub fn current_role(session: Session) -> AdminRole {
 #[component]
 pub fn Console() -> NodeHandle {
     let session = use_store::<Session>();
-    let tasks = Tasks::here();
     let section = Signal::new(Section::default());
     let signing_out = Signal::new(false);
     let error = Signal::new(None::<String>);
     let sign_out = move || {
         signing_out.set(true);
-        tasks.spawn(async move {
+        spawn_local(async move {
             if let Err(e) = session.sign_out().await {
                 signing_out.set(false);
                 error.set(Some(e.message()));

@@ -3,12 +3,12 @@
 
 use re_ofscp_types::admin::{InviteCreated, InviteList};
 use rinch::prelude::*;
+use rinch::reactive::Effect;
 
 use super::common::{
     CopyButton, ErrorAlert, Load, Loading, Pending, SuccessAlert, confirm_dialog, failure,
 };
 use super::shell::current_role;
-use super::tasks::Tasks;
 use crate::logic::roles::{Action, can, unavailable_reason};
 use crate::logic::time::display;
 use crate::logic::{forms, request};
@@ -24,25 +24,21 @@ fn issued_for(inv: &InviteCreated) -> String {
 }
 
 /// Fetch the usable invites into `list`.
-fn load(tasks: Tasks, session: Session, list: Signal<Load<InviteList>>) {
-    list.set(Load::Loading);
-    tasks.spawn(async move {
-        match session.call::<InviteList>(request::list_invites()).await {
-            Ok(found) => list.set(Load::Ready(found)),
-            Err(e) => {
-                if let Some(m) = failure(&e) {
-                    list.set(Load::Failed(m));
-                }
+async fn load(session: Session, list: Signal<Load<InviteList>>) {
+    match session.call::<InviteList>(request::list_invites()).await {
+        Ok(found) => list.set(Load::Ready(found)),
+        Err(e) => {
+            if let Some(m) = failure(&e) {
+                list.set(Load::Failed(m));
             }
         }
-    });
+    }
 }
 
 /// The invites screen.
 #[component]
 pub fn InvitesScreen() -> NodeHandle {
     let session = use_store::<Session>();
-    let tasks = Tasks::here();
     let list = Signal::new(Load::<InviteList>::Loading);
     let issued = Signal::new(None::<InviteCreated>);
     let notice = Signal::new(None::<String>);
@@ -53,7 +49,19 @@ pub fn InvitesScreen() -> NodeHandle {
     let pending = Signal::new(None::<Pending<String>>);
     let pending_busy = Signal::new(false);
     let pending_error = Signal::new(None::<String>);
-    load(tasks, session, list);
+    // Each write reloads the list (the effect's first run is the initial
+    // load), aborting a listing still in flight so that an older answer
+    // never replaces a newer one. The listing is this component's.
+    let reload = Signal::new(());
+    let mut loading: Option<TaskHandle> = None;
+    Effect::new(move || {
+        reload.get();
+        if let Some(previous) = loading.take() {
+            previous.abort();
+        }
+        list.set(Load::Loading);
+        loading = Some(spawn_local(load(session, list)));
+    });
 
     let may = move |a: Action| can(current_role(session), a);
     let create = move || {
@@ -71,14 +79,14 @@ pub fn InvitesScreen() -> NodeHandle {
         error.set(None);
         notice.set(None);
         busy.set(true);
-        tasks.spawn(async move {
+        spawn_local(async move {
             match session.call::<InviteCreated>(call).await {
                 Ok(created) => {
                     busy.set(false);
                     handle.set(String::new());
                     ttl_days.set(String::new());
                     issued.set(Some(created));
-                    load(tasks, session, list);
+                    reload.set(());
                 }
                 Err(e) => {
                     if let Some(m) = failure(&e) {
@@ -91,13 +99,13 @@ pub fn InvitesScreen() -> NodeHandle {
     };
     let revoke = move |id: String| {
         pending_busy.set(true);
-        tasks.spawn(async move {
+        spawn_local(async move {
             match session.call_empty(request::revoke_invite(&id)).await {
                 Ok(()) => {
                     pending_busy.set(false);
                     pending.set(None);
                     notice.set(Some("The invite is revoked.".to_owned()));
-                    load(tasks, session, list);
+                    reload.set(());
                 }
                 Err(e) => {
                     if let Some(m) = failure(&e) {

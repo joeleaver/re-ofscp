@@ -3,9 +3,9 @@
 
 use re_ofscp_types::admin::AuditList;
 use rinch::prelude::*;
+use rinch::reactive::Effect;
 
 use super::common::{ErrorAlert, Load, Loading, StatusBadge, failure};
-use super::tasks::Tasks;
 use crate::browser;
 use crate::logic::forms;
 use crate::logic::problem::{ApiError, sentence};
@@ -28,18 +28,15 @@ fn listing_failure(e: &ApiError) -> Option<String> {
 }
 
 /// Fetch the entries matching `filter` into `list`.
-fn load(tasks: Tasks, session: Session, filter: AuditFilter, list: Signal<Load<AuditList>>) {
-    list.set(Load::Loading);
-    tasks.spawn(async move {
-        match session.call::<AuditList>(request::audit(&filter)).await {
-            Ok(found) => list.set(Load::Ready(found)),
-            Err(e) => {
-                if let Some(m) = listing_failure(&e) {
-                    list.set(Load::Failed(m));
-                }
+async fn load(session: Session, filter: AuditFilter, list: Signal<Load<AuditList>>) {
+    match session.call::<AuditList>(request::audit(&filter)).await {
+        Ok(found) => list.set(Load::Ready(found)),
+        Err(e) => {
+            if let Some(m) = listing_failure(&e) {
+                list.set(Load::Failed(m));
             }
         }
-    });
+    }
 }
 
 /// A labelled UTC `datetime-local` field.
@@ -62,13 +59,26 @@ fn time_field(__scope: &mut RenderScope, label: &'static str, value: Signal<Stri
 #[component]
 pub fn AuditScreen() -> NodeHandle {
     let session = use_store::<Session>();
-    let tasks = Tasks::here();
     let (start, end) = default_window(browser::now_unix());
     let since = Signal::new(start);
     let until = Signal::new(end);
     let admin = Signal::new(String::new());
     let form_error = Signal::new(None::<String>);
     let list = Signal::new(Load::<AuditList>::Loading);
+    // The filter last asked for. Each write starts its listing and aborts
+    // the one before, so a slower, older answer never replaces a newer one
+    // when the window is switched quickly. The task is this component's
+    // (spawned by its effect), so leaving the screen cancels it.
+    let wanted = Signal::new(None::<AuditFilter>);
+    let mut current: Option<TaskHandle> = None;
+    Effect::new(move || {
+        let Some(filter) = wanted.get() else { return };
+        if let Some(previous) = current.take() {
+            previous.abort();
+        }
+        list.set(Load::Loading);
+        current = Some(spawn_local(load(session, filter, list)));
+    });
 
     let run = move || {
         let filter = forms::audit_admin(&admin.get())
@@ -76,7 +86,7 @@ pub fn AuditScreen() -> NodeHandle {
         match filter {
             Ok(filter) => {
                 form_error.set(None);
-                load(tasks, session, filter, list);
+                wanted.set(Some(filter));
             }
             Err(e) => form_error.set(Some(e.0)),
         }

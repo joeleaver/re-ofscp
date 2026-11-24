@@ -3,9 +3,9 @@
 
 use re_ofscp_types::admin::TotpEnrollment;
 use rinch::prelude::*;
+use rinch::reactive::Effect;
 
 use super::common::{CodeInput, CopyButton, ErrorAlert, Load, Loading, failure};
-use super::tasks::Tasks;
 use crate::logic::{forms, qr, request};
 use crate::session::Session;
 
@@ -32,30 +32,40 @@ impl Shown {
 
 /// Start (or restart) enrollment: the server makes a new pending secret,
 /// replacing any earlier one that was never confirmed.
-fn enroll(tasks: Tasks, session: Session, state: Signal<Load<Shown>>) {
-    state.set(Load::Loading);
-    tasks.spawn(async move {
-        match session.call::<TotpEnrollment>(request::totp_enroll()).await {
-            Ok(e) => state.set(Load::Ready(Shown::new(e))),
-            Err(e) => {
-                if let Some(m) = failure(&e) {
-                    state.set(Load::Failed(m));
-                }
+async fn enroll(session: Session, state: Signal<Load<Shown>>) {
+    match session.call::<TotpEnrollment>(request::totp_enroll()).await {
+        Ok(e) => state.set(Load::Ready(Shown::new(e))),
+        Err(e) => {
+            if let Some(m) = failure(&e) {
+                state.set(Load::Failed(m));
             }
         }
-    });
+    }
 }
 
 /// The enrollment step.
 #[component]
 pub fn TotpEnroll() -> NodeHandle {
     let session = use_store::<Session>();
-    let tasks = Tasks::here();
     let state = Signal::new(Load::<Shown>::Loading);
     let typed = Signal::new(String::new());
     let busy = Signal::new(false);
     let error = Signal::new(None::<String>);
-    enroll(tasks, session, state);
+    // Each write starts enrollment over (the effect's first run is the
+    // first enrollment), aborting one still in flight. "Try again" and
+    // "Start over" sit in `match` arms that the restart replaces, so a task
+    // their handlers spawned would end with the arm; spawned by this
+    // component's effect, it belongs to the step.
+    let restart = Signal::new(());
+    let mut enrolling: Option<TaskHandle> = None;
+    Effect::new(move || {
+        restart.get();
+        if let Some(previous) = enrolling.take() {
+            previous.abort();
+        }
+        state.set(Load::Loading);
+        enrolling = Some(spawn_local(enroll(session, state)));
+    });
 
     let confirm = move || {
         if busy.get() {
@@ -71,7 +81,11 @@ pub fn TotpEnroll() -> NodeHandle {
         };
         error.set(None);
         busy.set(true);
-        tasks.spawn(async move {
+        // Written in the `Ready` arm, so this task belongs to that arm: it
+        // ends only if the arm goes, which takes a new secret (and "Start
+        // over" is disabled while `busy`). Confirming a secret no longer
+        // shown would be wrong anyway.
+        spawn_local(async move {
             match session.call_empty(call).await {
                 // The session is now full: refreshing it opens the console.
                 Ok(()) => session.refresh().await,
@@ -92,7 +106,7 @@ pub fn TotpEnroll() -> NodeHandle {
                 Load::Loading => Loading { caption: "Creating your secret…" },
                 Load::Failed(why) => Stack { gap: "sm",
                     Alert { color: "red", variant: "light", {why} }
-                    Group { Button { onclick: move || enroll(tasks, session, state), "Try again" } }
+                    Group { Button { onclick: move || restart.set(()), "Try again" } }
                 },
                 Load::Ready(shown) => Stack { gap: "md",
                     Text { size: "sm",
@@ -124,7 +138,7 @@ pub fn TotpEnroll() -> NodeHandle {
                         Button {
                             variant: "subtle",
                             disabled: {|| busy.get()},
-                            onclick: move || enroll(tasks, session, state),
+                            onclick: move || restart.set(()),
                             "Start over with a new secret"
                         }
                     }

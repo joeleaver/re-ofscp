@@ -5,17 +5,16 @@ mod accounts;
 mod admins;
 mod audit;
 mod common;
-mod field;
 mod invites;
 mod password;
 mod setup;
 mod shell;
 mod sign_in;
 mod style;
-mod tasks;
 mod totp;
 
 use rinch::prelude::*;
+use rinch::reactive::Effect;
 
 use crate::logic::flow::{Stage, stage};
 use crate::session::{Session, Status};
@@ -23,7 +22,6 @@ use common::Loading;
 use setup::SetupFlow;
 use shell::Console;
 use sign_in::SignIn;
-use tasks::Tasks;
 
 /// The top-level screen. Kept separate from the session itself so that
 /// refreshing the session (after a password change, say) does not rebuild
@@ -39,8 +37,15 @@ enum Screen {
 #[component]
 pub fn app() -> NodeHandle {
     let session = create_store(Session::default());
-    let tasks = Tasks::here();
-    tasks.spawn(session.refresh());
+    // Each write asks for a session check; the effect's first run is the
+    // check on load. "Try again" sits in a `match` arm that the check
+    // replaces, and a task spawned by a handler there would end with that
+    // arm; spawned by this component's effect, it lives as long as the app.
+    let check = Signal::new(());
+    Effect::new(move || {
+        check.get();
+        spawn_local(session.refresh());
+    });
     let screen = derived(move || match session.status.get() {
         Status::Checking => Screen::Checking,
         Status::Unreachable(why) => Screen::Unreachable(why),
@@ -49,7 +54,7 @@ pub fn app() -> NodeHandle {
     });
     let retry = move || {
         session.status.set(Status::Checking);
-        tasks.spawn(session.refresh());
+        check.set(());
     };
     rsx! {
         div {
