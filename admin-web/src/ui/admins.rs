@@ -412,6 +412,7 @@ fn CreateAdminForm(on_close: Callback, on_created: InputCallback) -> NodeHandle 
                 value_fn: move || username.get(),
                 oninput: move |v: String| username.set(v),
                 spellcheck: false,
+                autocomplete: "off",
             }
             TextInput {
                 label: "Initial password",

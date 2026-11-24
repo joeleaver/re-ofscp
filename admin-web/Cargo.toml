@@ -16,7 +16,7 @@ re-ofscp-types = { path = "../crates/re-ofscp-types" }
 # rinch — pinned to an exact upstream commit. Bump deliberately.
 rinch = { git = "https://github.com/joeleaver/rinch", rev = "23dc8cc634bd57834081f92ea1a56465cca680d9", default-features = false, features = ["components", "theme"] }
 rinch-core = { git = "https://github.com/joeleaver/rinch", rev = "23dc8cc634bd57834081f92ea1a56465cca680d9", features = ["theme"] }
-rinch-web = { git = "https://github.com/joeleaver/rinch", rev = "23dc8cc634bd57834081f92ea1a56465cca680d9" }
+rinch-web = { git = "https://github.com/joeleaver/rinch", rev = "23dc8cc634bd57834081f92ea1a56465cca680d9", default-features = false }
 # fetch() on the web, a blocking client natively (unused there: native builds
 # only run the unit tests of the pure `logic` modules).
 rinch-http = { git = "https://github.com/joeleaver/rinch", rev = "23dc8cc634bd57834081f92ea1a56465cca680d9" }

@@ -327,6 +327,7 @@ fn CreateAccountForm(on_close: Callback, on_created: InputCallback) -> NodeHandl
                 value_fn: move || handle.get(),
                 oninput: move |v: String| handle.set(v),
                 spellcheck: false,
+                autocomplete: "off",
             }
             TextInput {
                 label: "Display name",
