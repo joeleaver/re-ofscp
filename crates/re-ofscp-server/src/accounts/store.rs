@@ -75,6 +75,19 @@ struct UserRow {
     status: String,
 }
 
+/// An account as the admin API lists it (no password hash).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct AccountSummary {
+    /// The handle.
+    pub handle: String,
+    /// Display name.
+    pub display_name: String,
+    /// [`status::ACTIVE`] or [`status::DISABLED`].
+    pub status: String,
+    /// RFC 3339 creation time.
+    pub created_at: String,
+}
+
 #[derive(Deserialize)]
 struct KeyRow {
     key_id: String,
@@ -162,6 +175,41 @@ impl AccountStore {
             password_hash: r.data.password_hash,
             status: r.data.status,
         }))
+    }
+
+    /// Up to `limit` accounts whose handle contains `contains` (every
+    /// account when `None`), in no particular order.
+    pub async fn search(
+        &self,
+        contains: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<AccountSummary>, StoreError> {
+        let q = match contains {
+            Some(c) => Ql::new("User.filter(.handle.contains(")
+                .str(c)
+                .raw(")).limit("),
+            None => Ql::new("User.limit("),
+        };
+        let q = q.uint(limit as u64).raw(")");
+        Ok(self
+            .db
+            .fetch::<AccountSummary>(&q)
+            .await?
+            .into_iter()
+            .map(|r| r.data)
+            .collect())
+    }
+
+    /// The account with `handle`, without its password hash.
+    pub async fn summary(&self, handle: &str) -> Result<Option<AccountSummary>, StoreError> {
+        let q = Ql::new("User.filter(.handle == ").str(handle).raw(")");
+        Ok(self
+            .db
+            .fetch::<AccountSummary>(&q)
+            .await?
+            .into_iter()
+            .next()
+            .map(|r| r.data))
     }
 
     /// Set an account's status.

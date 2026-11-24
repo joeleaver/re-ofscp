@@ -20,11 +20,11 @@ use re_ofscp_types::{Authority, is_valid_handle};
 use tokio::sync::{Mutex, broadcast};
 
 pub use bootstrap::{BOOTSTRAP_TTL_SECS, BootstrapTokens, IssueError};
-pub use invites::{InviteStore, IssuedInvite};
+pub use invites::{InviteStore, InviteSummary, IssuedInvite, Revoked};
 pub use keys::{NoRemoteKeys, ProviderKeys};
 pub use password::{PasswordError, Passwords};
 pub use register::{InviteError, RegisterError};
-pub use store::{AccountStore, DeviceKey, StoreError, User};
+pub use store::{AccountStore, AccountSummary, DeviceKey, StoreError, User};
 
 use crate::db::Db;
 use crate::ratelimit::{FailureBackoff, RateLimiter};

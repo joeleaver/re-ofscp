@@ -4,6 +4,7 @@
 //! host (server) and `wasm32-unknown-unknown` (admin UI).
 
 pub mod actor;
+pub mod admin;
 pub mod auth;
 pub mod dm;
 

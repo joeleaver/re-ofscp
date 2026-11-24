@@ -9,11 +9,8 @@
 //! | `DELETE /api/auth/device-keys/{keyId}` | signed, local actor | §4.7 |
 //! | `GET /.well-known/ofscp/users/{handle}/keys` | none | §4.6 |
 
-use std::net::{IpAddr, SocketAddr};
-
 use axum::Json;
-use axum::extract::{ConnectInfo, FromRequestParts, Path, State};
-use axum::http::request::Parts;
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use re_ofscp_types::auth::{
@@ -22,31 +19,24 @@ use re_ofscp_types::auth::{
     RegistrationRequest, UserKeysResponse,
 };
 use re_ofscp_types::is_valid_handle;
-use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
 
 use super::{
     BOOTSTRAP_TTL_SECS, IssueError, MAX_DEVICE_KEYS, MAX_DEVICE_NAME_CHARS, RegisterError,
     Revocation,
 };
 use crate::AppState;
+use crate::client::{Peer, client_key};
 use crate::problem::Problem;
 use crate::ratelimit::Limited;
 use crate::signing::Authenticated;
 use crate::signing::canonical::decode_public_key;
+use crate::timefmt::rfc3339;
 
 /// How long verifiers may cache a user's keys (§4.7.1: SHOULD be short).
 pub const KEYS_CACHE_SECS: i64 = 300;
 
 /// Largest body accepted by the unauthenticated auth endpoints.
 pub const AUTH_BODY_LIMIT: usize = 16 * 1024;
-
-fn rfc3339(unix: i64) -> String {
-    OffsetDateTime::from_unix_timestamp(unix)
-        .ok()
-        .and_then(|t| t.format(&Rfc3339).ok())
-        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_owned())
-}
 
 fn limited(l: Limited) -> Problem {
     Problem::too_many_requests(l.retry_after)
@@ -69,83 +59,6 @@ fn internal(e: impl std::fmt::Display) -> Problem {
     Problem::internal()
 }
 
-/// The TCP peer address, when the server was started with connect info
-/// (tests calling the router directly have none).
-pub struct Peer(Option<SocketAddr>);
-
-impl<S: Send + Sync> FromRequestParts<S> for Peer {
-    type Rejection = std::convert::Infallible;
-
-    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        Ok(Self(
-            parts
-                .extensions
-                .get::<ConnectInfo<SocketAddr>>()
-                .map(|c| c.0),
-        ))
-    }
-}
-
-/// The client's address for rate limiting.
-///
-/// With `CLIENT_IP_HEADER` configured, the header's **last** entry: the one
-/// our trusted proxy added (earlier `X-Forwarded-For` entries are whatever
-/// the client sent). Otherwise the TCP peer. IPv6 addresses are grouped by
-/// /64, the usual unit one subscriber controls, so a client cannot mint
-/// fresh rate-limit keys by cycling through its own prefix.
-fn client_key(state: &AppState, headers: &HeaderMap, peer: &Peer) -> String {
-    let Some(name) = state.config.client_ip_header.as_ref() else {
-        return peer
-            .0
-            .map_or_else(|| "unknown".to_owned(), |a| rate_key(a.ip()));
-    };
-    let last = headers
-        .get(name.as_str())
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.rsplit(',').next())
-        .map(str::trim)
-        .filter(|v| !v.is_empty());
-    let Some(last) = last else {
-        // The trusted proxy always sets it; without it every client would
-        // share the proxy's address as one bucket.
-        tracing::error!(header = %name, "client address header missing; keying by TCP peer");
-        return peer
-            .0
-            .map_or_else(|| "unknown".to_owned(), |a| rate_key(a.ip()));
-    };
-    match parse_client_addr(last) {
-        Some(ip) => rate_key(ip),
-        None => {
-            // Appended by the trusted proxy, so still one client's value:
-            // key by it rather than collapse everyone into one bucket.
-            tracing::error!(header = %name, "client address header is not an IP address");
-            format!("raw:{}", last.chars().take(64).collect::<String>())
-        }
-    }
-}
-
-/// An address as proxies write it: `203.0.113.7`, `2001:db8::1`,
-/// `203.0.113.7:4711` or `[2001:db8::1]:4711`.
-fn parse_client_addr(v: &str) -> Option<IpAddr> {
-    v.parse::<IpAddr>()
-        .ok()
-        .or_else(|| v.parse::<SocketAddr>().ok().map(|a| a.ip()))
-}
-
-/// IPv4 as is (and IPv4-mapped IPv6 as IPv4); other IPv6 by its /64.
-fn rate_key(ip: IpAddr) -> String {
-    match ip {
-        IpAddr::V4(v4) => v4.to_string(),
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            Some(v4) => v4.to_string(),
-            None => {
-                let s = v6.segments();
-                format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3])
-            }
-        },
-    }
-}
-
 /// `POST /api/auth/register` (§4.1.1): by account invite, or refused when
 /// registration is closed. Answers `201` with a bootstrap token.
 pub async fn register(
@@ -158,7 +71,7 @@ pub async fn register(
     let now = state.verifier.now();
     accounts
         .per_source
-        .check(&client_key(&state, &headers, &peer), now)
+        .check(&client_key(&state.config, &headers, &peer), now)
         .map_err(limited)?;
     let user = accounts.register(&req, now).await.map_err(|e| match e {
         RegisterError::Closed => Problem::registration_closed(),
@@ -201,7 +114,7 @@ pub async fn login(
     let now = state.verifier.now();
     accounts
         .per_source
-        .check(&client_key(&state, &headers, &peer), now)
+        .check(&client_key(&state.config, &headers, &peer), now)
         .map_err(limited)?;
     // An invalid handle cannot exist: it is answered exactly like an
     // unknown one (same work, same body) but not tracked for lockout, which
@@ -271,7 +184,7 @@ pub async fn register_device_key(
     let now = state.verifier.now();
     accounts
         .per_source
-        .check(&client_key(&state, &headers, &peer), now)
+        .check(&client_key(&state.config, &headers, &peer), now)
         .map_err(limited)?;
     let unauthorized =
         || Problem::unauthorized().with_detail("a valid bootstrap token is required");
@@ -451,29 +364,4 @@ pub async fn user_keys(
         Json(body),
     )
         .into_response())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn client_addresses_parse_with_or_without_a_port() {
-        let ip = |s: &str| parse_client_addr(s).map(|a| a.to_string());
-        assert_eq!(ip("203.0.113.7").as_deref(), Some("203.0.113.7"));
-        assert_eq!(ip("203.0.113.7:4711").as_deref(), Some("203.0.113.7"));
-        assert_eq!(ip("[2001:db8::1]:4711").as_deref(), Some("2001:db8::1"));
-        assert_eq!(ip("2001:db8::1").as_deref(), Some("2001:db8::1"));
-        assert_eq!(ip("for=203.0.113.7"), None);
-    }
-
-    #[test]
-    fn rate_keys_group_ipv6_by_64() {
-        let k = |s: &str| rate_key(s.parse().unwrap());
-        assert_eq!(k("203.0.113.7"), "203.0.113.7");
-        assert_eq!(k("::ffff:203.0.113.7"), "203.0.113.7");
-        assert_eq!(k("2001:db8:1:2:aaaa::1"), "2001:db8:1:2::/64");
-        assert_eq!(k("2001:db8:1:2:bbbb::9"), k("2001:db8:1:2:aaaa::1"));
-        assert_ne!(k("2001:db8:1:3::1"), k("2001:db8:1:2::1"));
-    }
 }

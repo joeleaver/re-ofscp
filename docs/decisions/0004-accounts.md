@@ -15,7 +15,8 @@
   refused at startup. Discovery will advertise it as
   `authentication.registration` (§3.1) when the discovery document lands.
 - **Admins** create accounts directly through `Accounts::create_account`,
-  which the admin API will call, with admin authentication and an audit log.
+  which the admin API calls, with admin authentication and an audit log
+  (0005).
 - **Invites** (§4.1.1): `Accounts::create_invite` issues `ai_` + 256 random
   bits, valid 7 days by default (at most 30), optionally pinned to a handle,
   shared as `https://{DOMAIN}/register?invite={token}`. Only the token's
@@ -161,9 +162,6 @@ with the §8 outbound rules lands, `NoRemoteKeys` refuses every remote signer.
 
 ## Not here yet
 
-- **Admin API:** admin sign-in and the admin API that calls
-  `create_account`, `disable_account` and `create_invite` (plus listing and
-  revoking invites) come with the next PR.
 - **Web sign-up page:** the invite link's `/register` page (served with
   `Referrer-Policy: no-referrer`) is a client concern; it isn't served yet.
 - **Password recovery (§4.1.3):** it needs an email channel. It's a SHOULD,

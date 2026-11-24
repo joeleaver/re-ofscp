@@ -4,12 +4,15 @@
 //! everything testable lives here.
 
 pub mod accounts;
+pub mod admin;
+pub mod client;
 pub mod config;
 pub mod db;
 pub mod problem;
 pub mod ratelimit;
 pub mod replay;
 pub mod signing;
+pub mod timefmt;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,6 +26,7 @@ pub use config::Config;
 pub use problem::Problem;
 
 use accounts::{Accounts, NoRemoteKeys};
+use admin::{AdminSecrets, Admins};
 use db::{Db, DbConfig};
 use replay::ReplayStore;
 use replay::ledger::{LedgerError, NonceLedger, RhypeLedger};
@@ -42,6 +46,8 @@ pub struct AppState {
     pub db: Arc<Db>,
     /// Accounts, passwords, bootstrap tokens and device keys.
     pub accounts: Arc<Accounts>,
+    /// Admin identity, sessions and the audit log.
+    pub admins: Arc<Admins>,
     /// Verifies every signed request, REST and federation alike, against the
     /// one provider-wide replay store.
     pub verifier: Arc<Verifier>,
@@ -109,6 +115,15 @@ impl AppStateBuilder {
             db.clone(),
             self.remote_keys,
         ));
+        let admins = Arc::new(Admins::new(
+            config.domain.clone(),
+            db.clone(),
+            accounts.passwords.clone(),
+            AdminSecrets {
+                secret_key: config.admin_secret_key.as_ref().map(|k| k.0),
+                setup_token: config.admin_setup_token.as_ref().map(|t| t.0.clone()),
+            },
+        ));
         let keys: Arc<dyn KeyResolver> = self.keys.unwrap_or_else(|| accounts.keys.clone());
         let verifier = Arc::new(Verifier::new(
             config.domain.clone(),
@@ -122,6 +137,7 @@ impl AppStateBuilder {
             config: Arc::new(config),
             db,
             accounts,
+            admins,
             verifier,
         }
     }
@@ -178,7 +194,7 @@ impl AppState {
 ///
 /// Layer order, outermost first: tracing, problem rendering (so every
 /// [`Problem`], including the signature layer's and extractors' rejections,
-/// gets its body), signature verification, routes.
+/// gets its body), signature verification (OFSCP routes only), routes.
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/health", get(health))
@@ -211,6 +227,10 @@ pub fn router(state: AppState) -> Router {
             state.verifier.clone(),
             signing::authenticate,
         ))
+        // Added after the signature layer, so it does not wrap them: admin
+        // requests are authenticated by the admin session, never by OFSCP
+        // signatures (docs/decisions/0005).
+        .merge(admin::routes::router())
         .layer(middleware::map_response_with_state(
             ProblemBase::new(&state.config.domain),
             problem::render,
