@@ -17,9 +17,27 @@ re-ofscp-types = { path = "../crates/re-ofscp-types" }
 rinch = { git = "https://github.com/joeleaver/rinch", rev = "7b9e92a9fd0c221b1fd41c8d19fbd500763258b6", default-features = false, features = ["components", "theme"] }
 rinch-core = { git = "https://github.com/joeleaver/rinch", rev = "7b9e92a9fd0c221b1fd41c8d19fbd500763258b6", features = ["theme"] }
 rinch-web = { git = "https://github.com/joeleaver/rinch", rev = "7b9e92a9fd0c221b1fd41c8d19fbd500763258b6" }
+# fetch() on the web, a blocking client natively (unused there: native builds
+# only run the unit tests of the pure `logic` modules).
+rinch-http = { git = "https://github.com/joeleaver/rinch", rev = "7b9e92a9fd0c221b1fd41c8d19fbd500763258b6" }
 
 wasm-bindgen = "0.2"
 console_error_panic_hook = "0.1"
+# Date.now() for the audit window, and the async Clipboard API for the copy
+# buttons.
+js-sys = "0.3"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["Window", "Navigator", "Clipboard"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Query strings and path segments.
+percent-encoding = "2"
+# Parsing and formatting the audit window and timestamps (RFC 3339).
+time = { version = "0.3", default-features = false, features = ["std", "parsing", "formatting", "macros"] }
+# The TOTP enrollment QR code, rendered to SVG in Rust.
+qrcode = { version = "0.15", default-features = false, features = ["std", "svg"] }
+base64 = "0.22"
 
 [profile.release]
 opt-level = "z"
