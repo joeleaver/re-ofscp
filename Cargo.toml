@@ -32,6 +32,11 @@ http-body-util = "0.1"
 psl = "2"
 argon2 = { version = "0.5", features = ["std"] }
 getrandom = "0.3"
+hmac = "0.12"
+sha1 = "0.10"
+chacha20poly1305 = "0.10"
+subtle = "2"
+data-encoding = "2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # rhypedb (the database) — pinned to an exact upstream commit. Bump deliberately.

@@ -27,32 +27,87 @@ fn schema_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../schema.rhype")
 }
 
+/// Ports are drawn at random from below Linux's ephemeral range
+/// (32768–60999). A port from `bind(0)` is soon handed out again, and many
+/// test processes start servers at once, so two of them would often pick
+/// the same one.
+const PORTS: std::ops::Range<u32> = 20_000..32_000;
+
+/// How many times to try fresh ports before giving up.
+const START_ATTEMPTS: u32 = 8;
+
+/// Where the listener's owner can't be checked (not Linux): how long a
+/// server must stay up after its port accepts a connection to count as
+/// ours. One that lost the port to another test's server exits with
+/// "address already in use" while the other server answers.
+#[cfg(not(target_os = "linux"))]
+const BIND_GRACE: Duration = Duration::from_millis(150);
+
+/// Whether process `pid` holds the socket listening on 127.0.0.1:`port`:
+/// the listener's inode from `/proc/net/tcp` is among its open files.
+#[cfg(target_os = "linux")]
+fn listener_is_ours(pid: u32, port: u16) -> bool {
+    let Ok(table) = std::fs::read_to_string("/proc/net/tcp") else {
+        return false;
+    };
+    let local = format!("0100007F:{port:04X}");
+    let sockets: Vec<String> = table
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            // Fields: sl, local, remote, state (0A = LISTEN), …, inode (10th).
+            (f.get(1) == Some(&local.as_str()) && f.get(3) == Some(&"0A"))
+                .then(|| f.get(9).map(|inode| format!("socket:[{inode}]")))
+                .flatten()
+        })
+        .collect();
+    let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return false;
+    };
+    fds.flatten().any(|fd| {
+        std::fs::read_link(fd.path())
+            .is_ok_and(|target| sockets.iter().any(|s| target.as_os_str() == s.as_str()))
+    })
+}
+
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .and_then(|l| l.local_addr())
-        .map(|a| a.port())
-        .expect("no free port")
+    loop {
+        let n = getrandom::u32().expect("random source");
+        let port = (PORTS.start + n % (PORTS.end - PORTS.start)) as u16;
+        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
 }
 
 impl RhypeServer {
     /// Start a server with the repository's `schema.rhype`.
     pub fn start() -> Self {
-        let http_port = free_port();
-        let mut tcp_port = free_port();
-        while tcp_port == http_port {
-            tcp_port = free_port();
-        }
         let mut s = Self {
             child: None,
             dir: tempfile::tempdir().expect("tempdir"),
-            http_port,
-            tcp_port,
+            http_port: 0,
+            tcp_port: 0,
         };
-        s.spawn();
-        s
+        for _ in 0..START_ATTEMPTS {
+            s.http_port = free_port();
+            s.tcp_port = free_port();
+            if s.tcp_port == s.http_port {
+                continue;
+            }
+            if s.spawn() {
+                return s;
+            }
+            // Lost a port to a concurrent test; nothing was written.
+            s.stop();
+        }
+        panic!("rhypedb-server would not start:\n{}", s.log());
     }
 
-    fn spawn(&mut self) {
+    /// Start the server on this instance's ports; `false` if it exited
+    /// (it could not bind them).
+    fn spawn(&mut self) -> bool {
         let bin = binary();
         let child = Command::new(&bin)
             .arg("--schema")
@@ -82,14 +137,46 @@ impl RhypeServer {
                 )
             });
         self.child = Some(child);
-        self.wait_ready();
+        self.wait_ready()
     }
 
-    fn wait_ready(&self) {
+    /// Whether the child has exited.
+    fn exited(&mut self) -> bool {
+        self.child
+            .as_mut()
+            .is_none_or(|c| !matches!(c.try_wait(), Ok(None)))
+    }
+
+    /// Whether *this* server is listening on its binary-protocol port
+    /// (not another test's server that took the port).
+    #[cfg(target_os = "linux")]
+    fn listening(&mut self) -> bool {
+        self.child
+            .as_ref()
+            .is_some_and(|c| listener_is_ours(c.id(), self.tcp_port))
+    }
+
+    /// Whether this server is listening: its port accepts connections and
+    /// it is still running [`BIND_GRACE`] later.
+    #[cfg(not(target_os = "linux"))]
+    fn listening(&mut self) -> bool {
+        if std::net::TcpStream::connect(self.tcp_addr()).is_err() {
+            return false;
+        }
+        std::thread::sleep(BIND_GRACE);
+        !self.exited()
+    }
+
+    /// Wait until this server listens on its port; `false` if it exited
+    /// first (it lost a port to another test).
+    fn wait_ready(&mut self) -> bool {
         let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
-            if std::net::TcpStream::connect(self.tcp_addr()).is_ok() {
-                return;
+            if self.exited() {
+                return false;
+            }
+            if self.listening() {
+                return true;
             }
             std::thread::sleep(Duration::from_millis(25));
         }
@@ -115,7 +202,11 @@ impl RhypeServer {
     /// Start it again on the same ports and data.
     pub fn restart(&mut self) {
         self.stop();
-        self.spawn();
+        assert!(
+            self.spawn(),
+            "rhypedb-server did not restart on its ports:\n{}",
+            self.log()
+        );
     }
 }
 

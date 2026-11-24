@@ -32,6 +32,17 @@ async fn main() -> anyhow::Result<()> {
         ),
     }
     let purge = tokio::spawn(state.clone().purge_ledger_forever());
+    if state.admins.enabled() {
+        tracing::info!("admin console enabled");
+    } else {
+        tracing::warn!("ADMIN_SECRET_KEY is not set; the admin API is off");
+    }
+    let purge_sessions = tokio::spawn(
+        state
+            .admins
+            .clone()
+            .purge_sessions_forever(std::sync::Arc::new(re_ofscp_server::signing::SystemClock)),
+    );
     let app = router(state);
     axum::serve(
         listener,
@@ -40,6 +51,7 @@ async fn main() -> anyhow::Result<()> {
     .with_graceful_shutdown(shutdown_signal())
     .await?;
     purge.abort();
+    purge_sessions.abort();
     Ok(())
 }
 

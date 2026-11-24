@@ -95,6 +95,7 @@ pub struct FailureBackoff {
     base_secs: i64,
     max_secs: i64,
     capacity: usize,
+    admit_when_full: bool,
 }
 
 impl FailureBackoff {
@@ -107,7 +108,18 @@ impl FailureBackoff {
             base_secs: base_secs.max(1),
             max_secs: max_secs.max(1),
             capacity,
+            admit_when_full: false,
         }
+    }
+
+    /// When every tracked key is locked and the table is full, admit an
+    /// untracked key without tracking it instead of refusing it. For a
+    /// table whose keys an attacker can invent, where refusing would let
+    /// them lock everyone out, and where another defence still holds for
+    /// the untracked attempt.
+    pub fn admitting_when_full(mut self) -> Self {
+        self.admit_when_full = true;
+        self
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Failures>> {
@@ -131,9 +143,13 @@ impl FailureBackoff {
         }
         if !map.contains_key(key) && map.len() >= self.capacity {
             // Forget keys that are not locked right now. If every tracked
-            // key is locked, refuse untracked ones (fail closed).
+            // key is locked, refuse untracked ones (fail closed), unless
+            // built `admitting_when_full`.
             map.retain(|_, f| f.locked_until > now);
             if map.len() >= self.capacity {
+                if self.admit_when_full {
+                    return Ok(());
+                }
                 return Err(Limited { retry_after: 1 });
             }
         }
@@ -286,5 +302,16 @@ mod tests {
         // Once those locks lapse they are dropped and "c" is tracked.
         assert_eq!(b.attempt("c", T + 60), Ok(()));
         assert_eq!(b.attempt("c", T + 60), Err(Limited { retry_after: 60 }));
+    }
+
+    #[test]
+    fn backoff_can_admit_untracked_keys_when_full() {
+        let b = FailureBackoff::new(1, 60, 3600, 2).admitting_when_full();
+        b.attempt("a", T).unwrap();
+        b.attempt("b", T).unwrap();
+        // Admitted, but not tracked: it never locks while the table is full.
+        assert_eq!(b.attempt("c", T), Ok(()));
+        assert_eq!(b.attempt("c", T), Ok(()));
+        assert!(b.attempt("a", T).is_err(), "tracked keys stay locked");
     }
 }

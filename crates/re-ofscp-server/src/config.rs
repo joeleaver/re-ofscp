@@ -41,7 +41,26 @@ pub struct Config {
     /// * `REPLAY_PER_REMOTE_DOMAIN`: per remote registrable domain (default
     ///   25 000; over → `429`).
     pub replay: ReplayLimits,
+    /// Seals admin TOTP secrets at rest (`ADMIN_SECRET_KEY`: 32 random
+    /// bytes, base64). Unset: the admin API is off (docs/decisions/0005).
+    pub admin_secret_key: Option<Redacted<[u8; 32]>>,
+    /// One-time token for creating the first admin (`ADMIN_SETUP_TOKEN`, at
+    /// least 32 characters). Useless once an admin exists; remove it then.
+    pub admin_setup_token: Option<Redacted<String>>,
 }
+
+/// A secret configuration value: `Debug` never prints it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Redacted<T>(pub T);
+
+impl<T> std::fmt::Debug for Redacted<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+/// Shortest accepted `ADMIN_SETUP_TOKEN`.
+pub const MIN_SETUP_TOKEN_LEN: usize = 32;
 
 /// A configuration error.
 #[derive(Debug, thiserror::Error)]
@@ -105,8 +124,27 @@ impl Config {
                 });
             }
         };
+        let admin_secret_key = match get("ADMIN_SECRET_KEY").map(|v| v.trim().to_owned()) {
+            None => None,
+            Some(v) => Some(Redacted(decode_key(&v).ok_or(ConfigError::Invalid {
+                name: "ADMIN_SECRET_KEY",
+                reason: "must be 32 bytes, base64 (e.g. `openssl rand -base64 32`)".to_owned(),
+            })?)),
+        };
+        let admin_setup_token = match get("ADMIN_SETUP_TOKEN").map(|v| v.trim().to_owned()) {
+            None => None,
+            Some(v) if v.len() >= MIN_SETUP_TOKEN_LEN => Some(Redacted(v)),
+            Some(_) => {
+                return Err(ConfigError::Invalid {
+                    name: "ADMIN_SETUP_TOKEN",
+                    reason: format!("must be at least {MIN_SETUP_TOKEN_LEN} characters"),
+                });
+            }
+        };
         Ok(Self {
             domain,
+            admin_secret_key,
+            admin_setup_token,
             bind,
             rhypedb_addr,
             client_ip_header,
@@ -114,6 +152,16 @@ impl Config {
             replay,
         })
     }
+}
+
+/// A 32-byte key in standard or URL-safe base64, padded or not.
+fn decode_key(v: &str) -> Option<[u8; 32]> {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
+    [STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD]
+        .iter()
+        .find_map(|e| e.decode(v).ok())
+        .and_then(|b| b.try_into().ok())
 }
 
 /// A positive integer variable, or `default` when unset.
@@ -208,6 +256,35 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn admin_secrets_are_validated_and_never_printed() {
+        let key = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+        let c = Config::from_lookup(env(&[
+            ("DOMAIN", "a.example"),
+            ("ADMIN_SECRET_KEY", key),
+            ("ADMIN_SETUP_TOKEN", &"t".repeat(32)),
+        ]))
+        .unwrap();
+        let k = c.admin_secret_key.clone().unwrap().0;
+        assert_eq!(k[1], 1);
+        assert_eq!(k[31], 31);
+        let printed = format!("{c:?}");
+        assert!(!printed.contains(key) && !printed.contains(&"t".repeat(32)));
+        let defaults = Config::from_lookup(env(&[("DOMAIN", "a.example")])).unwrap();
+        assert!(defaults.admin_secret_key.is_none() && defaults.admin_setup_token.is_none());
+        for (name, value) in [
+            ("ADMIN_SECRET_KEY", "c2hvcnQ="),
+            ("ADMIN_SECRET_KEY", "not base64!"),
+            ("ADMIN_SETUP_TOKEN", "short"),
+        ] {
+            let r = Config::from_lookup(env(&[("DOMAIN", "a.example"), (name, value)]));
+            assert!(
+                matches!(r, Err(ConfigError::Invalid { name: n, .. }) if n == name),
+                "{name}={value}"
+            );
+        }
     }
 
     #[test]

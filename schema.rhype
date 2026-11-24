@@ -69,3 +69,57 @@ type ReplayClock {
     name: String @unique
     high_water: DateTime
 }
+
+// An admin of this provider (docs/decisions/0005). Admins are a separate
+// identity system from `User`: they are not OFSCP actors, are never
+// federated and never sign OFSCP requests.
+type Admin {
+    username: String @unique
+    // Argon2id PHC string.
+    password_hash: String
+    // "owner", "operator" or "read_only".
+    role: String
+    // "active" or "disabled". Disabling is final.
+    status: String
+    // The TOTP secret, sealed with ADMIN_SECRET_KEY (XChaCha20-Poly1305,
+    // bound to the username). Empty until enrollment is confirmed.
+    totp_secret: String
+    // A secret awaiting confirmation (sealed likewise), or empty.
+    totp_pending: String
+    // The last accepted TOTP time step; a code is accepted only for a later
+    // step, so each code works once.
+    totp_last_step: i64
+    // Set when another admin chose the password.
+    password_change_required: Bool
+    // Bumped whenever the admin's credentials change (TOTP confirmed or
+    // reset, password changed). Each session records the value it was
+    // opened under and ends once it differs.
+    credential_epoch: i64
+    // The admin who created this one, or "setup".
+    created_by: String
+    created_at: DateTime
+}
+
+// A signed-in admin's session. Only the token's SHA-256 is stored.
+type AdminSession {
+    token_hash: String @unique
+    username: String @indexed
+    // The admin's credential_epoch when the session was opened.
+    credential_epoch: i64
+    created_at: DateTime
+    last_seen_at: DateTime
+    // Absolute end, whatever the activity.
+    expires_at: DateTime @indexed
+}
+
+// The admin audit log: one entry per admin action, written before the
+// action runs (outcome "pending") and completed after it.
+type AdminAudit {
+    at: DateTime @indexed
+    admin: String @indexed
+    action: String
+    target: String
+    outcome: String
+    source: String
+    detail: String
+}

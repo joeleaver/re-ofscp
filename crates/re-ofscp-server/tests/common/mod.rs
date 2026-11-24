@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 
 pub mod accounts;
+pub mod admin;
 pub mod harness;
 pub mod rhypedb;
 

@@ -301,14 +301,19 @@ impl Db {
     /// Run a write that returns exactly one object (`create`, `update`) and
     /// decode it into `T`. Never retried.
     pub async fn write_one<T: DeserializeOwned>(&self, q: &Ql) -> Result<Row<T>, DbError> {
-        let mut rows: Vec<Row<T>> = self
-            .query_once(q)
+        let mut rows = self.write_many::<T>(q).await?;
+        Self::single(rows.pop(), rows.len())
+    }
+
+    /// Run a write and decode every object it returned (an `update`
+    /// returns the objects it changed) into `T`. Never retried.
+    pub async fn write_many<T: DeserializeOwned>(&self, q: &Ql) -> Result<Vec<Row<T>>, DbError> {
+        self.query_once(q)
             .await?
             .into_objects()
             .iter()
             .map(|o| Row::from_object(o).map_err(DbError::from_client))
-            .collect::<Result<_, _>>()?;
-        Self::single(rows.pop(), rows.len())
+            .collect()
     }
 
     fn single<T>(last: Option<Row<T>>, rest: usize) -> Result<Row<T>, DbError> {

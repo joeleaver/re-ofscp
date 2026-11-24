@@ -41,6 +41,18 @@ pub struct Invite {
     pub handle: Option<String>,
 }
 
+/// What [`InviteStore::revoke`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Revoked {
+    /// It was usable and is now expired.
+    Revoked,
+    /// It was already used (or claimed by a registration in flight); it is
+    /// expired now regardless.
+    Used,
+    /// No unexpired invite has that id.
+    Unknown,
+}
+
 /// A freshly issued invite. The token appears only here: it is not stored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IssuedInvite {
@@ -52,6 +64,22 @@ pub struct IssuedInvite {
     pub handle: Option<String>,
     /// Unix seconds after which it is no longer usable.
     pub expires_at: i64,
+}
+
+/// A usable invite as the admin API lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct InviteSummary {
+    /// SHA-256 of the token, hex: the invite's id.
+    pub token_hash: String,
+    /// The pinned handle, if any.
+    #[serde(default)]
+    pub handle: Option<String>,
+    /// The issuing admin.
+    pub created_by: String,
+    /// RFC 3339 issue time.
+    pub created_at: String,
+    /// RFC 3339 expiry.
+    pub expires_at: String,
 }
 
 #[derive(Deserialize)]
@@ -151,6 +179,49 @@ impl InviteStore {
             .str(handle)
             .raw(" })");
         Ok(!self.db.write_rows(&q).await?.into_objects().is_empty())
+    }
+
+    /// Up to `limit` invites usable at `now`, in no particular order.
+    pub async fn list_usable(&self, now: i64, limit: usize) -> Result<Vec<InviteSummary>, DbError> {
+        let q = Ql::new("RegistrationInvite.filter(.used == false && .expires_at > ")
+            .unix_seconds(now)
+            .raw(").limit(")
+            .uint(limit as u64)
+            .raw(")");
+        Ok(self
+            .db
+            .fetch::<InviteSummary>(&q)
+            .await?
+            .into_iter()
+            .map(|r| r.data)
+            .collect())
+    }
+
+    /// Revoke the invite with `token_hash` by expiring it at `now`.
+    /// [`Revoked::Unknown`] if no unexpired invite has that hash.
+    ///
+    /// The invite is expired even when it is claimed: a registration in
+    /// flight may still complete, but if it fails and releases the claim the
+    /// invite stays dead. ([`Revoked::Used`] then says it was already used
+    /// or being used.)
+    pub async fn revoke(&self, token_hash: &str, now: i64) -> Result<Revoked, DbError> {
+        #[derive(Deserialize)]
+        struct UsedRow {
+            used: bool,
+        }
+        let q = Ql::new("RegistrationInvite.filter(.token_hash == ")
+            .str(token_hash)
+            .raw(" && .expires_at > ")
+            .unix_seconds(now)
+            .raw(").update({ expires_at: ")
+            .unix_seconds(now)
+            .raw(" })");
+        let rows = self.db.write_many::<UsedRow>(&q).await?;
+        Ok(match rows.first() {
+            None => Revoked::Unknown,
+            Some(r) if r.data.used => Revoked::Used,
+            Some(_) => Revoked::Revoked,
+        })
     }
 
     /// Undo [`InviteStore::claim`] after the account could not be created,

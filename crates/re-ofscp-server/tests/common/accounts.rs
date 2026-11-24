@@ -26,6 +26,8 @@ pub struct Env {
     pub state: AppState,
     /// Its router.
     pub app: Router,
+    /// Its clock (starts at [`SIGNED_AT`]).
+    pub clock: Arc<SettableClock>,
 }
 
 /// How to build an [`Env`].
@@ -35,9 +37,17 @@ pub struct EnvOptions {
     pub remote: Option<StaticKeys>,
     /// `REGISTRATION`, when set.
     pub registration: Option<&'static str>,
+    /// Leave `ADMIN_SECRET_KEY` unset (the admin API is then off).
+    pub no_admin: bool,
 }
 
-fn config(server: &RhypeServer, registration: Option<&'static str>) -> Config {
+/// `ADMIN_SETUP_TOKEN` in tests.
+pub const SETUP_TOKEN: &str = "setup-token-for-tests-0123456789abcdef";
+
+/// `ADMIN_SECRET_KEY` in tests (bytes 0..32).
+const ADMIN_SECRET_KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+
+fn config(server: &RhypeServer, registration: Option<&'static str>, admin: bool) -> Config {
     let addr = server.tcp_addr();
     Config::from_lookup(move |k| match k {
         "DOMAIN" => Some("providera.com".into()),
@@ -45,6 +55,8 @@ fn config(server: &RhypeServer, registration: Option<&'static str>) -> Config {
         // Tests choose their own source address per request.
         "CLIENT_IP_HEADER" => Some("x-test-ip".into()),
         "REGISTRATION" => registration.map(str::to_owned),
+        "ADMIN_SECRET_KEY" if admin => Some(ADMIN_SECRET_KEY.into()),
+        "ADMIN_SETUP_TOKEN" => Some(SETUP_TOKEN.into()),
         _ => None,
     })
     .unwrap()
@@ -54,7 +66,8 @@ fn config(server: &RhypeServer, registration: Option<&'static str>) -> Config {
 pub async fn env_with(opts: EnvOptions) -> Env {
     let server = RhypeServer::start();
     let clock = SettableClock::at(SIGNED_AT - time::Duration::seconds(400));
-    let mut b = AppState::builder(config(&server, opts.registration)).clock(clock.clone());
+    let mut b =
+        AppState::builder(config(&server, opts.registration, !opts.no_admin)).clock(clock.clone());
     if let Some(r) = opts.remote {
         b = b.remote_keys(Arc::new(r));
     }
@@ -66,6 +79,7 @@ pub async fn env_with(opts: EnvOptions) -> Env {
         _server: server,
         state,
         app,
+        clock,
     }
 }
 
