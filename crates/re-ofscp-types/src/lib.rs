@@ -4,6 +4,7 @@
 //! host (server) and `wasm32-unknown-unknown` (admin UI).
 
 pub mod actor;
+pub mod auth;
 pub mod dm;
 
 pub use actor::{Actor, Authority, IdentError, is_valid_handle};

@@ -108,6 +108,20 @@ pub const SERVICE_UNAVAILABLE: ErrorCode = ErrorCode {
     title: "Service Unavailable",
     description: "Temporarily unavailable (for example warming up after a restart). Wait for Retry-After seconds, then re-sign with a fresh timestamp and nonce and retry.",
 };
+/// `registration_closed` (§4.1.1).
+pub const REGISTRATION_CLOSED: ErrorCode = ErrorCode {
+    code: "registration_closed",
+    status: 403,
+    title: "Registration Closed",
+    description: "This provider does not accept self-registration. Accounts are created by its administrators.",
+};
+/// `invite_required` (§4.1.1).
+pub const INVITE_REQUIRED: ErrorCode = ErrorCode {
+    code: "invite_required",
+    status: 403,
+    title: "Invite Required",
+    description: "Registration needs a valid account invite, and none was supplied or the one supplied is not usable (unknown, expired, already used, or for a different handle).",
+};
 
 /// Extension code (§7.3 allows extensions paired with their status): the
 /// resource exists but not with this method.
@@ -182,6 +196,8 @@ pub const REGISTRY: &[ErrorCode] = &[
     BAD_REQUEST,
     UNAUTHORIZED,
     FORBIDDEN,
+    REGISTRATION_CLOSED,
+    INVITE_REQUIRED,
     NOT_FOUND,
     CONFLICT,
     SUBSCRIPTION_LIMIT,
@@ -228,6 +244,15 @@ impl Problem {
     /// 404 `not_found`.
     pub fn not_found() -> Self {
         Self::new(&NOT_FOUND)
+    }
+    /// 403 `registration_closed` (§4.1.1).
+    pub fn registration_closed() -> Self {
+        Self::new(&REGISTRATION_CLOSED)
+    }
+
+    /// 403 `invite_required` (§4.1.1).
+    pub fn invite_required() -> Self {
+        Self::new(&INVITE_REQUIRED)
     }
     /// 405 `method_not_allowed` (extension code).
     pub fn method_not_allowed() -> Self {
@@ -468,6 +493,8 @@ mod tests {
             Problem::unauthorized(),
             Problem::forbidden(),
             Problem::not_found(),
+            Problem::registration_closed(),
+            Problem::invite_required(),
             Problem::method_not_allowed(),
             Problem::request_timeout(),
             Problem::unsupported_media_type(),

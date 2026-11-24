@@ -18,9 +18,8 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("binding {}", config.bind))?;
     tracing::info!(domain = %config.domain, bind = %config.bind, "re-ofscp listening");
 
-    // No device keys can be registered yet, so no signed request verifies.
-    // The rhypedb-backed local resolver and the SSRF-safe remote resolver
-    // arrive with accounts.
+    // Local accounts' keys come from rhypedb. Remote signers are refused
+    // until the SSRF-safe remote resolver lands.
     let state = AppState::builder(config).build();
     match tokio::time::timeout(RESTORE_TIMEOUT, state.restore_replay()).await {
         Ok(Ok(n)) => tracing::info!(restored = n, "replay store restored from the ledger"),
@@ -34,9 +33,12 @@ async fn main() -> anyhow::Result<()> {
     }
     let purge = tokio::spawn(state.clone().purge_ledger_forever());
     let app = router(state);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
     purge.abort();
     Ok(())
 }
