@@ -39,7 +39,7 @@ fn admit(state: &AppState, headers: &HeaderMap, peer: &Peer, now: i64) -> Result
     if !admins.enabled() {
         return Err(disabled());
     }
-    check_origin(headers, &admins.domain)?;
+    check_origin(headers, &admins.origins)?;
     let source = client_key(&state.config, headers, peer);
     admins.per_source.check(&source, now).map_err(limited)?;
     Ok(source)

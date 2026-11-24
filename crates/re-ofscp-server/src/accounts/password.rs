@@ -14,12 +14,7 @@ use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, Salt
 use argon2::{Algorithm, Argon2, Params, Version};
 use tokio::sync::Semaphore;
 
-/// Minimum password length (§4.1.4 RECOMMENDED).
-pub const MIN_PASSWORD_LEN: usize = 8;
-
-/// Maximum password length in bytes, bounding the work an attacker can ask
-/// for and the size of the request.
-pub const MAX_PASSWORD_LEN: usize = 1024;
+pub use re_ofscp_types::auth::{MAX_PASSWORD_LEN, MIN_PASSWORD_LEN};
 
 /// Memory cost in KiB (§4.1.4: at least 64 MiB).
 const M_COST_KIB: u32 = 64 * 1024;

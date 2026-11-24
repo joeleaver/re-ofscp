@@ -47,6 +47,13 @@ pub struct Config {
     /// One-time token for creating the first admin (`ADMIN_SETUP_TOKEN`, at
     /// least 32 characters). Useless once an admin exists; remove it then.
     pub admin_setup_token: Option<Redacted<String>>,
+    /// Local development only (`ADMIN_LOOPBACK_HTTP=true`, default off):
+    /// the admin console also accepts requests from `http://{DOMAIN}`, so
+    /// it can be served without TLS on a developer's machine. Refused
+    /// unless `DOMAIN` is `localhost` or a `*.localhost` name, which
+    /// always resolve to loopback (RFC 6761 §6.3), so a public deployment
+    /// cannot turn it on (docs/decisions/0005).
+    pub admin_loopback_http: bool,
 }
 
 /// A secret configuration value: `Debug` never prints it.
@@ -141,10 +148,28 @@ impl Config {
                 });
             }
         };
+        let admin_loopback_http = match get("ADMIN_LOOPBACK_HTTP").as_deref().map(str::trim) {
+            None | Some("false") => false,
+            Some("true") if is_loopback_name(&domain) => true,
+            Some("true") => {
+                return Err(ConfigError::Invalid {
+                    name: "ADMIN_LOOPBACK_HTTP",
+                    reason: "only allowed when DOMAIN is localhost or a *.localhost name"
+                        .to_owned(),
+                });
+            }
+            Some(other) => {
+                return Err(ConfigError::Invalid {
+                    name: "ADMIN_LOOPBACK_HTTP",
+                    reason: format!("{other:?} is not \"true\" or \"false\""),
+                });
+            }
+        };
         Ok(Self {
             domain,
             admin_secret_key,
             admin_setup_token,
+            admin_loopback_http,
             bind,
             rhypedb_addr,
             client_ip_header,
@@ -152,6 +177,14 @@ impl Config {
             replay,
         })
     }
+}
+
+/// Whether `domain`'s host is `localhost` or a `*.localhost` name, which
+/// resolvers must answer with loopback addresses (RFC 6761 §6.3).
+fn is_loopback_name(domain: &Authority) -> bool {
+    let s = domain.as_str();
+    let host = s.rsplit_once(':').map_or(s, |(host, _)| host);
+    host == "localhost" || host.ends_with(".localhost")
 }
 
 /// A 32-byte key in standard or URL-safe base64, padded or not.
@@ -283,6 +316,39 @@ mod tests {
             assert!(
                 matches!(r, Err(ConfigError::Invalid { name: n, .. }) if n == name),
                 "{name}={value}"
+            );
+        }
+    }
+
+    #[test]
+    fn loopback_http_is_off_by_default_and_only_for_localhost() {
+        let lookup = |domain: &str, flag: Option<&str>| {
+            let mut pairs = vec![("DOMAIN", domain)];
+            if let Some(f) = flag {
+                pairs.push(("ADMIN_LOOPBACK_HTTP", f));
+            }
+            Config::from_lookup(env(&pairs)).map(|c| c.admin_loopback_http)
+        };
+        assert!(!lookup("localhost:8090", None).unwrap());
+        assert!(!lookup("localhost:8090", Some("false")).unwrap());
+        assert!(lookup("localhost:8090", Some("true")).unwrap());
+        assert!(lookup("admin.localhost", Some(" true ")).unwrap());
+        for (domain, flag) in [
+            ("social.example", "true"),
+            ("localhost.example", "true"),
+            ("notlocalhost:8090", "true"),
+            ("localhost:8090", "yes"),
+            ("localhost:8090", "1"),
+        ] {
+            assert!(
+                matches!(
+                    lookup(domain, Some(flag)),
+                    Err(ConfigError::Invalid {
+                        name: "ADMIN_LOOPBACK_HTTP",
+                        ..
+                    })
+                ),
+                "{domain} {flag}"
             );
         }
     }

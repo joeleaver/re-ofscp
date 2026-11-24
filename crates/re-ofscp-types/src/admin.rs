@@ -7,6 +7,21 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Lifetime of an account invite when the issuer does not choose one: 7 days.
+pub const DEFAULT_INVITE_TTL_SECS: i64 = 7 * 86_400;
+
+/// Longest lifetime an issuer may choose for an account invite: 30 days.
+pub const MAX_INVITE_TTL_SECS: i64 = 30 * 86_400;
+
+/// Longest account search (`GET /api/admin/accounts?q=`), in bytes.
+pub const MAX_ACCOUNT_QUERY_LEN: usize = 64;
+
+/// Default audit-log window (`GET /api/admin/audit`): the last day.
+pub const DEFAULT_AUDIT_WINDOW_SECS: i64 = 86_400;
+
+/// Longest audit-log window one listing covers: 31 days.
+pub const MAX_AUDIT_WINDOW_SECS: i64 = 31 * 86_400;
+
 /// An admin's role. Each role can do everything the one before it can.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

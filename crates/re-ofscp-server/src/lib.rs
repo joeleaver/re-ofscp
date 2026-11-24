@@ -26,7 +26,7 @@ pub use config::Config;
 pub use problem::Problem;
 
 use accounts::{Accounts, NoRemoteKeys};
-use admin::{AdminSecrets, Admins};
+use admin::{AdminSecrets, Admins, ConsoleOrigins};
 use db::{Db, DbConfig};
 use replay::ReplayStore;
 use replay::ledger::{LedgerError, NonceLedger, RhypeLedger};
@@ -117,6 +117,7 @@ impl AppStateBuilder {
         ));
         let admins = Arc::new(Admins::new(
             config.domain.clone(),
+            ConsoleOrigins::new(&config.domain, config.admin_loopback_http),
             db.clone(),
             accounts.passwords.clone(),
             AdminSecrets {

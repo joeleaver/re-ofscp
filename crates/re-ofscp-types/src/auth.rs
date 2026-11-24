@@ -6,6 +6,14 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Minimum password length in bytes (§4.1.4 RECOMMENDED). Also applies to
+/// admin passwords.
+pub const MIN_PASSWORD_LEN: usize = 8;
+
+/// Maximum password length in bytes, bounding the work an attacker can ask
+/// for and the size of the request.
+pub const MAX_PASSWORD_LEN: usize = 1024;
+
 /// `POST /api/auth/login` request (§4.1.2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -123,6 +123,22 @@ change the password, and log out; everything else is 403 and audited as a
   yet.
 - A CSRF failure with a valid session is audited as a `csrf` denial naming
   the admin.
+- **Local development (`ADMIN_LOOPBACK_HTTP`):** the console is developed
+  against a local provider served over plain http, so its origin is
+  `http://localhost:{port}`, which the rule above refuses. Setting
+  `ADMIN_LOOPBACK_HTTP=true` also accepts exactly `http://{DOMAIN}`, and
+  only when `DOMAIN`'s host is `localhost` or a `*.localhost` name: with
+  any other `DOMAIN` the setting is a configuration error, so it can't
+  weaken a real deployment. It is off unless set, and the server warns at
+  start-up when it is on. Nothing else changes: the cookie keeps its
+  `__Secure-` name and `Secure` flag. Chrome and Firefox accept such a
+  cookie from `http://localhost` (and `*.localhost`), which they treat as
+  a secure context; Safari does not, and drops it, so in Safari the
+  sign-in succeeds but the session is never sent back. Develop the
+  console in Chrome or Firefox.
+  `scripts/dev-admin.sh` runs the whole stack this way (rhypedb, the
+  provider, and `trunk serve` proxying `/api/` so the browser sees one
+  origin), with the throwaway values in `scripts/dev-admin.env`.
 
 ### Abuse resistance
 
@@ -200,6 +216,42 @@ change the password, and log out; everything else is 403 and audited as a
   so the list is one bounded read. Revoking expires the invite; revoking a
   used one is 409, an unknown one 404.
 
+### The console (`admin-web`)
+
+- **Credentials stay out of the page's reach.** The session is the HttpOnly
+  cookie; the CSRF token is held in memory only (the session state), never
+  in `localStorage`, `sessionStorage` or a cookie, so a reload asks
+  `GET /api/admin/session` for it again. A TOTP secret and an invite token
+  are shown once, when the server returns them, and dropped when the
+  screen closes.
+- **Roles:** the console shows what the signed-in role can't do as
+  unavailable, with the role it needs; the server still enforces every
+  check. Restricted sessions see only the set-up steps.
+- **Session end:** any 401 on an authenticated call returns the console to
+  sign-in with a notice, whatever screen was open.
+- **Logic is plain Rust** (`admin-web/src/logic`: request building, form
+  validation, roles, the set-up flow, time windows, the QR code) with no
+  browser in it, so CI tests it natively; the screens (`src/ui`) are thin.
+- **Requests belong to their screen.** rinch ends a task with the owner
+  of the handler that spawned it (rinch's async guide, "Lifetime"). A
+  handler written at a screen's top level is the screen's, even on a
+  component that re-renders (`Button { loading: … }`, rinch#3027), so
+  those spawn directly. A handler written in a `for` row, `if` branch or
+  `match` arm belongs to that row or arm; where its request would replace
+  the arm (retry, start over) or outlive the row (open an account, reload
+  after a form closes), the handler writes a signal and an effect of the
+  screen spawns the request instead. Such an effect tracks only that
+  signal and does its writes under `untracked`: otherwise the renders its
+  writes trigger add dependencies, and each request went out twice.
+- **The newest request wins.** Listings and the account panel keep the
+  `TaskHandle` of their request and abort it when a new one starts, so an
+  older, slower answer never replaces a newer one.
+- **Credential fields** are rinch `TextInput`s with an `autocomplete`
+  token (`username`, `current-password`, `new-password`, `one-time-code`;
+  rinch#3028) so that password managers fill and save them. rinch's
+  `TextInput` has no `inputmode` prop, so the code field gets no numeric
+  keypad on phones.
+
 ### Single instance
 
 The setup, admin-roster and invite-issue locks are in-process, like the
@@ -208,7 +260,5 @@ into the database first.
 
 ## Not here yet
 
-- **Admin web UI:** `admin-web` still needs the sign-in, enrollment and
-  management screens on top of this API.
 - **WebAuthn:** see above.
 - **Audit export / retention policy:** add when an operator needs one.

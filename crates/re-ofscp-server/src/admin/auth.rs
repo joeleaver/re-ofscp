@@ -6,7 +6,8 @@
 //!   cookie. Requests are never authenticated by OFSCP signatures.
 //! * **CSRF:** every state-changing request (anything but `GET`/`HEAD`)
 //!   must come from this provider's own origin: an `Origin` header, when
-//!   present, must be `https://{DOMAIN}`, and `Sec-Fetch-Site`, when
+//!   present, must be `https://{DOMAIN}` (or, in local development with
+//!   `ADMIN_LOOPBACK_HTTP`, `http://{DOMAIN}`), and `Sec-Fetch-Site`, when
 //!   present, must be `same-origin`. Signed-in requests must also carry
 //!   `X-CSRF-Token` matching the session. With `SameSite=Strict` and
 //!   JSON-only bodies (which a cross-site form cannot send without a CORS
@@ -44,15 +45,39 @@ pub fn is_mutation(method: &Method) -> bool {
     !matches!(*method, Method::GET | Method::HEAD)
 }
 
+/// The origins the admin console may send state-changing requests from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsoleOrigins {
+    https: String,
+    loopback_http: Option<String>,
+}
+
+impl ConsoleOrigins {
+    /// `https://{domain}`, plus `http://{domain}` when `loopback_http` is
+    /// set. Configuration only allows that for a loopback `domain`
+    /// (`ADMIN_LOOPBACK_HTTP`, docs/decisions/0005).
+    pub fn new(domain: &Authority, loopback_http: bool) -> Self {
+        Self {
+            https: format!("https://{domain}"),
+            loopback_http: loopback_http.then(|| format!("http://{domain}")),
+        }
+    }
+
+    fn allows(&self, origin: &str) -> bool {
+        origin.eq_ignore_ascii_case(&self.https)
+            || self
+                .loopback_http
+                .as_deref()
+                .is_some_and(|o| origin.eq_ignore_ascii_case(o))
+    }
+}
+
 /// Refuse a cross-origin state-changing request.
-pub fn check_origin(headers: &HeaderMap, domain: &Authority) -> Result<(), Problem> {
+pub fn check_origin(headers: &HeaderMap, allowed: &ConsoleOrigins) -> Result<(), Problem> {
     let refuse = || Problem::forbidden().with_detail("cross-origin requests are not accepted");
     let mut origins = headers.get_all("origin").iter();
     if let Some(origin) = origins.next() {
-        let expected = format!("https://{domain}");
-        let ok = origin
-            .to_str()
-            .is_ok_and(|o| o.eq_ignore_ascii_case(&expected));
+        let ok = origin.to_str().is_ok_and(|o| allowed.allows(o));
         if !ok || origins.next().is_some() {
             return Err(refuse());
         }
@@ -106,7 +131,7 @@ async fn resume(parts: &Parts, state: &AppState) -> Result<AdminCtx, Problem> {
     }
     let mutation = is_mutation(&parts.method);
     if mutation {
-        check_origin(&parts.headers, &admins.domain)?;
+        check_origin(&parts.headers, &admins.origins)?;
     }
     let unauthorized = || Problem::unauthorized().with_detail("sign in to the admin console");
     let token = match cookie_token(&parts.headers) {
@@ -273,7 +298,10 @@ mod tests {
 
     #[test]
     fn only_same_origin_mutations_pass() {
-        let d = Authority::parse_canonical("social.example").unwrap();
+        let d = ConsoleOrigins::new(
+            &Authority::parse_canonical("social.example").unwrap(),
+            false,
+        );
         assert!(check_origin(&h(&[]), &d).is_ok());
         assert!(check_origin(&h(&[("origin", "https://social.example")]), &d).is_ok());
         assert!(check_origin(&h(&[("sec-fetch-site", "same-origin")]), &d).is_ok());
@@ -289,6 +317,24 @@ mod tests {
             h(&[("sec-fetch-site", "same-site")]),
         ] {
             assert!(check_origin(&bad, &d).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn loopback_http_adds_exactly_the_http_origin() {
+        let local = Authority::parse_canonical("localhost:8090").unwrap();
+        let strict = ConsoleOrigins::new(&local, false);
+        let dev = ConsoleOrigins::new(&local, true);
+        let http = h(&[("origin", "http://localhost:8090")]);
+        assert!(check_origin(&http, &strict).is_err());
+        assert!(check_origin(&http, &dev).is_ok());
+        assert!(check_origin(&h(&[("origin", "https://localhost:8090")]), &dev).is_ok());
+        for bad in [
+            "http://localhost:8091",
+            "http://localhost",
+            "http://evil.localhost:8090",
+        ] {
+            assert!(check_origin(&h(&[("origin", bad)]), &dev).is_err(), "{bad}");
         }
     }
 
