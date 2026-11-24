@@ -158,10 +158,18 @@ impl Admins {
     /// epoch: carry that session over to the new epoch, and delete the
     /// admin's other sessions, which the new epoch has already ended
     /// (including any opened concurrently under the old credentials).
+    ///
+    /// The credential has changed by now. If this fails, the change stands
+    /// and the caller's session is simply dead too (its epoch is stale):
+    /// they sign in again with the new credentials.
     async fn carry_over(&self, admin: &Admin, session: &str) -> Result<(), ManageError> {
-        self.sessions
+        if !self
+            .sessions
             .restamp(session, admin.credential_epoch + 1)
-            .await?;
+            .await?
+        {
+            tracing::info!(admin = %admin.username, "session ended during its own credential change");
+        }
         self.sessions
             .delete_for(&admin.username, Some(session))
             .await?;

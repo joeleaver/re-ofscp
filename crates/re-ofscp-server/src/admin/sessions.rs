@@ -226,14 +226,15 @@ impl SessionStore {
     }
 
     /// Carry the session with `token_hash` over to credential `epoch` (the
-    /// admin's own credential change, made through this session).
-    pub async fn restamp(&self, token_hash: &str, epoch: i64) -> Result<(), DbError> {
+    /// admin's own credential change, made through this session). `false`
+    /// if the session no longer exists (it was logged out meanwhile).
+    pub async fn restamp(&self, token_hash: &str, epoch: i64) -> Result<bool, DbError> {
         let q = Ql::new("AdminSession.filter(.token_hash == ")
             .str(token_hash)
             .raw(").update({ credential_epoch: ")
             .int(epoch)
             .raw(" })");
-        self.db.execute(&q).await
+        Ok(!self.db.write_rows(&q).await?.into_objects().is_empty())
     }
 
     /// End one session.

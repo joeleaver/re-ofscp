@@ -126,6 +126,12 @@ pub struct Admins {
     /// TOTP yet, whose password alone opens a (restricted) session. Only
     /// real admins are tracked, so it never fills.
     pub unenrolled_backoff: FailureBackoff,
+    /// Progressive lockout per username on TOTP codes after a *correct*
+    /// password: bounds code guessing however many sources an attacker
+    /// has. Only a password holder can reach it, so it is no lockout
+    /// lever for strangers; while it is locked the answer is the same 401,
+    /// so it never confirms that the password was right.
+    pub code_backoff: FailureBackoff,
     /// Progressive lockout per username for credential checks inside a
     /// session (TOTP confirmation, the current password at a change).
     pub reauth_backoff: FailureBackoff,
@@ -164,6 +170,7 @@ impl Admins {
             login_backoff: FailureBackoff::new(5, 60, 3600, 10_000).admitting_when_full(),
             // 10 free failures across every source, then 60 s doubling.
             unenrolled_backoff: FailureBackoff::new(10, 60, 3600, 2 * store::MAX_ADMINS),
+            code_backoff: FailureBackoff::new(5, 60, 3600, 2 * store::MAX_ADMINS),
             reauth_backoff: FailureBackoff::new(5, 60, 3600, 2 * store::MAX_ADMINS),
             secrets: secrets.secret_key.as_ref().map(SecretBox::new),
             setup_token_hash: secrets.setup_token.as_deref().map(sha256),
@@ -241,10 +248,10 @@ impl Admins {
             Err(AdminStoreError::Taken) => (Err(SetupError::Done), audit::outcome::FAILED),
             Err(AdminStoreError::Db(e)) => (Err(e.into()), audit::outcome::FAILED),
         };
-        let detail = if result.is_ok() {
-            "first owner"
-        } else {
-            "server error"
+        let detail = match &result {
+            Ok(_) => "first owner",
+            Err(SetupError::Done) => "already set up",
+            Err(_) => "server error",
         };
         self.audit.finish(entry, &record, outcome, detail).await;
         result
@@ -314,13 +321,22 @@ impl Admins {
             return Err(LoginError::Invalid { known });
         };
         if admin.totp_enabled() {
+            if self.code_backoff.attempt(&admin.username, now).is_err() {
+                // Too many wrong codes after a right password: the same
+                // answer as any failure, so the password is not confirmed.
+                return Err(LoginError::Invalid { known });
+            }
+            let refund_code = |e: LoginError| {
+                self.code_backoff.refund(&admin.username);
+                undecided(e)
+            };
             let secret = self
                 .secrets()
                 .and_then(|b| {
                     b.open(&admin.totp_secret, &admin.username)
                         .map_err(|e| DbError::Decode(e.to_string()))
                 })
-                .map_err(|e| undecided(LoginError::Internal(e.to_string())))?;
+                .map_err(|e| refund_code(LoginError::Internal(e.to_string())))?;
             let step = code
                 .and_then(|c| totp::verify(&secret, c, now, admin.totp_last_step))
                 .ok_or(LoginError::Invalid { known })?;
@@ -328,11 +344,12 @@ impl Admins {
                 .store
                 .use_totp_step(&admin.username, step)
                 .await
-                .map_err(|e| undecided(LoginError::Internal(e.to_string())))?;
+                .map_err(|e| refund_code(LoginError::Internal(e.to_string())))?;
             if !fresh {
                 // A concurrent sign-in used this code (or a later one).
                 return Err(LoginError::Invalid { known });
             }
+            self.code_backoff.succeed(&admin.username);
         }
         self.login_backoff.succeed(&pair);
         self.unenrolled_backoff.succeed(&admin.username);
@@ -353,9 +370,11 @@ impl Admins {
     }
 
     /// The live session for cookie value `token` and its active admin, or
-    /// `None`. A session past either limit, whose admin is gone or
-    /// disabled, or that was opened under earlier credentials (a password
-    /// or TOTP change since), is deleted. Activity is recorded at most once a minute.
+    /// `None`. A session past either limit, or whose admin is gone or
+    /// disabled, is deleted. One opened under earlier credentials (a
+    /// password or TOTP change since) is refused but left for the change
+    /// to clean up: it may be the very session making the change, about
+    /// to be carried over to the new epoch. Activity is recorded at most once a minute.
     pub async fn resume(&self, token: &str, now: i64) -> Result<Option<(Session, Admin)>, DbError> {
         let Some(hash) = sessions::token_hash(token) else {
             return Ok(None);
@@ -371,11 +390,14 @@ impl Admins {
             .store
             .find(&session.username)
             .await?
-            .filter(|a| a.is_active() && a.credential_epoch == session.credential_epoch);
+            .filter(Admin::is_active);
         let Some(admin) = admin else {
             self.sessions.delete(&hash).await?;
             return Ok(None);
         };
+        if admin.credential_epoch != session.credential_epoch {
+            return Ok(None);
+        }
         if now - session.last_seen_at >= sessions::TOUCH_EVERY_SECS {
             self.sessions.touch(&hash, now).await?;
         }

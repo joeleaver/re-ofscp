@@ -36,10 +36,40 @@ const PORTS: std::ops::Range<u32> = 20_000..32_000;
 /// How many times to try fresh ports before giving up.
 const START_ATTEMPTS: u32 = 8;
 
-/// How long a server must stay up after it accepts a connection to count
-/// as ours: one that lost the port to another test's server exits at once
-/// with "address already in use", while the other server answers.
+/// Where the listener's owner can't be checked (not Linux): how long a
+/// server must stay up after its port accepts a connection to count as
+/// ours. One that lost the port to another test's server exits with
+/// "address already in use" while the other server answers.
+#[cfg(not(target_os = "linux"))]
 const BIND_GRACE: Duration = Duration::from_millis(150);
+
+/// Whether process `pid` holds the socket listening on 127.0.0.1:`port`:
+/// the listener's inode from `/proc/net/tcp` is among its open files.
+#[cfg(target_os = "linux")]
+fn listener_is_ours(pid: u32, port: u16) -> bool {
+    let Ok(table) = std::fs::read_to_string("/proc/net/tcp") else {
+        return false;
+    };
+    let local = format!("0100007F:{port:04X}");
+    let sockets: Vec<String> = table
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            // Fields: sl, local, remote, state (0A = LISTEN), …, inode (10th).
+            (f.get(1) == Some(&local.as_str()) && f.get(3) == Some(&"0A"))
+                .then(|| f.get(9).map(|inode| format!("socket:[{inode}]")))
+                .flatten()
+        })
+        .collect();
+    let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return false;
+    };
+    fds.flatten().any(|fd| {
+        std::fs::read_link(fd.path())
+            .is_ok_and(|target| sockets.iter().any(|s| target.as_os_str() == s.as_str()))
+    })
+}
 
 fn free_port() -> u16 {
     loop {
@@ -117,17 +147,36 @@ impl RhypeServer {
             .is_none_or(|c| !matches!(c.try_wait(), Ok(None)))
     }
 
-    /// Wait until the server accepts connections and is still running
-    /// [`BIND_GRACE`] later; `false` if it exited first.
+    /// Whether *this* server is listening on its binary-protocol port
+    /// (not another test's server that took the port).
+    #[cfg(target_os = "linux")]
+    fn listening(&mut self) -> bool {
+        self.child
+            .as_ref()
+            .is_some_and(|c| listener_is_ours(c.id(), self.tcp_port))
+    }
+
+    /// Whether this server is listening: its port accepts connections and
+    /// it is still running [`BIND_GRACE`] later.
+    #[cfg(not(target_os = "linux"))]
+    fn listening(&mut self) -> bool {
+        if std::net::TcpStream::connect(self.tcp_addr()).is_err() {
+            return false;
+        }
+        std::thread::sleep(BIND_GRACE);
+        !self.exited()
+    }
+
+    /// Wait until this server listens on its port; `false` if it exited
+    /// first (it lost a port to another test).
     fn wait_ready(&mut self) -> bool {
         let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
             if self.exited() {
                 return false;
             }
-            if std::net::TcpStream::connect(self.tcp_addr()).is_ok() {
-                std::thread::sleep(BIND_GRACE);
-                return !self.exited();
+            if self.listening() {
+                return true;
             }
             std::thread::sleep(Duration::from_millis(25));
         }

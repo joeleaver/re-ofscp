@@ -106,7 +106,10 @@ change the password, and log out; everything else is 403 and audited as a
   on its old value, whenever TOTP is confirmed or reset or the password
   changes. Each session stores the epoch it was opened under, and a session
   whose epoch differs from its admin's is dead. The session that made the
-  change is re-stamped with the new epoch.
+  change is re-stamped with the new epoch. A stale session is refused
+  but not deleted on sight (the change deletes the admin's other sessions
+  itself), so a request racing on the changing session can't delete it
+  before it is re-stamped.
 
 ### CSRF and origin
 
@@ -134,8 +137,13 @@ change the password, and log out; everything else is 403 and audited as a
   would lock every owner for as long as the attacker keeps going).
 - **Distributed guessing:** an attacker with many addresses gets five
   guesses per address. For an enrolled admin each guess must be the
-  password *and* a current code together (one 401 for both), so that's
-  hopeless. An admin who hasn't enrolled yet has only a password between an
+  password *and* a current code together (one 401 for both). Someone who
+  already has the password could still spread code guesses across
+  addresses, so wrong codes after a **correct** password also count
+  towards a per-username lock (5 free, then 60 s doubling up to an hour).
+  Only a password holder can trigger it, so it is no lever for strangers,
+  and while it's locked the answer stays the same 401, so it never
+  confirms the password. An admin who hasn't enrolled yet has only a password between an
   attacker and a restricted session (from which they could enroll their
   own TOTP), so those admins also have a lock per username alone: 10
   failures across every source, then 60 s doubling up to an hour. It

@@ -426,3 +426,27 @@ async fn a_password_change_ends_sessions_opened_under_the_old_one() {
         "the changing session carries on"
     );
 }
+
+#[tokio::test]
+async fn code_guessing_with_the_password_is_capped_across_sources() {
+    let env = env().await;
+    let root = owner(&env).await;
+    let secret = root.secret.clone().unwrap();
+    // `login` uses a fresh source address every time.
+    for guess in ["000000", "111111", "222222", "333333", "444444"] {
+        let res = login(&env, "root", "owner password 1", Some(guess)).await;
+        assert_eq!(res.status, StatusCode::UNAUTHORIZED);
+    }
+    // Now even the right code fails, with the usual 401: the lock does
+    // not confirm that the password was right.
+    let c = code(&env, &secret);
+    let res = login(&env, "root", "owner password 1", Some(&c)).await;
+    assert_eq!(res.status, StatusCode::UNAUTHORIZED);
+    let wrong = login(&env, "root", "wrong password", Some(&c)).await;
+    assert_eq!(res.json, wrong.json);
+    // Until the lock lapses.
+    advance(&env, 61);
+    let c = code(&env, &secret);
+    let res = login(&env, "root", "owner password 1", Some(&c)).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.json);
+}
