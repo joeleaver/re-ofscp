@@ -111,6 +111,12 @@ pub fn code(env: &Env, secret: &[u8]) -> String {
     format!("{:06}", totp::code_at(secret, totp::step_at(now(env))))
 }
 
+/// Move the clock on by `secs`.
+pub fn advance(env: &Env, secs: i64) {
+    env.clock
+        .set(time::OffsetDateTime::from_unix_timestamp(now(env) + secs).unwrap());
+}
+
 /// Move the clock on by one TOTP step, so a fresh code is accepted.
 pub fn next_step(env: &Env) {
     let t = now(env) + totp::STEP_SECS;
@@ -222,4 +228,22 @@ pub async fn audit(env: &Env, viewer: &Admin) -> Vec<Value> {
     let res = call(env, Method::GET, "/api/admin/audit", None, viewer).await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.json);
     res.json["entries"].as_array().unwrap().clone()
+}
+
+/// Wait until the audit log holds `expected` failed sign-ins (they are
+/// written in the background), and no more.
+pub async fn wait_for_failed_logins(env: &Env, viewer: &Admin, expected: usize) {
+    let mut seen = 0;
+    for _ in 0..100 {
+        seen = audit(env, viewer)
+            .await
+            .iter()
+            .filter(|e| e["action"] == "session.login" && e["outcome"] == "failed")
+            .count();
+        if seen >= expected {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(seen, expected);
 }

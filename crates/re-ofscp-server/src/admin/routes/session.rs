@@ -6,7 +6,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use re_ofscp_types::admin::{
     AdminLoginRequest, AdminSessionInfo, AdminSetupRequest, PasswordChange, TotpConfirm,
-    TotpEnrollment, is_valid_admin_username,
+    TotpEnrollment,
 };
 
 use super::{SERVER_ERROR, busy, internal, limited, manage_problem, manage_why, password_problem};
@@ -58,7 +58,7 @@ pub async fn setup(
     let source = admit(&state, &headers, &peer, now)?;
     let admins = &state.admins;
     let admin = admins
-        .setup(&req.setup_token, &req.username, &req.password, now)
+        .setup(&req.setup_token, &req.username, &req.password, &source, now)
         .await
         .map_err(|e| match e {
             SetupError::NotConfigured => Problem::not_found()
@@ -70,20 +70,13 @@ pub async fn setup(
             SetupError::Done => Problem::conflict().with_detail(e.to_string()),
             SetupError::InvalidUsername => Problem::bad_request().with_detail(e.to_string()),
             SetupError::Password(p) => password_problem(&p),
+            SetupError::Audit(ref err) => {
+                tracing::error!(target: "audit", error = %err, "audit log unavailable; refusing admin setup");
+                Problem::service_unavailable(5)
+                    .with_detail("the audit log is unavailable; retry shortly")
+            }
             SetupError::Db(_) => internal(e),
         })?;
-    let record = Record {
-        admin: admin.username.clone(),
-        action: "admin.setup",
-        target: admin.username.clone(),
-        source,
-        detail: "first owner".to_owned(),
-    };
-    if let Err(e) = admins.audit.record(&record, outcome::OK, now).await {
-        // The owner exists now; refusing would not undo that. Keep the
-        // event in the structured log at least.
-        tracing::error!(target: "audit", error = %e, admin = %admin.username, "could not record admin setup");
-    }
     Ok((StatusCode::CREATED, Json(super::admins::view(&admin))).into_response())
 }
 
@@ -107,26 +100,38 @@ pub async fn login(
         detail: detail.to_owned(),
     };
     let admin = match admins
-        .login(&req.username, &req.password, req.code.as_deref(), now)
+        .login(
+            &req.username,
+            &req.password,
+            req.code.as_deref(),
+            &source,
+            now,
+        )
         .await
     {
         Ok(a) => a,
         Err(e) => {
             // Failures are audited for real admins only: recording every
-            // made-up username would let anyone fill the log.
-            if matches!(e, LoginError::Invalid { known: true })
-                || matches!(e, LoginError::Locked(_) if is_valid_admin_username(&req.username))
-            {
+            // made-up username would let anyone fill the log. The write is
+            // not awaited, so a real admin's failure takes no longer to
+            // answer than a made-up one's (no enumeration by timing).
+            if matches!(
+                e,
+                LoginError::Invalid { known: true } | LoginError::Locked { known: true, .. }
+            ) {
                 let r = record(&e.to_string());
-                if let Err(err) = admins.audit.record(&r, outcome::FAILED, now).await {
-                    tracing::error!(target: "audit", error = %err, "could not record a failed admin sign-in");
-                }
+                let audit = admins.audit.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = audit.record(&r, outcome::FAILED, now).await {
+                        tracing::error!(target: "audit", error = %err, "could not record a failed admin sign-in");
+                    }
+                });
             }
             return Err(match e {
                 LoginError::Invalid { .. } => {
                     Problem::unauthorized().with_detail("invalid username, password or code")
                 }
-                LoginError::Locked(l) => limited(l),
+                LoginError::Locked { limit, .. } => limited(limit),
                 LoginError::Busy => busy(),
                 LoginError::Internal(_) => internal(e),
             });

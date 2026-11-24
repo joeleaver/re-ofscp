@@ -218,24 +218,52 @@ async fn mutations_need_the_csrf_token_and_the_same_origin() {
 }
 
 #[tokio::test]
-async fn repeated_failures_lock_the_username() {
+async fn repeated_failures_lock_the_username_from_that_source() {
     let env = env().await;
     let root = owner(&env).await;
+    let ip = "192.0.2.50";
+    // Spaced out so the per-source bucket never refuses first.
     for _ in 0..5 {
-        let res = login(&env, "root", "wrong password", Some("123456")).await;
+        let res = login_from(&env, "root", "wrong password", Some("123456"), ip).await;
         assert_eq!(res.status, StatusCode::UNAUTHORIZED);
+        advance(&env, 6);
     }
     let c = code(&env, root.secret.as_ref().unwrap());
-    let res = login(&env, "root", "owner password 1", Some(&c)).await;
+    let res = login_from(&env, "root", "owner password 1", Some(&c), ip).await;
     assert_eq!(res.status, StatusCode::TOO_MANY_REQUESTS);
-    assert!(res.headers.contains_key("retry-after"));
-    // Failures of a real admin are audited (seen by the still-valid session).
-    let failed = audit(&env, &root)
-        .await
-        .into_iter()
-        .filter(|e| e["action"] == "session.login" && e["outcome"] == "failed")
-        .count();
-    assert_eq!(failed, 6);
+    let retry: u64 = res.headers["retry-after"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(retry > 30, "the lockout, not the bucket: {retry}");
+    // Nobody can lock the admin out from elsewhere.
+    let res = login_from(&env, "root", "owner password 1", Some(&c), "192.0.2.51").await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.json);
+    // Failures of a real admin are audited, including the refusal.
+    wait_for_failed_logins(&env, &root, 6).await;
+}
+
+#[tokio::test]
+async fn unenrolled_admins_are_locked_across_every_source() {
+    let env = env().await;
+    let root = owner(&env).await;
+    let body = json!({"username": "newbie", "password": "initial password", "role": "operator"});
+    let res = call(&env, Method::POST, "/api/admin/admins", Some(body), &root).await;
+    assert_eq!(res.status, StatusCode::CREATED);
+    // `login` uses a fresh source address every time.
+    for _ in 0..10 {
+        let res = login(&env, "newbie", "wrong password", None).await;
+        assert_eq!(res.status, StatusCode::UNAUTHORIZED);
+    }
+    let res = login(&env, "newbie", "initial password", None).await;
+    assert_eq!(res.status, StatusCode::TOO_MANY_REQUESTS);
+    // Made-up usernames are not tracked at all.
+    for _ in 0..12 {
+        let res = login(&env, "nobody", "wrong password", None).await;
+        assert_eq!(res.status, StatusCode::UNAUTHORIZED);
+    }
+    wait_for_failed_logins(&env, &root, 11).await;
 }
 
 #[tokio::test]
@@ -342,4 +370,59 @@ async fn conflicting_session_cookies_are_refused() {
         format!("{COOKIE}=as_planted").parse().unwrap(),
     );
     assert_eq!(send(&env, req).await.status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn confirming_totp_ends_every_password_only_session() {
+    let env = env().await;
+    setup(&env, "root", "owner password 1").await;
+    let mut root = sign_in(&env, "root", "owner password 1", None).await;
+    let other = sign_in(&env, "root", "owner password 1", None).await;
+    // A sign-in that read the admin before enrollment but stores its
+    // session after it (the race a slow password check opens).
+    let admins = &env.state.admins;
+    let stale = admins
+        .login("root", "owner password 1", None, "192.0.2.60", now(&env))
+        .await
+        .unwrap();
+    enroll(&env, &mut root).await;
+    let (late, _) = admins.start_session(&stale, now(&env)).await.unwrap();
+    assert!(admins.resume(&late, now(&env)).await.unwrap().is_none());
+    let get = |a: &Admin| request(Method::GET, "/api/admin/session", None, Some(a));
+    assert_eq!(
+        send(&env, get(&other)).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    let res = send(&env, get(&root)).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.json["restricted"], false);
+}
+
+#[tokio::test]
+async fn a_password_change_ends_sessions_opened_under_the_old_one() {
+    let env = env().await;
+    let root = owner(&env).await;
+    let admins = &env.state.admins;
+    let c = code(&env, root.secret.as_ref().unwrap());
+    let stale = admins
+        .login(
+            "root",
+            "owner password 1",
+            Some(&c),
+            "192.0.2.61",
+            now(&env),
+        )
+        .await
+        .unwrap();
+    let body = json!({"currentPassword": "owner password 1", "newPassword": "owner password 2"});
+    let res = call(&env, Method::POST, "/api/admin/password", Some(body), &root).await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.json);
+    let (late, _) = admins.start_session(&stale, now(&env)).await.unwrap();
+    assert!(admins.resume(&late, now(&env)).await.unwrap().is_none());
+    let res = call(&env, Method::GET, "/api/admin/session", None, &root).await;
+    assert_eq!(
+        res.status,
+        StatusCode::OK,
+        "the changing session carries on"
+    );
 }

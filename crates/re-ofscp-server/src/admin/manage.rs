@@ -95,25 +95,18 @@ impl Admins {
             .map_err(|e| DbError::Decode(e.to_string()))?;
         // Wrong codes count towards the sign-in lockout, so a session
         // cannot try codes without limit.
-        self.login_backoff
+        self.reauth_backoff
             .attempt(&admin.username, now)
             .map_err(ManageError::Locked)?;
         let step = totp::verify(&secret, code, now, admin.totp_last_step)
             .ok_or(ManageError::WrongCredential("that code is not valid"))?;
-        self.login_backoff.succeed(&admin.username);
-        if !self
-            .store
-            .confirm_totp(&admin.username, &admin.totp_pending, step)
-            .await?
-        {
+        self.reauth_backoff.succeed(&admin.username);
+        if !self.store.confirm_totp(admin, step).await? {
             return Err(ManageError::Conflict(
                 "enrollment changed meanwhile; start again",
             ));
         }
-        self.sessions
-            .delete_for(&admin.username, Some(session))
-            .await?;
-        Ok(())
+        self.carry_over(admin, session).await
     }
 
     /// Change the admin's own password, proving the current one. Wrong
@@ -127,7 +120,7 @@ impl Admins {
         session: &str,
         now: i64,
     ) -> Result<(), ManageError> {
-        self.login_backoff
+        self.reauth_backoff
             .attempt(&admin.username, now)
             .map_err(ManageError::Locked)?;
         let ok = match self
@@ -137,7 +130,7 @@ impl Admins {
         {
             Ok(ok) => ok,
             Err(e) => {
-                self.login_backoff.refund(&admin.username);
+                self.reauth_backoff.refund(&admin.username);
                 return Err(e.into());
             }
         };
@@ -146,14 +139,29 @@ impl Admins {
                 "the current password is wrong",
             ));
         }
-        self.login_backoff.succeed(&admin.username);
+        self.reauth_backoff.succeed(&admin.username);
         if current == new {
             return Err(ManageError::Invalid(
                 "the new password must differ from the current one",
             ));
         }
         let hash = self.passwords.hash(new).await?;
-        self.store.set_password(admin, &hash, false).await?;
+        if !self.store.set_password(admin, &hash).await? {
+            return Err(ManageError::Conflict(
+                "your credentials changed meanwhile; sign in again",
+            ));
+        }
+        self.carry_over(admin, session).await
+    }
+
+    /// After `admin`'s own credential change through `session` bumped the
+    /// epoch: carry that session over to the new epoch, and delete the
+    /// admin's other sessions, which the new epoch has already ended
+    /// (including any opened concurrently under the old credentials).
+    async fn carry_over(&self, admin: &Admin, session: &str) -> Result<(), ManageError> {
+        self.sessions
+            .restamp(session, admin.credential_epoch + 1)
+            .await?;
         self.sessions
             .delete_for(&admin.username, Some(session))
             .await?;
@@ -266,7 +274,12 @@ impl Admins {
         if target.status != status::ACTIVE {
             return Err(ManageError::Conflict("that admin is disabled"));
         }
-        self.store.reset_totp(username).await?;
+        if !self.store.reset_totp(&target).await? {
+            return Err(ManageError::Conflict(
+                "that admin's credentials changed meanwhile; try again",
+            ));
+        }
+        // The new epoch already ended them; this tidies up.
         self.sessions.delete_for(username, None).await?;
         Ok(())
     }

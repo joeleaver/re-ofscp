@@ -41,6 +41,9 @@ pub struct Admin {
     pub totp_last_step: i64,
     /// Whether the admin must choose a new password.
     pub password_change_required: bool,
+    /// Bumped on every credential change; sessions opened under an
+    /// earlier value are dead.
+    pub credential_epoch: i64,
     /// Creator's username, or `"setup"`.
     pub created_by: String,
     /// RFC 3339 creation time.
@@ -86,6 +89,7 @@ struct AdminRow {
     totp_pending: String,
     totp_last_step: i64,
     password_change_required: bool,
+    credential_epoch: i64,
     created_by: String,
     created_at: String,
 }
@@ -103,6 +107,7 @@ fn decode(id: u64, r: AdminRow) -> Result<Admin, DbError> {
         totp_pending: r.totp_pending,
         totp_last_step: r.totp_last_step,
         password_change_required: r.password_change_required,
+        credential_epoch: r.credential_epoch,
         created_by: r.created_by,
         created_at: r.created_at,
     })
@@ -157,7 +162,7 @@ impl AdminStore {
             .raw(", totp_secret: \"\", totp_pending: \"\", totp_last_step: 0")
             .raw(", password_change_required: ")
             .bool(a.password_change_required)
-            .raw(", created_by: ")
+            .raw(", credential_epoch: 0, created_by: ")
             .str(a.created_by)
             .raw(", created_at: ")
             .unix_seconds(now)
@@ -195,21 +200,20 @@ impl AdminStore {
         Ok(admins)
     }
 
-    /// Replace the password hash and set whether a change is required.
-    pub async fn set_password(
-        &self,
-        admin: &Admin,
-        password_hash: &str,
-        change_required: bool,
-    ) -> Result<(), DbError> {
-        let q = Ql::new("Admin.get(")
-            .uint(admin.id)
+    /// Replace the password hash, clear the change requirement and bump
+    /// the credential epoch, provided the epoch is still `admin`'s (no
+    /// credential changed since it was read). `false` if it changed.
+    pub async fn set_password(&self, admin: &Admin, password_hash: &str) -> Result<bool, DbError> {
+        let q = Ql::new("Admin.filter(.username == ")
+            .str(&admin.username)
+            .raw(" && .credential_epoch == ")
+            .int(admin.credential_epoch)
             .raw(").update({ password_hash: ")
             .str(password_hash)
-            .raw(", password_change_required: ")
-            .bool(change_required)
+            .raw(", password_change_required: false, credential_epoch: ")
+            .int(admin.credential_epoch + 1)
             .raw(" })");
-        self.db.execute(&q).await
+        Ok(!self.db.write_rows(&q).await?.into_objects().is_empty())
     }
 
     /// Set the role of an active admin. `false` if it is not active.
@@ -245,23 +249,23 @@ impl AdminStore {
         Ok(!self.db.write_rows(&q).await?.into_objects().is_empty())
     }
 
-    /// Promote the pending secret `pending` to the enrolled one, with
-    /// `step` as its last used step. `false` if the pending secret changed
-    /// meanwhile or a secret is already enrolled.
-    pub async fn confirm_totp(
-        &self,
-        username: &str,
-        pending: &str,
-        step: i64,
-    ) -> Result<bool, DbError> {
+    /// Promote `admin`'s pending secret to the enrolled one, with `step` as
+    /// its last used step, and bump the credential epoch. `false` if the
+    /// pending secret or the epoch changed meanwhile, or a secret is
+    /// already enrolled.
+    pub async fn confirm_totp(&self, admin: &Admin, step: i64) -> Result<bool, DbError> {
         let q = Ql::new("Admin.filter(.username == ")
-            .str(username)
+            .str(&admin.username)
+            .raw(" && .credential_epoch == ")
+            .int(admin.credential_epoch)
             .raw(" && .totp_secret == \"\" && .totp_pending == ")
-            .str(pending)
+            .str(&admin.totp_pending)
             .raw(").update({ totp_secret: ")
-            .str(pending)
+            .str(&admin.totp_pending)
             .raw(", totp_pending: \"\", totp_last_step: ")
             .int(step)
+            .raw(", credential_epoch: ")
+            .int(admin.credential_epoch + 1)
             .raw(" })");
         Ok(!self.db.write_rows(&q).await?.into_objects().is_empty())
     }
@@ -280,12 +284,18 @@ impl AdminStore {
         Ok(!self.db.write_rows(&q).await?.into_objects().is_empty())
     }
 
-    /// Remove an admin's TOTP enrollment (they enroll again at next
-    /// sign-in). The last used step is kept, so old codes stay dead.
-    pub async fn reset_totp(&self, username: &str) -> Result<(), DbError> {
+    /// Remove `admin`'s TOTP enrollment (they enroll again at next
+    /// sign-in) and bump the credential epoch, ending every session. The
+    /// last used step is kept, so old codes stay dead. `false` if the epoch
+    /// changed since `admin` was read.
+    pub async fn reset_totp(&self, admin: &Admin) -> Result<bool, DbError> {
         let q = Ql::new("Admin.filter(.username == ")
-            .str(username)
-            .raw(").update({ totp_secret: \"\", totp_pending: \"\" })");
-        self.db.execute(&q).await
+            .str(&admin.username)
+            .raw(" && .credential_epoch == ")
+            .int(admin.credential_epoch)
+            .raw(").update({ totp_secret: \"\", totp_pending: \"\", credential_epoch: ")
+            .int(admin.credential_epoch + 1)
+            .raw(" })");
+        Ok(!self.db.write_rows(&q).await?.into_objects().is_empty())
     }
 }

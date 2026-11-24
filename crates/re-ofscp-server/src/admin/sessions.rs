@@ -130,6 +130,9 @@ pub struct Session {
     pub token_hash: String,
     /// The admin's username.
     pub username: String,
+    /// The admin's credential epoch when it was opened (or last
+    /// re-stamped by the admin's own credential change).
+    pub credential_epoch: i64,
     /// Unix seconds of the last recorded request.
     pub last_seen_at: i64,
     /// Unix seconds at which it ends regardless.
@@ -147,6 +150,7 @@ impl Session {
 struct SessionRow {
     token_hash: String,
     username: String,
+    credential_epoch: i64,
     last_seen_at: String,
     expires_at: String,
 }
@@ -163,13 +167,22 @@ impl SessionStore {
         Self { db }
     }
 
-    /// Store a session for `username` starting at `now`; returns its end.
-    pub async fn create(&self, token_hash: &str, username: &str, now: i64) -> Result<i64, DbError> {
+    /// Store a session for `username`, opened under credential `epoch`,
+    /// starting at `now`; returns its end.
+    pub async fn create(
+        &self,
+        token_hash: &str,
+        username: &str,
+        epoch: i64,
+        now: i64,
+    ) -> Result<i64, DbError> {
         let expires_at = now + ABSOLUTE_SECS;
         let q = Ql::new("AdminSession.create({ token_hash: ")
             .str(token_hash)
             .raw(", username: ")
             .str(username)
+            .raw(", credential_epoch: ")
+            .int(epoch)
             .raw(", created_at: ")
             .unix_seconds(now)
             .raw(", last_seen_at: ")
@@ -198,6 +211,7 @@ impl SessionStore {
             expires_at: time(&r.expires_at)?,
             token_hash: r.token_hash,
             username: r.username,
+            credential_epoch: r.credential_epoch,
         }))
     }
 
@@ -207,6 +221,17 @@ impl SessionStore {
             .str(token_hash)
             .raw(").update({ last_seen_at: ")
             .unix_seconds(now)
+            .raw(" })");
+        self.db.execute(&q).await
+    }
+
+    /// Carry the session with `token_hash` over to credential `epoch` (the
+    /// admin's own credential change, made through this session).
+    pub async fn restamp(&self, token_hash: &str, epoch: i64) -> Result<(), DbError> {
+        let q = Ql::new("AdminSession.filter(.token_hash == ")
+            .str(token_hash)
+            .raw(").update({ credential_epoch: ")
+            .int(epoch)
             .raw(" })");
         self.db.execute(&q).await
     }
@@ -311,6 +336,7 @@ mod tests {
         let s = Session {
             token_hash: String::new(),
             username: "joe".into(),
+            credential_epoch: 0,
             last_seen_at: 1_000,
             expires_at: 1_000 + ABSOLUTE_SECS,
         };

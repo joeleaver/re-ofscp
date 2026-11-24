@@ -65,6 +65,9 @@ pub enum SetupError {
     /// The password is too short or too long, or hashing is saturated.
     #[error(transparent)]
     Password(#[from] PasswordError),
+    /// The audit log could not be written, so nothing was created.
+    #[error("the audit log is unavailable")]
+    Audit(DbError),
     /// Storage failed.
     #[error(transparent)]
     Db(#[from] DbError),
@@ -81,9 +84,15 @@ pub enum LoginError {
         /// never in the response).
         known: bool,
     },
-    /// Too many failures for this username.
+    /// Too many failures for this username (from this source, or at all
+    /// for an admin who has not enrolled TOTP yet).
     #[error("too many failed sign-ins")]
-    Locked(Limited),
+    Locked {
+        /// When to retry.
+        limit: Limited,
+        /// Whether the username names an admin (for the audit log only).
+        known: bool,
+    },
     /// Hashing is saturated.
     #[error("password hashing is saturated")]
     Busy,
@@ -107,8 +116,19 @@ pub struct Admins {
     pub passwords: Passwords,
     /// Per-client-address limiter for the unauthenticated admin endpoints.
     pub per_source: RateLimiter,
-    /// Per-username progressive lockout after failed sign-ins.
+    /// Progressive lockout after failed sign-ins, per username *and*
+    /// source, so nobody can lock an admin out from elsewhere. Keys can be
+    /// invented, so a full table admits rather than refuses: for enrolled
+    /// admins the TOTP code is the defence against distributed guessing,
+    /// and for the rest [`Admins::unenrolled_backoff`].
     pub login_backoff: FailureBackoff,
+    /// Progressive lockout per username for admins who have not enrolled
+    /// TOTP yet, whose password alone opens a (restricted) session. Only
+    /// real admins are tracked, so it never fills.
+    pub unenrolled_backoff: FailureBackoff,
+    /// Progressive lockout per username for credential checks inside a
+    /// session (TOTP confirmation, the current password at a change).
+    pub reauth_backoff: FailureBackoff,
     secrets: Option<SecretBox>,
     setup_token_hash: Option<[u8; 32]>,
     /// Serializes changes that must see a consistent set of admins (setup,
@@ -141,7 +161,10 @@ impl Admins {
             // 5 requests at once per source, then 10 per minute.
             per_source: RateLimiter::new(5, 10, 100_000),
             // 5 free failures, then 60 s doubling to 1 h.
-            login_backoff: FailureBackoff::new(5, 60, 3600, 10_000),
+            login_backoff: FailureBackoff::new(5, 60, 3600, 10_000).admitting_when_full(),
+            // 10 free failures across every source, then 60 s doubling.
+            unenrolled_backoff: FailureBackoff::new(10, 60, 3600, 2 * store::MAX_ADMINS),
+            reauth_backoff: FailureBackoff::new(5, 60, 3600, 2 * store::MAX_ADMINS),
             secrets: secrets.secret_key.as_ref().map(SecretBox::new),
             setup_token_hash: secrets.setup_token.as_deref().map(sha256),
             roster: Mutex::new(()),
@@ -169,6 +192,7 @@ impl Admins {
         token: &str,
         username: &str,
         password: &str,
+        source: &str,
         now: i64,
     ) -> Result<Admin, SetupError> {
         let expected = self.setup_token_hash.ok_or(SetupError::NotConfigured)?;
@@ -185,6 +209,19 @@ impl Admins {
         if self.store.any().await? {
             return Err(SetupError::Done);
         }
+        // Like every admin action, refused unless the audit log takes it.
+        let record = audit::Record {
+            admin: username.to_owned(),
+            action: "admin.setup",
+            target: username.to_owned(),
+            source: source.to_owned(),
+            detail: "first owner".to_owned(),
+        };
+        let entry = self
+            .audit
+            .begin(&record, now)
+            .await
+            .map_err(SetupError::Audit)?;
         let created = self
             .store
             .create(
@@ -198,18 +235,26 @@ impl Admins {
                 now,
             )
             .await;
-        match created {
-            Ok(a) => Ok(a),
+        let (result, outcome) = match created {
+            Ok(a) => (Ok(a), audit::outcome::OK),
             // Nothing existed a moment ago under the roster lock.
-            Err(AdminStoreError::Taken) => Err(SetupError::Done),
-            Err(AdminStoreError::Db(e)) => Err(e.into()),
-        }
+            Err(AdminStoreError::Taken) => (Err(SetupError::Done), audit::outcome::FAILED),
+            Err(AdminStoreError::Db(e)) => (Err(e.into()), audit::outcome::FAILED),
+        };
+        let detail = if result.is_ok() {
+            "first owner"
+        } else {
+            "server error"
+        };
+        self.audit.finish(entry, &record, outcome, detail).await;
+        result
     }
 
-    /// Check a sign-in: username, password and, once enrolled, a TOTP code.
+    /// Check a sign-in from `source`: username, password and, once
+    /// enrolled, a TOTP code.
     ///
-    /// Shaped like the OFSCP login (docs/decisions/0004): a valid username
-    /// is counted as a failure before anything is checked, unknown and
+    /// Shaped like the OFSCP login (docs/decisions/0004): an attempt is
+    /// counted as a failure before anything is checked, unknown and
     /// disabled admins are verified against a dummy hash, faults are
     /// refunded, and a success clears the count. A code is accepted once:
     /// its step is recorded with a conditional update.
@@ -218,30 +263,43 @@ impl Admins {
         username: &str,
         password: &str,
         code: Option<&str>,
+        source: &str,
         now: i64,
     ) -> Result<Admin, LoginError> {
         let valid = is_valid_admin_username(username);
-        if valid {
-            self.login_backoff
-                .attempt(username, now)
-                .map_err(LoginError::Locked)?;
-        }
-        let undecided = |e: LoginError| {
-            if valid {
-                self.login_backoff.refund(username);
-            }
-            e
-        };
+        // Nothing is counted yet, so a fault here needs no refund.
         let admin = if valid {
             self.store
                 .find(username)
                 .await
-                .map_err(|e| undecided(LoginError::Internal(e.to_string())))?
+                .map_err(|e| LoginError::Internal(e.to_string()))?
         } else {
             None
         };
         let known = admin.is_some();
         let active = admin.filter(Admin::is_active);
+        // Usernames cannot contain NUL, so the key is unambiguous.
+        let pair = format!("{username}\0{source}");
+        if valid {
+            self.login_backoff
+                .attempt(&pair, now)
+                .map_err(|limit| LoginError::Locked { limit, known })?;
+        }
+        let unenrolled = active.as_ref().is_some_and(|a| !a.totp_enabled());
+        if unenrolled && let Err(limit) = self.unenrolled_backoff.attempt(username, now) {
+            // Refused before checking: this attempt does not count.
+            self.login_backoff.refund(&pair);
+            return Err(LoginError::Locked { limit, known });
+        }
+        let undecided = |e: LoginError| {
+            if valid {
+                self.login_backoff.refund(&pair);
+            }
+            if unenrolled {
+                self.unenrolled_backoff.refund(username);
+            }
+            e
+        };
         let ok = self
             .passwords
             .verify(password, active.as_ref().map(|a| a.password_hash.as_str()))
@@ -276,7 +334,8 @@ impl Admins {
                 return Err(LoginError::Invalid { known });
             }
         }
-        self.login_backoff.succeed(&admin.username);
+        self.login_backoff.succeed(&pair);
+        self.unenrolled_backoff.succeed(&admin.username);
         Ok(admin)
     }
 
@@ -286,13 +345,17 @@ impl Admins {
         let token = sessions::new_token()?;
         let hash = sessions::token_hash(&token)
             .ok_or_else(|| DbError::Query("minted an unrecognisable session token".to_owned()))?;
-        let expires_at = self.sessions.create(&hash, &admin.username, now).await?;
+        let expires_at = self
+            .sessions
+            .create(&hash, &admin.username, admin.credential_epoch, now)
+            .await?;
         Ok((token, expires_at))
     }
 
     /// The live session for cookie value `token` and its active admin, or
-    /// `None`. A session past either limit, or whose admin is gone or
-    /// disabled, is deleted. Activity is recorded at most once a minute.
+    /// `None`. A session past either limit, whose admin is gone or
+    /// disabled, or that was opened under earlier credentials (a password
+    /// or TOTP change since), is deleted. Activity is recorded at most once a minute.
     pub async fn resume(&self, token: &str, now: i64) -> Result<Option<(Session, Admin)>, DbError> {
         let Some(hash) = sessions::token_hash(token) else {
             return Ok(None);
@@ -308,7 +371,7 @@ impl Admins {
             .store
             .find(&session.username)
             .await?
-            .filter(Admin::is_active);
+            .filter(|a| a.is_active() && a.credential_epoch == session.credential_epoch);
         let Some(admin) = admin else {
             self.sessions.delete(&hash).await?;
             return Ok(None);

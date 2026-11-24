@@ -91,6 +91,10 @@ type Admin {
     totp_last_step: i64
     // Set when another admin chose the password.
     password_change_required: Bool
+    // Bumped whenever the admin's credentials change (TOTP confirmed or
+    // reset, password changed). Each session records the value it was
+    // opened under and ends once it differs.
+    credential_epoch: i64
     // The admin who created this one, or "setup".
     created_by: String
     created_at: DateTime
@@ -100,6 +104,8 @@ type Admin {
 type AdminSession {
     token_hash: String @unique
     username: String @indexed
+    // The admin's credential_epoch when the session was opened.
+    credential_epoch: i64
     created_at: DateTime
     last_seen_at: DateTime
     // Absolute end, whatever the activity.

@@ -98,6 +98,15 @@ change the password, and log out; everything else is 403 and audited as a
 - **Ended early** by logout (that session), a password change or TOTP
   confirmation (every *other* session of that admin), and by disabling or a
   TOTP reset (every session of that admin).
+- **Credential epoch:** deleting the other sessions alone isn't enough: a
+  sign-in that read the admin before the change but stored its session
+  after the deletion (its password check takes ~100 ms) would survive,
+  and a password-only session would then count as a full one once TOTP is
+  enrolled. So `Admin.credential_epoch` is bumped, by a conditional update
+  on its old value, whenever TOTP is confirmed or reset or the password
+  changes. Each session stores the epoch it was opened under, and a session
+  whose epoch differs from its admin's is dead. The session that made the
+  change is re-stamped with the new epoch.
 
 ### CSRF and origin
 
@@ -117,13 +126,34 @@ change the password, and log out; everything else is 403 and audited as a
 - **Per source address:** a token bucket of 5 at once, then 10 per minute, on
   setup and login, keyed the same way as account login (0004:
   `CLIENT_IP_HEADER`, IPv6 by /64).
-- **Per username:** the same `FailureBackoff` as accounts: 5 failures free,
-  then 60 s doubling up to an hour (429 with `Retry-After`). Wrong passwords,
-  wrong or reused codes, and wrong codes at TOTP confirmation and wrong
-  current passwords at a password change all count.
+- **Per username and source:** the same `FailureBackoff` as accounts, keyed
+  by (username, source): 5 failures free, then 60 s doubling up to an hour
+  (429 with `Retry-After`). Wrong passwords and wrong or reused codes count.
+  Keying by source too means nobody can lock an admin out of the console
+  from elsewhere, which a per-username lock would allow (five failures
+  would lock every owner for as long as the attacker keeps going).
+- **Distributed guessing:** an attacker with many addresses gets five
+  guesses per address. For an enrolled admin each guess must be the
+  password *and* a current code together (one 401 for both), so that's
+  hopeless. An admin who hasn't enrolled yet has only a password between an
+  attacker and a restricted session (from which they could enroll their
+  own TOTP), so those admins also have a lock per username alone: 10
+  failures across every source, then 60 s doubling up to an hour. It
+  tracks real admins only, so its table never fills; the trade-off is
+  that someone can lock a not-yet-enrolled admin out, and so learn that the
+  username exists and hasn't enrolled. Enroll promptly.
+- **Never fails closed for everyone:** the (username, source) table holds
+  10 000 entries and its keys can be invented. When it's full of locked
+  keys, a new key is admitted untracked rather than refused, so filling it
+  can't lock real admins out; the TOTP code and the per-username lock still
+  stand.
+- **Inside a session:** wrong codes at TOTP confirmation and wrong current
+  passwords at a password change count towards a third per-username lock
+  (5 free, then 60 s doubling), which only that session's holder can reach.
 - **No enumeration:** an unknown username, a wrong password and a wrong code
-  all get the same 401 body, and an unknown username still runs a dummy
-  hash.
+  all get the same 401 body, an unknown username still runs a dummy hash,
+  and a real admin's failure is audited in the background, so it takes no
+  longer to answer.
 
 ### Audit log
 
@@ -132,11 +162,14 @@ change the password, and log out; everything else is 403 and audited as a
   action names are in `src/admin/routes/mod.rs`.
 - **Fail closed:** a `pending` entry is written before the action and
   finished after it (`ok` or `failed`). If the log can't be written, the
-  action is refused with 503. If a sign-in's audit write fails after its
+  action is refused with 503; that includes setup, whose entry is written
+  before the owner is created. If a sign-in's audit write fails after its
   session was created, the session is deleted and the sign-in fails.
-- **Denials are recorded** (role, CSRF, restricted session). Failed logins
-  are recorded only for usernames that exist, so the log can't be flooded
-  with invented names.
+- **Denials are recorded** (role, CSRF, restricted session). Failed and
+  locked-out logins are recorded only for usernames that exist, so the log
+  can't be flooded with invented names. Those entries are written in the
+  background (they record a refusal, not an action), so a failure to write
+  one is logged rather than changing the answer.
 - **Never secrets:** invite entries record the invite id (its token hash),
   never the token. Passwords, codes and hashes never appear; a database
   error is summarised as "server error" because its text can echo a query.
