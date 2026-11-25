@@ -199,6 +199,7 @@ fn config(server: &RhypeServer) -> Config {
     let addr = server.tcp_addr();
     Config::from_lookup(move |k| match k {
         "DOMAIN" => Some("providera.com".into()),
+        "PROVIDER_SIGNING_KEY" => Some(common::PROVIDER_SIGNING_KEY.into()),
         "RHYPEDB_ADDR" => Some(addr.clone()),
         _ => None,
     })

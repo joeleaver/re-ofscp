@@ -10,6 +10,9 @@ pub mod rhypedb;
 
 use std::path::PathBuf;
 
+/// `PROVIDER_SIGNING_KEY` in tests (bytes 32..64).
+pub const PROVIDER_SIGNING_KEY: &str = "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=";
+
 /// The sibling `ofscp` spec checkout (`OFSCP_SPEC_DIR` overrides). CI clones
 /// `lost-conn/ofscp` beside this repository. Missing → the test fails, never
 /// silently skips.

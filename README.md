@@ -33,7 +33,7 @@ cargo test
 cargo run --release -p rhypedb-server -- --schema ../re-ofscp/schema.rhype --data-dir ./data
 
 # Run the server against it
-DOMAIN=localhost:8080 cargo run -p re-ofscp-server
+DOMAIN=localhost:8080 PROVIDER_SIGNING_KEY=$(openssl rand -base64 32) cargo run -p re-ofscp-server
 
 # Admin UI (needs `cargo install trunk`)
 cd admin-web && trunk serve
@@ -44,10 +44,12 @@ cd admin-web && trunk serve
 ```bash
 jkbase project create re-ofscp
 jkbase secret set DOMAIN=<public host>
+jkbase secret set PROVIDER_SIGNING_KEY=$(openssl rand -base64 32)
 jkbase deploy
 ```
 
 `DOMAIN` must be the public host that clients use, because OFSCP signatures bind to it (§4.4.2).
+`PROVIDER_SIGNING_KEY` is the provider's Ed25519 seed; discovery publishes its public half (§8.1, `docs/decisions/0007-discovery-and-cors.md`). Generate it once and keep it: changing it rotates the provider key.
 
 ## License
 

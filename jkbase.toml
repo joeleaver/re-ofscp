@@ -9,6 +9,7 @@
 # First deploy (from the repo root):
 #   jkbase project create re-ofscp
 #   jkbase secret set DOMAIN=<public host>   # MUST equal the host clients use (OFSCP §4.4.2)
+#   jkbase secret set PROVIDER_SIGNING_KEY=$(openssl rand -base64 32)   # provider key (§8.1)
 #   jkbase deploy
 #
 # The runtime clears the environment: every env var the server reads
