@@ -129,7 +129,7 @@ async fn discovery_validates_against_the_spec_schema() {
     assert_eq!(auth["registration"], "invite");
 
     // The one published key is the configured one; no private material.
-    let expected = env.state.config.provider_key.public_entry();
+    let expected = &env.state.config.provider_key.public_entries()[0];
     let keys = p["publicKeys"].as_array().unwrap();
     assert_eq!(keys.len(), 1);
     assert_eq!(keys[0]["key_id"], expected.key_id);

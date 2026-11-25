@@ -9,7 +9,10 @@
 //! The admin API (`/api/admin/…`) and the admin console (`/admin`) are the
 //! exception: they authenticate with a `SameSite=Strict` session cookie
 //! plus CSRF protection and stay same-origin (docs/decisions/0005), so they
-//! get no CORS headers at all and a preflight to them is not answered.
+//! get no CORS headers at all and a preflight to them is not answered. §3.4
+//! "Scope" (lost-conn/ofscp#21) puts a provider's own non-standard
+//! endpoints outside the CORS requirement, and says endpoints with ambient
+//! credentials SHOULD NOT be opened cross-origin.
 
 use axum::extract::Request;
 use axum::http::header::{

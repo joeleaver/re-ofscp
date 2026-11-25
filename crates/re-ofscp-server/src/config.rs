@@ -245,12 +245,14 @@ fn is_loopback_name(domain: &Authority) -> bool {
     host == "localhost" || host.ends_with(".localhost")
 }
 
-/// A `mailto:` or `https:` URI with something after the scheme and no
-/// whitespace or control characters.
+/// A `mailto:` or `https:` URI (scheme in any case, RFC 3986 §3.1) with
+/// something after the scheme and no whitespace or control characters.
 fn is_contact_uri(v: &str) -> bool {
-    let rest = v
-        .strip_prefix("mailto:")
-        .or_else(|| v.strip_prefix("https://"));
+    let rest = ["mailto:", "https://"].iter().find_map(|scheme| {
+        v.get(..scheme.len())
+            .filter(|p| p.eq_ignore_ascii_case(scheme))
+            .map(|_| &v[scheme.len()..])
+    });
     rest.is_some_and(|r| !r.is_empty()) && !v.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
@@ -360,6 +362,10 @@ mod tests {
         assert_eq!(
             contact("a.example", Some(" https://a.example/about ")).unwrap(),
             "https://a.example/about"
+        );
+        assert_eq!(
+            contact("a.example", Some("MAILTO:ops@a.example")).unwrap(),
+            "MAILTO:ops@a.example"
         );
         for bad in [
             "",

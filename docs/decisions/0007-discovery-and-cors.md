@@ -2,7 +2,8 @@
 
 - **Status:** accepted
 - **Date:** 2026-11-25
-- **Spec:** §3.1 (discovery), §3.4 (CORS, settled in lost-conn/ofscp#11),
+- **Spec:** §3.1 (discovery), §3.4 (CORS, settled in lost-conn/ofscp#11;
+  "Scope" in lost-conn/ofscp#21),
   §4.1.1 (registration modes, lost-conn/ofscp#18), §8.1 (provider signing
   identity); schema `schemas/v0.1/provider-discovery.json`
 
@@ -43,12 +44,13 @@ our provider signing keys.
   The admin console uses a `SameSite=Strict` session cookie plus CSRF
   protection and stays same-origin (0005). A cross-origin preflight to it
   gets no `204` and no CORS headers, so browsers refuse the request.
-  §3.4 literally says "every `/api/…`" endpoint. We read it with §3.2
-  ("additional, non-standard endpoints … are out of scope"): the MUST
-  covers the endpoints the spec defines, not a provider's own
-  cookie-authenticated administration. This was raised with the OFSCP
-  oracle (2026-11-25) as a spec clarification; if the spec settles the
-  other way, the admin API moves off `/api/` rather than gaining CORS.
+  This follows §3.4 "Scope" (lost-conn/ofscp#21, in review): the CORS
+  requirements cover the endpoints the spec defines plus every
+  `/.well-known/ofscp…` document. A provider's own non-standard endpoints,
+  even under `/api/`, are outside them. A provider SHOULD NOT open an
+  endpoint that uses ambient credentials cross-origin, and MUST NOT put a
+  non-standard endpoint at a path the spec defines (`/api/admin/…` takes
+  none).
 
 ### Provider signing key (§8.1)
 
@@ -85,15 +87,18 @@ invalid for every reader, so we publish a real key.
   2. To rotate: move the current seed to `PROVIDER_SIGNING_KEY_PREVIOUS`,
      set a new `PROVIDER_SIGNING_KEY`, deploy.
   3. Peers that cached the old document re-fetch on the unknown key id
-     (§8.1). Any request signed with the old key and still in flight or
-     queued for retry still verifies, because the old key is still
-     published.
-  4. After the longest retry horizon of anything signed with the old key
-     (at least discovery's `max-age`, 300 s, plus the 300 s skew window),
-     remove `PROVIDER_SIGNING_KEY_PREVIOUS` and deploy.
+     (§8.1). A request signed with the old key that is already in flight
+     when the deploy lands still verifies, because the old key is still
+     published. (Retries are re-signed with a fresh timestamp, so they
+     use the current key.)
+  4. Once no request signed with the old key can still verify (its
+     timestamp is past the 300 s skew window) and peers' cached copies of
+     the old document have expired (discovery's `max-age`, 300 s), remove
+     `PROVIDER_SIGNING_KEY_PREVIOUS` and deploy.
 
-  `ProviderKey::published` already returns a list, so step 1 only adds an
-  entry to it and to the discovery document.
+  `ProviderKey::published` already returns a list, and discovery's
+  `publicKeys` is derived from that same list, so step 1 only adds an
+  entry there.
 
 ### Discovery document (§3.1)
 

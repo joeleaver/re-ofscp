@@ -58,14 +58,19 @@ impl ProviderKey {
         vec![(self.key_id.clone(), self.signing.verifying_key())]
     }
 
-    /// The public half as published in discovery.
-    pub fn public_entry(&self) -> ProviderPublicKey {
-        ProviderPublicKey {
-            key_id: self.key_id.clone(),
-            algorithm: "Ed25519".to_owned(),
-            public_key: STANDARD.encode(self.signing.verifying_key().as_bytes()),
-            created_at: None,
-        }
+    /// The published keys as discovery lists them (`provider.publicKeys`),
+    /// from the same list as [`ProviderKey::published`], so what peers see
+    /// and what this provider accepts cannot drift apart.
+    pub fn public_entries(&self) -> Vec<ProviderPublicKey> {
+        self.published()
+            .into_iter()
+            .map(|(key_id, key)| ProviderPublicKey {
+                key_id,
+                algorithm: "Ed25519".to_owned(),
+                public_key: STANDARD.encode(key.as_bytes()),
+                created_at: None,
+            })
+            .collect()
     }
 }
 
@@ -96,9 +101,12 @@ mod tests {
     }
 
     #[test]
-    fn public_entry_round_trips_and_debug_hides_the_seed() {
+    fn public_entries_round_trip_and_debug_hides_the_seed() {
         let key = ProviderKey::from_seed(&[7; 32]);
-        let entry = key.public_entry();
+        let entries = key.public_entries();
+        assert_eq!(entries.len(), key.published().len());
+        let entry = &entries[0];
+        assert_eq!(entry.key_id, key.key_id());
         let decoded = decode_public_key(&entry.public_key).unwrap();
         assert_eq!(decoded, key.signing_key().verifying_key());
         assert_eq!(entry.algorithm, "Ed25519");

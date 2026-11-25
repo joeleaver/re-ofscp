@@ -56,7 +56,7 @@ pub fn document(config: &Config) -> DiscoveryDocument {
                 registration_endpoint,
                 registration: Some(config.registration),
             },
-            public_keys: vec![config.provider_key.public_entry()],
+            public_keys: config.provider_key.public_entries(),
         },
         capabilities: Capabilities {
             // No message, channel or group APIs yet.
@@ -182,10 +182,7 @@ mod tests {
             Some("https://social.example:8443/api/auth/register")
         );
         assert_eq!(auth.registration, Some(RegistrationMode::Invite));
-        assert_eq!(
-            doc.provider.public_keys,
-            vec![c.provider_key.public_entry()]
-        );
+        assert_eq!(doc.provider.public_keys, c.provider_key.public_entries());
     }
 
     #[test]

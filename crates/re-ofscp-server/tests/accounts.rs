@@ -378,3 +378,24 @@ async fn account_creation_validates_handles_and_rejects_duplicates() {
         StatusCode::NOT_FOUND
     );
 }
+
+/// A local actor cannot borrow the provider signing key: actor signatures
+/// resolve only against the actor's own device keys (§4.5, §8.1).
+#[tokio::test]
+async fn a_local_actor_signing_with_the_provider_key_is_401() {
+    let env = env().await;
+    create(&env, "alice", "correct horse battery").await;
+    let own = &env.state.config.provider_key;
+    let req = signed(
+        own.signing_key(),
+        "alice@providera.com",
+        own.key_id(),
+        "GET",
+        "/api/auth/device-keys",
+        "",
+        NOW,
+    );
+    let (status, json, _, _) = send(&env.app, req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{json}");
+    assert_eq!(json["errorCode"], "unauthorized");
+}
