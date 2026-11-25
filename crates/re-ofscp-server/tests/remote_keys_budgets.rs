@@ -9,7 +9,7 @@ use std::time::Duration;
 use common::harness::new_key;
 use common::key_setup::{Setup, cached, client, fetched, nth_client, unavailable};
 use common::remote_peer::{DISCOVERY_PATH, Reply, discovery_doc, keys_doc, keys_path};
-use re_ofscp_server::signing::{KeyResolver, Signer};
+use re_ofscp_server::signing::{KeyResolver, Requester, Signer};
 use re_ofscp_server::timefmt::rfc3339;
 use re_ofscp_types::Actor;
 
@@ -186,11 +186,19 @@ async fn joining_a_fetch_under_way_is_free() {
     assert_eq!(s.hits("slow"), 1);
 }
 
+/// Each `(client, signer)` looks `signer` up for `key_id`; the answers do
+/// not matter.
+async fn spam(s: &Setup, lookups: Vec<(Requester, Signer)>, key_id: &str, fresh: bool) {
+    for (spammer, signer) in lookups {
+        let _ = s.resolve_as(&spammer, &signer, key_id, fresh).await;
+    }
+}
+
 #[tokio::test]
 async fn known_users_keep_working_while_first_time_lookups_are_spammed() {
     let s = Setup::new().await;
     let (k1, k2) = (new_key().verifying_key(), new_key().verifying_key());
-    s.serve_keys("alice", &[("dk_1", k1)], 600);
+    s.serve_keys("alice", &[("dk_1", k1)], 120);
     let alice = s.actor("alice");
     // A fetch that found keys: alice is now a known source.
     assert_eq!(s.resolve(&alice, "dk_1", false).await, fetched(Some(k1)));
@@ -198,27 +206,19 @@ async fn known_users_keep_working_while_first_time_lookups_are_spammed() {
     // handle (404s, so first-time lookups) every two seconds: more than the
     // first-time bucket refills, so it stays empty.
     let mut n = 0;
+    let mut spam_round = || -> Vec<_> {
+        (0..8)
+            .map(|c| {
+                n += 1;
+                (nth_client(100 + c), s.actor(&format!("r{n:04}")))
+            })
+            .collect()
+    };
     for _ in 0..90 {
-        for c in 0..8 {
-            n += 1;
-            let spammer = nth_client(100 + c);
-            let _ = s
-                .resolve_as(&spammer, &s.actor(&format!("r{n:04}")), "dk_1", false)
-                .await;
-        }
+        spam(&s, spam_round(), "dk_1", false).await;
         s.advance(2);
     }
-    for c in 0..8 {
-        n += 1;
-        let _ = s
-            .resolve_as(
-                &nth_client(100 + c),
-                &s.actor(&format!("r{n:04}")),
-                "dk_1",
-                false,
-            )
-            .await;
-    }
+    spam(&s, spam_round(), "dk_1", false).await;
     assert_eq!(
         unavailable(
             s.resolve_as(&nth_client(1), &s.actor("newcomer"), "dk_1", false)
@@ -227,12 +227,76 @@ async fn known_users_keep_working_while_first_time_lookups_are_spammed() {
         2,
         "the first-time bucket is empty"
     );
-    // alice rotates her key: the re-fetch for her (known) is charged to
-    // the known bucket, so it still goes through.
+    // alice rotates her key. A re-fetch on a key miss is charged as
+    // first-time, whoever is named (anyone can name a bogus key id), so
+    // while the spam lasts it waits for that bucket: the cost of keeping
+    // the known bucket out of the spammers' reach.
     s.serve_keys("alice", &[("dk_1", k1), ("dk_2", k2)], 600);
     assert_eq!(
-        s.resolve_as(&nth_client(2), &alice, "dk_2", true).await,
+        unavailable(s.resolve_as(&nth_client(2), &alice, "dk_2", true).await),
+        2
+    );
+    // Her cached keys have expired meanwhile: the expiry re-fetch of a
+    // known source is charged to the known bucket and goes through,
+    // bringing the new key.
+    assert_eq!(
+        s.resolve_as(&nth_client(3), &alice, "dk_2", false).await,
         fetched(Some(k2))
     );
     assert_eq!(s.hits("alice"), 2);
+}
+
+/// Known users whose cached keys expire while spammers keep naming them
+/// with bogus key ids (each lookup then a `fresh` re-fetch, which handles
+/// being public anyone can cause) are still re-fetched on expiry.
+#[tokio::test]
+async fn bogus_key_id_refetches_of_known_users_cannot_drain_the_known_bucket() {
+    const USERS: u32 = 40;
+    let s = Setup::new().await;
+    let k = new_key().verifying_key();
+    let handle = |i: u32| format!("user{i:02}");
+    let expiry = s.now() + 400;
+    for i in 0..USERS {
+        s.serve_keys(&handle(i), &[("dk_1", k)], expiry - s.now());
+        assert_eq!(
+            s.resolve_as(&nth_client(i), &s.actor(&handle(i)), "dk_1", false)
+                .await,
+            fetched(Some(k))
+        );
+        s.advance(2);
+    }
+    // Six clients each name a known user with a bogus key id every two
+    // seconds: up to one re-fetch per user per minute, 40 a minute, more
+    // than a bucket refills (30). Were they charged to the known bucket,
+    // it would stay empty.
+    let mut next = 0;
+    let mut spam_round = || -> Vec<_> {
+        (0..6)
+            .map(|c| {
+                next += 1;
+                (nth_client(100 + c), s.actor(&handle(next % USERS)))
+            })
+            .collect()
+    };
+    while s.now() < expiry {
+        spam(&s, spam_round(), "dk_bogus", true).await;
+        s.advance(2);
+    }
+    // The cached keys have expired. While the spam goes on, every known
+    // user's expiry re-fetch (one every two seconds, within the known
+    // bucket's refill) still goes through. Each user's document is renewed
+    // just before its lookup, so no spammer's re-fetch has cached it: the
+    // lookup is a fetch, charged to the known bucket.
+    for i in 0..USERS {
+        spam(&s, spam_round(), "dk_bogus", true).await;
+        s.serve_keys(&handle(i), &[("dk_1", k)], 600);
+        assert_eq!(
+            s.resolve_as(&nth_client(200 + i), &s.actor(&handle(i)), "dk_1", false)
+                .await,
+            fetched(Some(k)),
+            "{}",
+            handle(i)
+        );
+        s.advance(2);
+    }
 }

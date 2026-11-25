@@ -25,6 +25,7 @@
 pub mod budget;
 pub mod document;
 pub mod fetch;
+mod known;
 mod state;
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -184,7 +185,14 @@ impl Inner {
                 }));
             }
         };
-        let standing = if tables.is_known(source) {
+        // Only an expiry-driven fetch of a known source uses the known
+        // budget. A `fresh` re-fetch is a key miss, which anyone can cause
+        // for any public handle by naming a bogus key id: it is charged as
+        // first-time whatever the source's standing, so such spam cannot
+        // drain the budget that keeps a peer's established users verifying
+        // (docs/decisions/0006). Expiry fetches of a source come at most
+        // once per cache lifetime, however often it is named.
+        let standing = if !fresh && tables.is_known(source) {
             Standing::Known
         } else {
             Standing::FirstTime

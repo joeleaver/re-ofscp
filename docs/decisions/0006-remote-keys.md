@@ -165,19 +165,51 @@ Replaces `NoRemoteKeys` behind `ProviderKeys`' `remote` slot.
       lookups. A source is known when its last completed fetch returned a
       non-empty key list; it stops being known when a fetch returns an
       empty list or a user-keys `404` (failures and refusals change
-      nothing). Known sources' fetches (expiry re-fetches, and re-fetches
-      on a miss, e.g. after a key rotation) use the known bucket; every
-      other fetch (never fetched, last seen empty or `404`) the first-time
-      bucket. Requests naming random handles or subdomains are all
-      first-time, so however many clients send them, they can only empty
-      the first-time bucket: the peer's existing users keep verifying.
-      New users of that peer get `503` while it lasts, which is the cost
-      that remains (see the trade-off below). Known sources are
-      remembered in a table of at most 10 000; past that, the one confirmed
-      longest ago is forgotten and is charged as first-time until a fetch
-      finds its keys again. Filling the table takes real non-empty key
-      lists, served from domains the attacker controls, each fetch paid
-      from its own client and first-time budgets.
+      nothing). Only a known source's **expiry-driven** fetch (a lookup
+      that is not `fresh` and finds no unexpired cache entry) uses the
+      known bucket. Every other fetch uses the first-time bucket: sources
+      never fetched or last seen empty or `404`, and **every `fresh`
+      re-fetch** (a key miss), whatever the source's standing. Handles are
+      public, so anyone can sign as `alice@victim.example` with a bogus
+      key id and force a re-fetch for her; charged to the known bucket,
+      three or four client addresses naming known users could keep it
+      empty, and real users' expiry re-fetches would get `503`. An expiry
+      fetch, by contrast, happens at most once per cache lifetime per
+      source however often it is named, so no amount of spam can drain
+      the known bucket faster than the peer's own documents expire.
+      Requests naming random handles or subdomains, or bogus key ids of
+      real users, can therefore only empty the first-time bucket: the
+      peer's existing users keep verifying until and across expiry.
+    - *Cost of keeping misses first-time:* a real user's key rotation is
+      seen as a key miss, so its re-fetch competes in the first-time
+      bucket. While that bucket is being emptied, a signature by the new
+      key gets `503` until a token frees up (the 60 s per-source re-fetch
+      interval and the client budget still apply as before), or until the
+      cached document expires, when the expiry re-fetch (known bucket)
+      brings the new key. Signatures by keys already cached keep working
+      throughout. New users of the peer get `503` while the spam lasts
+      too. We accept both: the alternative lets anyone who knows a peer's
+      user list lock all of them out.
+    - *Known sources are bounded per target group* (registrable domain):
+      at most **500** per group and **10 000** in all. A group at its
+      cap forgets its own source confirmed longest ago; a full table
+      forgets the oldest source of the **largest** group (on a tie, the
+      group that most recently gained a source, which is the one being
+      filled). One domain's provider serving keys for any handle can
+      therefore only cycle its own 500 entries, never push out another
+      domain's known sources, and a group is only cut back while no other
+      group is larger: with *k* groups filled by an attacker, a peer keeps
+      its known sources up to 10 000 / (*k* + 1): all of its 500 unless
+      the attacker fills 20 or more other registrable domains, each of
+      whose 500 sources had to be fetched from the attacker's own client
+      and first-time budgets.
+      500 is far more sources than the known bucket could re-fetch in a
+      short cache lifetime anyway (30 a minute); a peer with more active
+      users than that sees its longest-unconfirmed ones charged as
+      first-time, which degrades only to the first-time bucket, never to a
+      refusal. A forgotten source is first-time until a fetch finds its
+      keys again. All operations are O(log n) (per-group ordered maps and
+      a ranking of groups by size).
   - *Per client:* a token bucket per client address (the same key as the
     login rate limits: the `CLIENT_IP_HEADER` entry our proxy appends, else
     the TCP peer; IPv6 by /64), burst 10, **10 per minute**. The signature
@@ -202,13 +234,24 @@ Replaces `NoRemoteKeys` behind `ProviderKeys`' `remote` slot.
   - When a limit stops a fetch: an unexpired cached key with that `key_id`
     is still used; otherwise `503` with `Retry-After` until the fetch would
     be allowed.
-  - *Trade-off:* the per-client bound is per source address, so a botnet
-    with many addresses can still spend a peer's first-time budget (new
-    users of that peer get `503`s until it refills) and, by naming known
-    actors with fresh lookups (one re-fetch per actor per minute), its
-    known budget. Cached keys keep
-    working meanwhile, and the target bucket still caps what reaches the
-    peer, which is the property §8 requires.
+  - *Trade-off:* the per-client bound is per source address, and the
+    client rate (10 a minute) is a third of a target bucket's refill, so
+    a handful of addresses (four are enough) can keep a peer's
+    first-time buckets empty: new users of that peer, and key rotations
+    of its existing users (see above), get `503`s until the spam stops or
+    the rotated user's cached document expires. They cannot touch its
+    known buckets, which only expiry-driven fetches use. Cached keys keep
+    working meanwhile.
+  - *What reaches a peer (§8):* the target buckets cap every fetch to one
+    registrable domain at 4 × (burst 20 + 30 a minute) = a burst of
+    **80** and **120 a minute** (2 a second) at most, all four buckets
+    together, whatever the number of clients. Of that, only the two
+    first-time buckets (a burst of 40, 60 a minute) can be driven by
+    others at will; the known buckets follow the peer's own document
+    lifetimes. These are small, cacheable `GET`s, so two a second at
+    worst is negligible load for any HTTPS server, and lowering the rates
+    would cost legitimate verification first (a busy peer's expiry
+    re-fetches, new users arriving in bursts): we keep 20 / 30 per bucket.
 - **Fetch failure:** an unexpired cached key with that `key_id` is still
   used; otherwise `503` with `Retry-After: 5`. When the failed fetch was a
   `fresh` re-fetch, it started the 60 s re-fetch interval, and a retry
@@ -231,9 +274,10 @@ Replaces `NoRemoteKeys` behind `ProviderKeys`' `remote` slot.
   resolve at all (NXDOMAIN, SERVFAIL, timeout) is a network error, so a fetch
   failure (`503`), not a refusal.
 - **Bounds:** at most 10 000 cached sources, 10 000 per-source re-fetch
-  times, 10 000 known sources and 10 000 fetches in flight; past that,
-  expired entries go first, then the oldest (in flight: `503`,
-  `Retry-After: 1`). Each set of token buckets (the existing `RateLimiter`:
+  times and 10 000 fetches in flight; past that, expired entries go first,
+  then the oldest (in flight: `503`, `Retry-After: 1`). Known sources: at
+  most 500 per target group and 10 000 in all, evicted as described under
+  "Per target". Each set of token buckets (the existing `RateLimiter`:
   known and first-time user-key targets, known and first-time discovery
   targets, clients) holds at most 10 000 keys; when full it drops idle buckets and
   otherwise refuses new keys (fail closed: `503`, `Retry-After: 1`), rather

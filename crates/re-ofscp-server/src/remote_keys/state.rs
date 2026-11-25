@@ -10,6 +10,7 @@ use tokio::sync::watch;
 
 use super::document::KeySet;
 use super::fetch::{Fetched, Source};
+use super::known::KnownSources;
 
 /// Most entries in each table.
 pub const MAX_ENTRIES: usize = 10_000;
@@ -44,9 +45,9 @@ pub struct Tables {
     /// When each source was last re-fetched for a `fresh` lookup.
     refetched: HashMap<Source, i64>,
     /// Known sources: those whose last completed fetch returned a
-    /// non-empty key list, with when that fetch completed. Their fetches
-    /// are charged to the targets' known budgets (docs/decisions/0006).
-    known: HashMap<Source, i64>,
+    /// non-empty key list. Their expiry re-fetches are charged to the
+    /// targets' known budgets (docs/decisions/0006).
+    known: KnownSources,
 }
 
 impl Tables {
@@ -97,22 +98,21 @@ impl Tables {
 
     /// Whether `source` is known: its last completed fetch found keys.
     pub fn is_known(&self, source: &Source) -> bool {
-        self.known.contains_key(source)
+        self.known.contains(source)
     }
 
     /// Record the outcome of a completed fetch of `source` at `now`: it
     /// found keys (`found`), so `source` is known, or an empty list or
     /// `404`, so it is not (any more). Failures and refusals say nothing
-    /// about the source and are not recorded. Past [`MAX_ENTRIES`] the
-    /// source confirmed longest ago is forgotten; it is then charged as a
-    /// first-time lookup until a fetch finds its keys again.
+    /// about the source and are not recorded. The table is bounded per
+    /// target group and overall ([`KnownSources`]); a source it forgets is
+    /// charged as a first-time lookup until a fetch finds its keys again.
     pub fn note_found(&mut self, source: &Source, found: bool, now: i64) {
-        if !found {
-            self.known.remove(source);
-            return;
+        if found {
+            self.known.confirm(source, now);
+        } else {
+            self.known.forget(source);
         }
-        make_room(&mut self.known, source, |_| false, |&at| at);
-        self.known.insert(source.clone(), now);
     }
 
     /// Note a `fresh` re-fetch of `source` at `now`.
@@ -195,22 +195,6 @@ mod tests {
         assert!(t.is_known(&s));
         t.note_found(&s, false, 200);
         assert!(!t.is_known(&s), "an empty list or 404 forgets it");
-    }
-
-    #[test]
-    fn known_sources_are_bounded_dropping_the_longest_unconfirmed() {
-        let mut t = Tables::default();
-        for i in 0..MAX_ENTRIES {
-            t.note_found(&source(i), true, if i == 0 { 5 } else { 10 });
-        }
-        // Re-confirming an entry does not grow the table.
-        t.note_found(&source(1), true, 20);
-        assert_eq!(t.known.len(), MAX_ENTRIES);
-        t.note_found(&source(MAX_ENTRIES), true, 30);
-        assert_eq!(t.known.len(), MAX_ENTRIES);
-        assert!(!t.is_known(&source(0)), "confirmed longest ago");
-        assert!(t.is_known(&source(1)));
-        assert!(t.is_known(&source(MAX_ENTRIES)));
     }
 
     #[test]

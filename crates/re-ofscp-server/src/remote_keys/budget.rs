@@ -8,10 +8,13 @@
 //!   DNS all share one bucket). Each target has four buckets: user keys and
 //!   provider discovery apart, so requests naming random handles cannot
 //!   stop us from verifying the provider itself; and each of those split
-//!   into **known** sources (the last completed fetch found keys) and
-//!   **first-time** lookups (everything else), so requests naming random
-//!   handles or subdomains, which are all first-time, cannot spend the
-//!   budget that keeps a peer's existing users working;
+//!   into **known**, for expiry-driven fetches of known sources (the last
+//!   completed fetch found keys), and **first-time**, for everything else,
+//!   including every re-fetch on a key miss. Requests naming random
+//!   handles or subdomains, or real users with bogus key ids, are all
+//!   first-time, so they cannot spend the budget that keeps a peer's
+//!   existing users working; an expiry fetch happens at most once per
+//!   cache lifetime per source, however often it is named;
 //! * **the client** whose request caused it, at a rate well below each
 //!   target bucket's, so one anonymous client cannot keep any of a peer's
 //!   buckets empty and lock that peer's real users out.
@@ -38,13 +41,15 @@ pub const CLIENT_BURST: u32 = 10;
 /// client can never keep one empty.
 pub const CLIENT_PER_MINUTE: u32 = 10;
 
-/// Whether a fetch is for a known source (its last completed fetch found
-/// keys) or a first-time lookup; each has its own target buckets.
+/// Which of a target's buckets a fetch is charged to; each standing has
+/// its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Standing {
-    /// The last completed fetch of this source found keys.
+    /// An expiry-driven fetch (not a re-fetch on a key miss) of a source
+    /// whose last completed fetch found keys.
     Known,
-    /// Never fetched, or last found an empty list or a `404`.
+    /// Any other fetch: a source never fetched, or last found an empty
+    /// list or a `404`, and every re-fetch on a key miss.
     FirstTime,
 }
 
@@ -313,8 +318,8 @@ mod tests {
             );
         }
         // Many clients together can empty the first-time bucket, but a
-        // known source's fetch (an expiry or failure re-fetch) is charged
-        // to the known bucket and still goes through, every minute.
+        // known source's expiry re-fetch is charged to the known bucket
+        // and still goes through, every minute.
         let start = T + 300;
         for t in start..start + 300 {
             for c in 0..8 {

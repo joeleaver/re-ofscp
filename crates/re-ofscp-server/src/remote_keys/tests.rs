@@ -391,3 +391,35 @@ async fn a_busy_target_costs_no_budget_and_no_refetch_interval() {
             .is_ok()
     );
 }
+
+#[tokio::test]
+async fn a_budget_refusal_after_reserving_releases_the_in_flight_slot() {
+    let (keys, _) = resolver();
+    let drain = Source::of(&remote("xxx@remote.example.com"));
+    for i in 0..DOMAIN_BURST {
+        let c = Requester::new(format!("drain{i}"));
+        keys.inner.budgets.charge(&drain, FirstTime, &c, T).unwrap();
+    }
+    // Each lookup reserves one of the target's in-flight slots, then is
+    // refused by the empty bucket. More lookups than there are slots: had
+    // a refusal kept its slot, the later ones would be refused as busy
+    // (`Retry-After: 5`) instead.
+    let cap = OutboundConfig::new(Vec::new()).max_in_flight_per_target;
+    for i in 0..2 * cap {
+        let c = Requester::new(format!("client{i}"));
+        let signer = remote(&format!("u{i:04}@remote.example.com"));
+        assert_eq!(
+            retry_after(keys.resolve(&signer, "dk_1", false, &c).await),
+            2
+        );
+    }
+    assert!(keys.inner.tables().flights.is_empty());
+    // Every slot is free.
+    let held: Vec<_> = (0..cap)
+        .map(|i| {
+            let host = Authority::parse_canonical(&format!("h{i}.remote.example.com")).unwrap();
+            keys.inner.client.reserve(&host, "/").unwrap()
+        })
+        .collect();
+    assert_eq!(held.len(), cap);
+}
