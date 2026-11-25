@@ -66,7 +66,8 @@ async fn production_state_warms_up_for_one_skew_window() {
         .keys(Arc::new(alice_keys()))
         .ledger(Arc::new(re_ofscp_server::replay::NoLedger))
         .clock(Arc::new(FixedClock(SIGNED_AT)))
-        .build();
+        .build()
+        .unwrap();
     let app = re_ofscp_server::router(state);
     let req = Req::health().build();
     let (status, json, _, retry) = send(&app, req).await;

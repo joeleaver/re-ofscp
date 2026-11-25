@@ -1,6 +1,7 @@
 //! OFSCP request signing (spec §4.4–§4.6, §7.1, §8.1).
 //!
 //! * [`canonical`]: byte-exact canonical strings and Ed25519 sign/verify.
+//! * [`keys`]: how the verifier finds signers' public keys.
 //! * [`verify`]: the §4.5 verification pipeline.
 //! * [`authenticate`]: middleware that verifies any request carrying
 //!   `X-OFSCP-*` headers and exposes the result to handlers via
@@ -12,6 +13,7 @@
 //! treated as anonymous.
 
 pub mod canonical;
+pub mod keys;
 pub mod verify;
 
 use std::sync::Arc;
@@ -23,9 +25,9 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use re_ofscp_types::{Actor, Authority};
 
+pub use keys::{KeyError, KeyFuture, KeyResolver, Resolved, StaticKeys};
 pub use verify::{
-    Clock, KeyError, KeyFuture, KeyResolver, Precheck, RequestParts, Signer, StaticKeys,
-    SystemClock, Verified, Verifier, VerifyError,
+    Clock, Precheck, RequestParts, Signer, SystemClock, Verified, Verifier, VerifyError,
 };
 
 use crate::problem::Problem;

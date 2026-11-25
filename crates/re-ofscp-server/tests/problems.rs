@@ -19,7 +19,12 @@ fn app() -> axum::Router {
         _ => None,
     })
     .unwrap();
-    router(AppState::builder(config).ledger(Arc::new(NoLedger)).build())
+    router(
+        AppState::builder(config)
+            .ledger(Arc::new(NoLedger))
+            .build()
+            .unwrap(),
+    )
 }
 
 async fn call(req: Request<Body>) -> (StatusCode, String, Vec<u8>) {

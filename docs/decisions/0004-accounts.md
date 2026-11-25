@@ -157,8 +157,8 @@ If the key store is unreachable, verification answers `503` (retry), not
 
 `ProviderKeys` resolves this provider's actors from the store, through a
 60 s positive cache that revocation clears. A `fresh` lookup always reads the
-store. Everything else goes to a remote resolver. Until remote resolution
-with the §8 outbound rules lands, `NoRemoteKeys` refuses every remote signer.
+store. Everything else goes to the remote resolver, which fetches keys under
+the §8 outbound rules (docs/decisions/0006).
 
 ## Not here yet
 

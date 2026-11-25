@@ -11,6 +11,7 @@ pub mod db;
 pub mod outbound;
 pub mod problem;
 pub mod ratelimit;
+pub mod remote_keys;
 pub mod replay;
 pub mod signing;
 pub mod timefmt;
@@ -26,9 +27,11 @@ use re_ofscp_types::{Health, OFSCP_VERSION};
 pub use config::Config;
 pub use problem::Problem;
 
-use accounts::{Accounts, NoRemoteKeys};
+use accounts::Accounts;
 use admin::{AdminSecrets, Admins, ConsoleOrigins};
 use db::{Db, DbConfig};
+use outbound::{OutboundClient, OutboundConfig};
+use remote_keys::RemoteKeys;
 use replay::ReplayStore;
 use replay::ledger::{LedgerError, NonceLedger, RhypeLedger};
 use signing::{Clock, KeyResolver, SystemClock, Verifier};
@@ -55,12 +58,14 @@ pub struct AppState {
 }
 
 /// Builds an [`AppState`]. Defaults: the wall clock, local keys from the
-/// account store (remote signers refused until remote resolution lands), and
-/// the rhypedb-backed replay ledger.
+/// account store, remote keys fetched through the SSRF-safe outbound client
+/// configured from `OUTBOUND_ALLOW_HOSTS`, and the rhypedb-backed replay
+/// ledger.
 pub struct AppStateBuilder {
     config: Config,
     keys: Option<Arc<dyn KeyResolver>>,
-    remote_keys: Arc<dyn KeyResolver>,
+    remote_keys: Option<Arc<dyn KeyResolver>>,
+    outbound: Option<Arc<OutboundClient>>,
     ledger: Option<Arc<dyn NonceLedger>>,
     clock: Arc<dyn Clock>,
 }
@@ -78,7 +83,16 @@ impl AppStateBuilder {
     /// the account store).
     #[must_use]
     pub fn remote_keys(mut self, remote: Arc<dyn KeyResolver>) -> Self {
-        self.remote_keys = remote;
+        self.remote_keys = Some(remote);
+        self
+    }
+
+    /// Make outbound requests (remote key fetches) through `client`
+    /// instead of one built from the configuration (tests trusting a local
+    /// certificate authority).
+    #[must_use]
+    pub fn outbound(mut self, client: Arc<OutboundClient>) -> Self {
+        self.outbound = Some(client);
         self
     }
 
@@ -98,8 +112,18 @@ impl AppStateBuilder {
 
     /// Build the state. The replay store starts in its restart warm-up;
     /// [`AppState::restore_replay`] ends it once the ledger is reloaded.
-    pub fn build(self) -> AppState {
+    /// Fails only if the outbound HTTP client cannot be set up.
+    pub fn build(self) -> Result<AppState, outbound::BuildError> {
         let config = self.config;
+        let outbound = match self.outbound {
+            Some(client) => client,
+            None => Arc::new(OutboundClient::new(&OutboundConfig::new(
+                config.outbound_allow_hosts.clone(),
+            ))?),
+        };
+        let remote_keys = self
+            .remote_keys
+            .unwrap_or_else(|| Arc::new(RemoteKeys::new(outbound, self.clock.clone())));
         let db = Arc::new(Db::new(DbConfig::new(config.rhypedb_addr.clone())));
         let ledger = self
             .ledger
@@ -114,7 +138,7 @@ impl AppStateBuilder {
             config.domain.clone(),
             config.registration,
             db.clone(),
-            self.remote_keys,
+            remote_keys,
         ));
         let admins = Arc::new(Admins::new(
             config.domain.clone(),
@@ -135,13 +159,13 @@ impl AppStateBuilder {
             keys,
             self.clock,
         ));
-        AppState {
+        Ok(AppState {
             config: Arc::new(config),
             db,
             accounts,
             admins,
             verifier,
-        }
+        })
     }
 }
 
@@ -151,7 +175,8 @@ impl AppState {
         AppStateBuilder {
             config,
             keys: None,
-            remote_keys: Arc::new(NoRemoteKeys),
+            remote_keys: None,
+            outbound: None,
             ledger: None,
             clock: Arc::new(SystemClock),
         }

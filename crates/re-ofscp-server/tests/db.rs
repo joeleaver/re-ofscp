@@ -216,7 +216,8 @@ async fn nonces_survive_a_restart_and_the_warm_up_is_skipped() {
     let before = AppState::builder(config(&server))
         .keys(Arc::new(alice_keys()))
         .clock(clock.clone())
-        .build();
+        .build()
+        .unwrap();
     clock.set(SIGNED_AT);
     let app = router(before);
     assert_eq!(send(&app, Req::health().build()).await.0, StatusCode::OK);
@@ -225,7 +226,8 @@ async fn nonces_survive_a_restart_and_the_warm_up_is_skipped() {
     let after = AppState::builder(config(&server))
         .keys(Arc::new(alice_keys()))
         .clock(clock.clone())
-        .build();
+        .build()
+        .unwrap();
     assert!(after.verifier.replay_store().warming_up());
     assert_eq!(after.restore_replay().await.unwrap(), 1);
     assert!(!after.verifier.replay_store().warming_up());
@@ -260,7 +262,8 @@ async fn an_unwritable_ledger_fails_closed() {
     let state = AppState::builder(config(&server))
         .keys(Arc::new(alice_keys()))
         .clock(clock.clone())
-        .build();
+        .build()
+        .unwrap();
     state.restore_replay().await.unwrap();
     clock.set(SIGNED_AT);
     server.stop();
@@ -310,7 +313,8 @@ async fn forward_clock_step_purge_then_restart_still_refuses_the_replay() {
     let first = AppState::builder(config(&server))
         .keys(Arc::new(alice_keys()))
         .clock(clock.clone())
-        .build();
+        .build()
+        .unwrap();
     first.restore_replay().await.unwrap();
     clock.set(SIGNED_AT);
     let app = router(first.clone());
@@ -326,7 +330,8 @@ async fn forward_clock_step_purge_then_restart_still_refuses_the_replay() {
     let second = AppState::builder(config(&server))
         .keys(Arc::new(alice_keys()))
         .clock(clock.clone())
-        .build();
+        .build()
+        .unwrap();
     assert_eq!(second.restore_replay().await.unwrap(), 0);
     let app = router(second);
     let (status, json, _, _) = send(&app, Req::health().build()).await;

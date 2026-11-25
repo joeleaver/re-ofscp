@@ -21,7 +21,7 @@ use tokio::sync::{Mutex, broadcast};
 
 pub use bootstrap::{BOOTSTRAP_TTL_SECS, BootstrapTokens, IssueError};
 pub use invites::{InviteStore, InviteSummary, IssuedInvite, Revoked};
-pub use keys::{NoRemoteKeys, ProviderKeys};
+pub use keys::ProviderKeys;
 pub use password::{PasswordError, Passwords};
 pub use register::{InviteError, RegisterError};
 pub use store::{AccountStore, AccountSummary, DeviceKey, StoreError, User};

@@ -258,6 +258,28 @@ pub fn signed(
     body: &str,
     timestamp: &str,
 ) -> Request<Body> {
+    signed_as(
+        key,
+        ("x-ofscp-actor", actor),
+        key_id,
+        method,
+        path,
+        body,
+        timestamp,
+    )
+}
+
+/// [`signed`], naming the signer with `identity`: (`x-ofscp-actor`, an
+/// actor) or (`x-ofscp-provider`, an authority).
+pub fn signed_as(
+    key: &SigningKey,
+    identity: (&str, &str),
+    key_id: &str,
+    method: &str,
+    path: &str,
+    body: &str,
+    timestamp: &str,
+) -> Request<Body> {
     let digest = content_digest(body.as_bytes());
     let mut raw = [0u8; 18];
     for (i, b) in raw.iter_mut().enumerate() {
@@ -279,7 +301,7 @@ pub fn signed(
         .uri(path)
         .header("host", "providera.com")
         .header("content-type", "application/json")
-        .header("x-ofscp-actor", actor)
+        .header(identity.0, identity.1)
         .header("x-ofscp-key-id", key_id)
         .header("x-ofscp-timestamp", timestamp)
         .header("x-ofscp-nonce", nonce)
