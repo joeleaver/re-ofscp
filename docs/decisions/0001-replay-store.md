@@ -2,7 +2,7 @@
 
 - **Status:** accepted
 - **Date:** 2026-11-23; revised 2026-11-25 (private-section suffixes no
-  longer form separate groups, pending Joe's confirmation)
+  longer form separate groups; confirmed by Joe)
 - **Spec:** §4.5 "Replay store (Normative)" and "Restarts", §7.1,
   §8 "Replay prevention". The restart and retention rules arrived in
   [lost-conn/ofscp#17](https://github.com/lost-conn/ofscp/pull/17) (merged).
@@ -50,7 +50,7 @@ surface:
     `a.evil.example`, `b.evil.example:8443` and so on as unlimited separate
     domains.
   - **Private-section suffixes do not make separate domains (revised
-    2026-11-25, to be confirmed by Joe).** The PSL's private section lists
+    2026-11-25, confirmed by Joe).** The PSL's private section lists
     suffixes such as `github.io`, `duckdns.org`, `workers.dev` and
     `vercel.app`, under which anyone gets names for free. An earlier
     revision read them as public suffixes, so `alice.github.io` and

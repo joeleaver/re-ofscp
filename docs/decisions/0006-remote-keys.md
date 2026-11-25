@@ -100,8 +100,7 @@ One client for every request to a host someone else chose. Later features
     share one group: one per-target budget, one in-flight cap of 4, one
     replay quota, and one share of each table. A provider that wants its
     own needs its own registered domain, which any real deployment has
-    anyway. Recorded in 0001 for the replay quota, pending Joe's
-    confirmation.
+    anyway. Recorded in 0001 for the replay quota; confirmed by Joe.
 - **Ports.** Authorities may carry a port (§2.2), so fetches to non-443
   ports stay allowed; the port only never earns a separate limit.
 - **TLS:** rustls with the bundled Mozilla roots (`webpki-roots`), so the
