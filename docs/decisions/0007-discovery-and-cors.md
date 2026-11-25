@@ -3,7 +3,7 @@
 - **Status:** accepted
 - **Date:** 2026-11-25
 - **Spec:** §3.1 (discovery), §3.4 (CORS, settled in lost-conn/ofscp#11;
-  "Scope" in lost-conn/ofscp#21),
+  "Scope" in lost-conn/ofscp#21, merged),
   §4.1.1 (registration modes, lost-conn/ofscp#18), §8.1 (provider signing
   identity); schema `schemas/v0.1/provider-discovery.json`
 
@@ -44,13 +44,21 @@ our provider signing keys.
   The admin console uses a `SameSite=Strict` session cookie plus CSRF
   protection and stays same-origin (0005). A cross-origin preflight to it
   gets no `204` and no CORS headers, so browsers refuse the request.
-  This follows §3.4 "Scope" (lost-conn/ofscp#21, in review): the CORS
+  This follows §3.4 "Scope" (lost-conn/ofscp#21, merged): the CORS
   requirements cover the endpoints the spec defines plus every
-  `/.well-known/ofscp…` document. A provider's own non-standard endpoints,
-  even under `/api/`, are outside them. A provider SHOULD NOT open an
-  endpoint that uses ambient credentials cross-origin, and MUST NOT put a
-  non-standard endpoint at a path the spec defines (`/api/admin/…` takes
-  none).
+  `/.well-known/ofscp…` document. A request is in scope when its method
+  and path match a spec endpoint template, each `{…}` matching exactly one
+  segment; no template begins `/api/{…}`, so `/api/admin/…` matches none,
+  while every other `/api/` path keeps CORS (a superset of the templates).
+  A provider's own non-standard endpoints, even under `/api/`, are outside
+  them. A provider SHOULD NOT open an endpoint that uses ambient
+  credentials cross-origin, and MUST NOT put a non-standard endpoint at a
+  path the spec defines (`/api/admin/…` takes none).
+- **Media and uploads (future):** when attachments land, attachment `url`s
+  and pre-signed `uploadUrl`s need `Access-Control-Allow-Origin: *`
+  (never `Allow-Credentials`) wherever they are hosted, and an `uploadUrl`
+  preflight must allow `PUT` and `content-type` plus whatever the storage
+  needs (§3.4 "Scope"). The `X-OFSCP-*` headers are not required there.
 
 ### Provider signing key (§8.1)
 
