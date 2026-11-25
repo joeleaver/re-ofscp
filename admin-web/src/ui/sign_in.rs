@@ -68,11 +68,10 @@ pub fn SignIn() -> NodeHandle {
                         oninput: move |v: String| username.set(v),
                         onsubmit: submit,
                     }
-                    TextInput {
+                    PasswordInput {
                         label: "Password",
-                        input_type: "password",
+                        toggle_visibility: false,
                         autocomplete: "current-password",
-                        spellcheck: false,
                         value_fn: move || password.get(),
                         oninput: move |v: String| password.set(v),
                         onsubmit: submit,

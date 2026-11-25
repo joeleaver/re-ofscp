@@ -164,9 +164,8 @@ pub fn CopyButton(text: String) -> NodeHandle {
 }
 
 /// The six-digit authenticator code field. Its `autocomplete` token lets
-/// the browser offer a code it has received. rinch's `TextInput` has no
-/// `inputmode` prop, so phones show their full keyboard here rather than a
-/// numeric keypad.
+/// the browser offer a code it has received, and `inputmode` brings up a
+/// numeric keypad on phones.
 #[component]
 pub fn CodeInput(label: String, value: Signal<String>, onsubmit: Callback) -> NodeHandle {
     rsx! {
@@ -174,6 +173,7 @@ pub fn CodeInput(label: String, value: Signal<String>, onsubmit: Callback) -> No
             label: label.clone(),
             placeholder: "123 456",
             autocomplete: "one-time-code",
+            inputmode: "numeric",
             spellcheck: false,
             value_fn: move || value.get(),
             oninput: move |v: String| value.set(v),

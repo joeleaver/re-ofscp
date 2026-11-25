@@ -172,19 +172,20 @@ pub fn AdminsScreen() -> NodeHandle {
     let mut loading: Option<TaskHandle> = None;
     Effect::new(move || {
         reload.get();
-        // Only the request signal is tracked. The writes below re-render
-        // what shows the result, and those renders' reads must not become
-        // this effect's dependencies (they made each request go out twice).
-        untracked(|| {
-            if !can(current_role(session), Action::ManageAdmins) {
-                return;
-            }
-            if let Some(previous) = loading.take() {
-                previous.abort();
-            }
-            list.set(Load::Loading);
-            loading = Some(spawn_local(load(session, list)));
-        });
+        // The role is read untracked: the roster loads when `reload` asks,
+        // not whenever the session changes. An admin who changes their own
+        // role refreshes the session and then sets `reload`; tracking the
+        // role would list the roster twice. The `reload` that follows still
+        // sees the new role, so an owner who demotes themselves stops
+        // listing.
+        if !can(untracked(|| current_role(session)), Action::ManageAdmins) {
+            return;
+        }
+        if let Some(previous) = loading.take() {
+            previous.abort();
+        }
+        list.set(Load::Loading);
+        loading = Some(spawn_local(load(session, list)));
     });
 
     let me = move || session.info().map(|i| i.username).unwrap_or_default();
@@ -414,12 +415,11 @@ fn CreateAdminForm(on_close: Callback, on_created: InputCallback) -> NodeHandle 
                 spellcheck: false,
                 autocomplete: "off",
             }
-            TextInput {
+            PasswordInput {
                 label: "Initial password",
+                toggle_visibility: false,
                 description: "At least 8 characters. They must replace it at first sign-in.",
-                input_type: "password",
                 autocomplete: "new-password",
-                spellcheck: false,
                 value_fn: move || password.get(),
                 oninput: move |v: String| password.set(v),
                 onsubmit: submit.clone(),

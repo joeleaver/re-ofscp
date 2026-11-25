@@ -76,35 +76,25 @@ pub fn AccountsScreen() -> NodeHandle {
     let mut searching: Option<TaskHandle> = None;
     Effect::new(move || {
         let q = searched.get();
-        // Only the request signal is tracked. The writes below re-render
-        // what shows the result, and those renders' reads must not become
-        // this effect's dependencies (they made each request go out twice).
-        untracked(|| {
-            if let Some(previous) = searching.take() {
-                previous.abort();
-            }
-            list.set(Load::Loading);
-            searching = Some(spawn_local(search(session, q, list)));
-        });
+        if let Some(previous) = searching.take() {
+            previous.abort();
+        }
+        list.set(Load::Loading);
+        searching = Some(spawn_local(search(session, q, list)));
     });
     let mut fetching: Option<TaskHandle> = None;
     Effect::new(move || {
         let handle = viewing.get();
-        // Only the request signal is tracked. The writes below re-render
-        // what shows the result, and those renders' reads must not become
-        // this effect's dependencies (they made each request go out twice).
-        untracked(|| {
-            if let Some(previous) = fetching.take() {
-                previous.abort();
+        if let Some(previous) = fetching.take() {
+            previous.abort();
+        }
+        match handle {
+            Some(handle) => {
+                shown.set(Some(Load::Loading));
+                fetching = Some(spawn_local(view(session, handle, shown)));
             }
-            match handle {
-                Some(handle) => {
-                    shown.set(Some(Load::Loading));
-                    fetching = Some(spawn_local(view(session, handle, shown)));
-                }
-                None => shown.set(None),
-            }
-        });
+            None => shown.set(None),
+        }
     });
 
     // Search for what the query field holds. It also reloads the list after
@@ -335,12 +325,11 @@ fn CreateAccountForm(on_close: Callback, on_created: InputCallback) -> NodeHandl
                 value_fn: move || display_name.get(),
                 oninput: move |v: String| display_name.set(v),
             }
-            TextInput {
+            PasswordInput {
                 label: "Initial password",
+                toggle_visibility: false,
                 description: "At least 8 characters. Share it with the account's owner securely.",
-                input_type: "password",
                 autocomplete: "new-password",
-                spellcheck: false,
                 value_fn: move || password.get(),
                 oninput: move |v: String| password.set(v),
                 onsubmit: submit.clone(),

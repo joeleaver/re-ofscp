@@ -56,16 +56,11 @@ pub fn InvitesScreen() -> NodeHandle {
     let mut loading: Option<TaskHandle> = None;
     Effect::new(move || {
         reload.get();
-        // Only the request signal is tracked. The writes below re-render
-        // what shows the result, and those renders' reads must not become
-        // this effect's dependencies (they made each request go out twice).
-        untracked(|| {
-            if let Some(previous) = loading.take() {
-                previous.abort();
-            }
-            list.set(Load::Loading);
-            loading = Some(spawn_local(load(session, list)));
-        });
+        if let Some(previous) = loading.take() {
+            previous.abort();
+        }
+        list.set(Load::Loading);
+        loading = Some(spawn_local(load(session, list)));
     });
 
     let may = move |a: Action| can(current_role(session), a);
