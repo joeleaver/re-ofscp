@@ -424,13 +424,30 @@ async fn a_budget_refusal_after_reserving_releases_the_in_flight_slot() {
     assert_eq!(held.len(), cap);
 }
 
+/// A document holding `key` as `dk_1`.
+fn one_key(key: ed25519_dalek::VerifyingKey) -> Arc<KeySet> {
+    Arc::new([("dk_1".to_owned(), key)].into_iter().collect())
+}
+
+/// Every one of `victims` is served `key` from cache, with no fetch.
+async fn all_cached(keys: &RemoteKeys, victims: &[Signer], key: ed25519_dalek::VerifyingKey) {
+    for victim in victims {
+        assert_eq!(
+            keys.resolve(victim, "dk_1", false, &client()).await,
+            Ok(Resolved::cached(Some(key)))
+        );
+    }
+    assert!(keys.inner.tables().flights.is_empty());
+}
+
 #[tokio::test]
 async fn a_flood_of_another_domains_documents_leaves_a_peers_cache_intact() {
     // An attacker's providers serve keys for any handle, so it can have us
-    // cache as many documents as it likes, all newer than the peer's: far
-    // past one group's quota, and past the whole table's across domains.
+    // cache as many documents as it likes, all newer than the peer's: twice
+    // the table's worth in one domain, then more spread over several.
     let (keys, _) = resolver();
     let key = SigningKey::from_bytes(&[5; 32]).verifying_key();
+    let evil_key = SigningKey::from_bytes(&[6; 32]).verifying_key();
     let victims: Vec<_> = (0..50)
         .map(|i| remote(&format!("user{i}@victim.example")))
         .collect();
@@ -439,24 +456,39 @@ async fn a_flood_of_another_domains_documents_leaves_a_peers_cache_intact() {
     }
     {
         let mut tables = keys.inner.tables();
-        for i in 0..3 * state::MAX_CACHED_PER_GROUP {
+        for i in 0..2 * state::MAX_CACHED {
             let source = Source::of(&remote(&format!("rrr{i}@evil.example")));
-            tables.store(&source, Arc::new(KeySet::new()), Some(T + 3600), T + 1);
+            tables.store(&source, one_key(evil_key), Some(T + 3600), T + 1);
         }
-        let domains = state::MAX_CACHED / state::MAX_CACHED_PER_GROUP + 5;
-        for d in 0..domains {
-            for i in 0..state::MAX_CACHED_PER_GROUP {
+        for d in 0..5 {
+            for i in 0..1_000 {
                 let source = Source::of(&remote(&format!("rrr{i}@evil{d}.example")));
-                tables.store(&source, Arc::new(KeySet::new()), Some(T + 3600), T + 2);
+                tables.store(&source, one_key(evil_key), Some(T + 3600), T + 2);
             }
         }
     }
-    // Every victim is still served from cache: no fetch, no budget.
+    all_cached(&keys, &victims, key).await;
+}
+
+#[tokio::test]
+async fn a_flood_of_negatives_leaves_a_peers_cached_documents_intact() {
+    // A peer with more users than any per-group cap ever was, all cached;
+    // then an attacker names thousands of handles at the same domain that
+    // do not exist, each answered by a cacheable 404 or empty list.
+    let (keys, _) = resolver();
+    let key = SigningKey::from_bytes(&[5; 32]).verifying_key();
+    let victims: Vec<_> = (0..1_000)
+        .map(|i| remote(&format!("user{i}@victim.example")))
+        .collect();
     for victim in &victims {
-        assert_eq!(
-            keys.resolve(victim, "dk_1", false, &client()).await,
-            Ok(Resolved::cached(Some(key)))
-        );
+        cache(&keys, victim, key, T + 3600);
     }
-    assert!(keys.inner.tables().flights.is_empty());
+    {
+        let mut tables = keys.inner.tables();
+        for i in 0..5 * state::MAX_NEGATIVE {
+            let source = Source::of(&remote(&format!("ghost{i}@victim.example")));
+            tables.store(&source, Arc::new(KeySet::new()), Some(T + 3600), T + 1);
+        }
+    }
+    all_cached(&keys, &victims, key).await;
 }

@@ -1,18 +1,23 @@
-//! A table of sources bounded per target group (registrable domain) as well
-//! as overall, so that one domain cannot push every other domain's entries
-//! out (docs/decisions/0006). Anyone running a provider that serves keys
-//! for any handle can fill a table with its own sources; the per-group cap
-//! keeps that to its own share. Both the cached documents and the known
-//! sources are kept in one.
+//! A table of sources grouped by target group (registrable domain) and
+//! bounded overall, optionally also per group, so that one domain cannot
+//! push every other domain's entries out (docs/decisions/0006). Anyone
+//! running a provider that serves keys for any handle can fill a table with
+//! its own sources; eviction makes that group pay for its own growth. The
+//! cached documents, the cached negatives, the known sources and the
+//! re-fetch times are each kept in one.
 //!
 //! Making room for a new entry:
 //!
-//! * a group at its cap gives up **its own** entry: an expired one if it
-//!   has any, else the one stored longest ago;
-//! * a full table gives up an expired entry of any group if there is one,
-//!   else the oldest entry of the **largest** group (on a tie, the one that
-//!   most recently gained an entry), so a group is only ever cut back while
-//!   no other group is bigger.
+//! * with a per-group cap, a group at its cap gives up **its own** entry:
+//!   an expired one if it has any, else the one stored longest ago;
+//! * a full table gives up an expired entry of any group if there is one
+//!   (an expired entry is never used, so dropping it costs nobody
+//!   anything); else the inserting group gives up its own entry (expired
+//!   first, else its oldest) if no other group is larger than it, and
+//!   otherwise the **largest** group (on a tie, the one that most recently
+//!   gained an entry) gives up its oldest. A group is therefore only ever
+//!   cut back while no other group is bigger, and never to make room for a
+//!   group that would then be bigger than it.
 //!
 //! Eviction only ever removes an entry; it never changes another entry's
 //! expiry (lost-conn/ofscp#20). Every operation is O(log n).
@@ -60,7 +65,8 @@ struct Group {
     grown: u64,
 }
 
-/// Entries keyed by source, bounded per target group and overall.
+/// Entries keyed by source, bounded overall and optionally per target
+/// group.
 pub struct Grouped<V> {
     slots: HashMap<Source, Slot<V>>,
     groups: HashMap<Arc<str>, Group>,
@@ -69,22 +75,32 @@ pub struct Grouped<V> {
     /// Every entry that expires, soonest first.
     expiries: BTreeMap<Expiry, Source>,
     seq: u64,
-    per_group: usize,
+    /// Most entries of one group, if groups are capped.
+    per_group: Option<usize>,
     total: usize,
 }
 
 impl<V> Grouped<V> {
-    /// A table holding at most `per_group` entries of one target group and
-    /// `total` in all.
-    pub fn with_caps(per_group: usize, total: usize) -> Self {
+    /// A table holding at most `total` entries, any number of them in one
+    /// target group while there is room.
+    pub fn with_total(total: usize) -> Self {
         Self {
             slots: HashMap::new(),
             groups: HashMap::new(),
             ranks: BTreeSet::new(),
             expiries: BTreeMap::new(),
             seq: 0,
-            per_group: per_group.max(1),
+            per_group: None,
             total: total.max(1),
+        }
+    }
+
+    /// A table holding at most `per_group` entries of one target group and
+    /// `total` in all.
+    pub fn with_caps(per_group: usize, total: usize) -> Self {
+        Self {
+            per_group: Some(per_group.max(1)),
+            ..Self::with_total(total)
         }
     }
 
@@ -163,7 +179,7 @@ impl<V> Grouped<V> {
     /// Make room for a new entry of group `name` at `now`.
     fn make_room(&mut self, name: &Arc<str>, now: i64) {
         let size = self.groups.get(name).map_or(0, |g| g.by_age.len());
-        if size >= self.per_group {
+        if self.per_group.is_some_and(|cap| size >= cap) {
             self.evict_from(name, now);
             return;
         }
@@ -175,9 +191,16 @@ impl<V> Grouped<V> {
         {
             let source = source.clone();
             self.remove(&source);
-        } else if let Some((_, _, largest)) = self.ranks.last().cloned() {
-            self.evict_from(&largest, now);
+            return;
         }
+        // The inserting group gives way itself unless another group is
+        // larger than it: cutting back an equal group would leave it the
+        // smaller of the two.
+        let victim = match self.ranks.last() {
+            Some((largest, _, other)) if *largest > size => other.clone(),
+            _ => name.clone(),
+        };
+        self.evict_from(&victim, now);
     }
 
     /// Remove one entry of group `name`: an expired one at `now` if there
@@ -261,7 +284,7 @@ impl<V> Grouped<V> {
         assert!(self.slots.len() <= self.total);
         for (name, group) in &self.groups {
             assert!(!group.by_age.is_empty());
-            assert!(group.by_age.len() <= self.per_group);
+            assert!(self.per_group.is_none_or(|cap| group.by_age.len() <= cap));
             assert!(
                 self.ranks
                     .contains(&(group.by_age.len(), group.grown, name.clone()))
@@ -427,6 +450,76 @@ mod tests {
         assert!(!t.contains(&user("aaa@one.example")));
         assert_eq!(t.get(&user("bbb@one.example")), Some((&(), Some(200))));
         assert_eq!(t.get(&user("ccc@two.example")), Some((&(), Some(300))));
+        t.assert_consistent();
+    }
+
+    #[test]
+    fn an_uncapped_group_keeps_all_its_entries_while_there_is_room() {
+        let mut t = Grouped::with_total(10_000);
+        t.insert(&user("alice@other.example"), (), Some(100_000), 0);
+        for i in 0..2_000 {
+            t.insert(
+                &user(&format!("user{i}@big.example")),
+                (),
+                Some(100_000),
+                1 + i,
+            );
+        }
+        assert_eq!(t.group_len("big.example"), 2_000);
+        assert_eq!(t.len(), 2_001);
+        t.assert_consistent();
+    }
+
+    #[test]
+    fn a_full_uncapped_table_cuts_back_the_attackers_larger_group() {
+        let mut t = Grouped::with_total(100);
+        let victims: Vec<_> = (0..30)
+            .map(|i| user(&format!("user{i}@victim.example")))
+            .collect();
+        for (i, v) in victims.iter().enumerate() {
+            t.insert(v, (), Some(100_000), i as i64);
+        }
+        // The attacker's group grows past the victim's and fills the
+        // table; from then on it cycles its own entries.
+        for i in 0..500 {
+            t.insert(
+                &user(&format!("rrr{i}@evil.example")),
+                (),
+                Some(100_000),
+                100 + i,
+            );
+        }
+        assert_eq!(t.len(), 100);
+        assert!(victims.iter().all(|v| t.contains(v)));
+        assert_eq!(t.group_len("evil.example"), 70);
+        assert!(t.contains(&user("rrr499@evil.example")));
+        // The victim's group, the smaller, grows at the attacker's expense.
+        for i in 30..40 {
+            t.insert(
+                &user(&format!("user{i}@victim.example")),
+                (),
+                Some(100_000),
+                1000 + i,
+            );
+        }
+        assert_eq!(t.group_len("victim.example"), 40);
+        assert_eq!(t.group_len("evil.example"), 60);
+        t.assert_consistent();
+    }
+
+    #[test]
+    fn a_full_table_never_cuts_back_an_equal_group_for_the_inserting_one() {
+        let mut t = Grouped::with_total(4);
+        t.insert(&user("aaa@one.example"), (), None, 1);
+        t.insert(&user("bbb@one.example"), (), None, 2);
+        t.insert(&user("ccc@two.example"), (), None, 3);
+        t.insert(&user("ddd@two.example"), (), None, 4);
+        // two.example grew last, but one.example would be the larger after
+        // the insert: it gives way itself.
+        t.insert(&user("eee@one.example"), (), None, 5);
+        assert!(!t.contains(&user("aaa@one.example")));
+        assert_eq!(t.group_len("one.example"), 2);
+        assert_eq!(t.group_len("two.example"), 2);
         t.assert_consistent();
     }
 }

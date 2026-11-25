@@ -2,36 +2,34 @@
 //! non-empty key list (docs/decisions/0006). Their expiry re-fetches are
 //! charged to the targets' known budgets.
 //!
-//! The table is a [`Grouped`] one, bounded per target group (registrable
-//! domain) as well as overall, so that one domain cannot push every other
-//! domain's sources out. Known sources never expire, so a group at
-//! [`MAX_KNOWN_PER_GROUP`] forgets its own source confirmed longest ago,
-//! and a full table ([`MAX_KNOWN`]) the one confirmed longest ago in the
-//! largest group. Every operation is O(log n).
+//! The table is a [`Grouped`] one, grouped by target group (registrable
+//! domain) and bounded overall ([`MAX_KNOWN`]). A group may hold any number
+//! of sources while there is room, so a peer with many active users keeps
+//! them all. Known sources never expire, so a full table forgets a source
+//! of the largest group (the inserting group's own if none is larger),
+//! confirmed longest ago: one domain cannot push another domain's sources
+//! out by filling the table with its own. Every operation is O(log n).
 
 use super::fetch::Source;
 use super::grouped::Grouped;
 use super::state::MAX_ENTRIES;
 
-/// Most known sources in one target group.
-pub const MAX_KNOWN_PER_GROUP: usize = 500;
 /// Most known sources in all.
 pub const MAX_KNOWN: usize = MAX_ENTRIES;
 
-/// The known sources, bounded per target group and overall.
+/// The known sources, grouped by target group and bounded overall.
 pub struct KnownSources(Grouped<()>);
 
 impl Default for KnownSources {
     fn default() -> Self {
-        Self::with_caps(MAX_KNOWN_PER_GROUP, MAX_KNOWN)
+        Self::with_total(MAX_KNOWN)
     }
 }
 
 impl KnownSources {
-    /// A table holding at most `per_group` sources of one target group and
-    /// `total` in all.
-    pub fn with_caps(per_group: usize, total: usize) -> Self {
-        Self(Grouped::with_caps(per_group, total))
+    /// A table holding at most `total` sources.
+    pub fn with_total(total: usize) -> Self {
+        Self(Grouped::with_total(total))
     }
 
     /// Whether `source` is known.
@@ -46,7 +44,7 @@ impl KnownSources {
     }
 
     /// Record that a fetch of `source` found keys at `now`, making room
-    /// first if it is new and its group or the table is full.
+    /// first if it is new and the table is full.
     pub fn confirm(&mut self, source: &Source, now: i64) {
         self.0.insert(source, (), None, now);
     }
@@ -88,30 +86,17 @@ mod tests {
     }
 
     #[test]
-    fn a_full_group_forgets_its_own_longest_unconfirmed_source() {
-        let mut k = KnownSources::with_caps(3, 100);
-        let victim = user("alice@victim.example");
-        k.confirm(&victim, 1);
-        for i in 0..3 {
-            k.confirm(&user(&format!("uuu{i}@evil.example")), 10 + i);
+    fn a_large_peer_keeps_all_its_sources_while_there_is_room() {
+        let mut k = KnownSources::default();
+        for i in 0..2_000 {
+            k.confirm(&user(&format!("user{i}@big.example")), i);
         }
-        // u0 is re-confirmed, so u1 is now the longest unconfirmed.
-        k.confirm(&user("uuu0@evil.example"), 20);
-        k.confirm(&user("uuu3@a.evil.example:8443"), 30);
-        assert!(!k.contains(&user("uuu1@evil.example")));
-        for id in [
-            "uuu0@evil.example",
-            "uuu2@evil.example",
-            "uuu3@a.evil.example:8443",
-        ] {
-            assert!(k.contains(&user(id)), "{id}");
-        }
-        assert!(k.contains(&victim), "another group is untouched");
+        assert_eq!(size(&k, "big.example"), 2_000);
         assert_consistent(&k);
     }
 
     #[test]
-    fn one_group_filling_its_quota_and_beyond_leaves_other_groups_intact() {
+    fn a_flood_of_another_domains_sources_leaves_a_peers_intact() {
         let mut k = KnownSources::default();
         let peers: Vec<_> = (0..50)
             .map(|i| user(&format!("user{i}@victim.example")))
@@ -119,13 +104,13 @@ mod tests {
         for (i, peer) in peers.iter().enumerate() {
             k.confirm(peer, i as i64);
         }
-        // An attacker's provider serves keys for any handle: thousands of
-        // its sources are confirmed, far past its group's quota, all more
-        // recently than the victim's.
-        for i in 0..5 * MAX_KNOWN_PER_GROUP {
+        // An attacker's provider serves keys for any handle: twice the
+        // table's worth of its sources are confirmed, all more recently
+        // than the victim's.
+        for i in 0..2 * MAX_KNOWN {
             k.confirm(&user(&format!("rrr{i}@evil.example")), 1000 + i as i64);
         }
-        assert_eq!(k.len(), peers.len() + MAX_KNOWN_PER_GROUP);
+        assert_eq!(k.len(), MAX_KNOWN);
         assert!(peers.iter().all(|p| k.contains(p)));
         assert_consistent(&k);
     }
@@ -136,7 +121,7 @@ mod tests {
 
     #[test]
     fn a_full_table_cuts_back_the_largest_group() {
-        let mut k = KnownSources::with_caps(5, 10);
+        let mut k = KnownSources::with_total(10);
         // victim: 3 sources; evil and bad: 5 each would overflow the table.
         for i in 0..3 {
             k.confirm(&user(&format!("vvv{i}@victim.example")), i);
@@ -148,8 +133,8 @@ mod tests {
             k.confirm(&user(&format!("bbb{i}@bad.example")), 20 + i);
         }
         assert_eq!(k.len(), 10);
-        // Past the total, the largest group gave way each time (on a tie,
-        // the one that grew last), never the smaller victim group.
+        // Past the total, the largest group gave way each time, never the
+        // smaller victim group.
         for i in 0..3 {
             assert!(k.contains(&user(&format!("vvv{i}@victim.example"))));
         }

@@ -128,7 +128,8 @@ Replaces `NoRemoteKeys` behind `ProviderKeys`' `remote` slot.
   `max-age`, and not at all for `no-store`, `no-cache` or `max-age=0`. A
   user-keys `404` has no `cache_until`, so its `Cache-Control` decides in the
   same way. `404` and empty lists are cached (a key miss still re-fetches,
-  below). An uncacheable answer replaces what was cached. Failures and
+  below), as *negatives* in a table of their own (see "Per target"). An
+  uncacheable answer replaces what was cached. Failures and
   refusals are never cached.
 - **Single flight.** Concurrent lookups for the same source wait for one
   fetch and share its result.
@@ -190,45 +191,60 @@ Replaces `NoRemoteKeys` behind `ProviderKeys`' `remote` slot.
       throughout. New users of the peer get `503` while the spam lasts
       too. We accept both: the alternative lets anyone who knows a peer's
       user list lock all of them out.
-    - *Known sources are bounded per target group* (registrable domain):
-      at most **500** per group and **10 000** in all. A group at its
-      cap forgets its own source confirmed longest ago; a full table
-      forgets the oldest source of the **largest** group (on a tie, the
-      group that most recently gained a source, which is the one being
-      filled). One domain's provider serving keys for any handle can
-      therefore only cycle its own 500 entries, never push out another
-      domain's known sources, and a group is only cut back while no other
-      group is larger: with *k* groups filled by an attacker, a peer keeps
-      its known sources up to 10 000 / (*k* + 1): all of its 500 unless
-      the attacker fills 20 or more other registrable domains, each of
-      whose 500 sources had to be fetched from the attacker's own client
-      and first-time budgets.
-      500 is far more sources than the known bucket could re-fetch in a
-      short cache lifetime anyway (30 a minute); a peer with more active
-      users than that sees its longest-unconfirmed ones charged as
-      first-time, which degrades only to the first-time bucket, never to a
-      refusal. A forgotten source is first-time until a fetch finds its
-      keys again. All operations are O(log n) (per-group ordered maps and
-      a ranking of groups by size).
-    - *Cached documents are bounded the same way,* and for the same
-      reason: with one global table evicting its oldest entry, a provider
-      serving keys for any handle could have us cache 10 000 of its own
-      documents and push out every peer's, after which each of the peer's
-      users' next ordinary lookup costs an expiry fetch from the peer's
-      known bucket, and is refused once that bucket is empty: the
-      starvation the budgets exist to prevent. The cache holds at most
-      **500** documents per target group and **10 000** in all. A group at
-      its cap gives up its own expired document if it has one, else its
-      own stored longest ago; a full cache gives up an expired document of
-      any group if there is one, else the oldest of the largest group (on
-      a tie, the one that most recently gained a document). The arithmetic
-      is that of the known sources above: a peer keeps its cached
-      documents unless an attacker fills 20 or more other registrable
-      domains, each through its own client and first-time budgets. Both
-      tables share one implementation (`remote_keys/grouped.rs`).
-      Eviction only removes a document; it never extends another's life
-      (#20), and it never touches the fetches in flight, so lookups keep
-      joining a fetch under way whatever the cache holds.
+    - *Known sources are bounded overall and grouped by target group*
+      (registrable domain): at most **10 000** in all, any number of them
+      in one group while there is room, so a peer with thousands of
+      active users keeps all of them known. A full table forgets a source
+      of the **largest** group, the one confirmed longest ago (on a tie,
+      the group that most recently gained a source); the inserting group
+      gives up its own instead whenever no other group is larger than it,
+      so a group is never cut back to make room for one that would then
+      be bigger. One domain's provider serving keys for any handle can
+      therefore grow only until it is the largest group, then cycles its
+      own entries; it never pushes out a smaller domain's known sources.
+      With *k* groups filled by an attacker, a peer keeps its known
+      sources up to 10 000 / (*k* + 1), and each of those groups' sources
+      had to be fetched from the attacker's own client and first-time
+      budgets. A forgotten source is first-time until a fetch finds its
+      keys again, which degrades only to the first-time bucket, never to
+      a refusal. (An earlier revision also capped each group at 500; a
+      peer with more active users than that evicted its own users even
+      while the table was mostly empty, so the per-group cap was
+      dropped.) All operations are O(log n) (per-group ordered maps and a
+      ranking of groups by size).
+    - *Cached documents with keys are bounded the same way,* and for the
+      same reason: with one global table evicting its oldest entry, a
+      provider serving keys for any handle could have us cache 10 000 of
+      its own documents and push out every peer's, after which each of
+      the peer's users' next ordinary lookup costs an expiry fetch from
+      the peer's known bucket, and is refused once that bucket is empty:
+      the starvation the budgets exist to prevent. The cache holds at
+      most **10 000** documents, any number of one group while there is
+      room. A full cache gives up an expired document of any group if
+      there is one (an expired document is never used, #20), else the
+      oldest of the largest group as above.
+    - *Cached negatives (empty lists and user-keys `404`s) have a table of
+      their own:* at most **100** per target group and **2 000** in all.
+      Anyone can have us cache a negative for any domain by naming random
+      handles at it, each fetch charged to the first-time bucket. Kept in
+      the same table as documents, those negatives would fill the victim
+      domain's share and each new one would evict one of its real users'
+      documents, whose next lookup then costs a known-bucket fetch: the
+      starvation above, reopened through the victim's own group. In a
+      separate table a negative can only ever displace another negative.
+      A group at its cap gives up its own expired negative if it has one,
+      else its own oldest; a full table evicts as above. A negative
+      pushed out costs at most one first-time fetch for a handle that has
+      no keys. A source is in at most one of the two tables: storing a
+      document drops its negative and vice versa, and an uncacheable
+      answer drops both. Lookups consult both, on the same terms: only an
+      unexpired entry is used (#20).
+    - All four of the resolver's per-source tables (documents,
+      negatives, known sources and the re-fetch times below) share one
+      implementation (`remote_keys/grouped.rs`). Eviction only removes an
+      entry; it never extends another's life (#20), and it never touches
+      the fetches in flight, so lookups keep joining a fetch under way
+      whatever the cache holds.
   - *Per client:* a token bucket per client address (the same key as the
     login rate limits: the `CLIENT_IP_HEADER` entry our proxy appends, else
     the TCP peer; IPv6 by /64), burst 10, **10 per minute**. The signature
@@ -292,13 +308,16 @@ Replaces `NoRemoteKeys` behind `ProviderKeys`' `remote` slot.
   only discovered by a lookup, which does take tokens. A name that fails to
   resolve at all (NXDOMAIN, SERVFAIL, timeout) is a network error, so a fetch
   failure (`503`), not a refusal.
-- **Bounds:** at most 10 000 per-source re-fetch times and 10 000
-  fetches in flight; past that, expired re-fetch times go first, then the
-  oldest (in flight: `503`, `Retry-After: 1`). Cached documents and known
-  sources: at most 500 per target group and 10 000 in all, evicted as
-  described under "Per target" (expired documents first, within the full
-  group or, for a full cache, anywhere; then the oldest of the full group
-  or of the largest group). Each set of token buckets (the existing `RateLimiter`:
+- **Bounds:** at most 10 000 fetches in flight (past that, `503`,
+  `Retry-After: 1`). At most 10 000 per-source re-fetch times, each
+  expiring when its 60 s interval ends and grouped by target group like
+  the cache: past that, an expired one goes first, then the oldest of the
+  largest group (every operation O(log n)). Cached documents and known
+  sources: at most 10 000 each, any number per group while there is room;
+  cached negatives: at most 100 per target group and 2 000 in all; all
+  evicted as described under "Per target" (an expired entry anywhere
+  first, then, for negatives, the full group's own oldest; then the oldest
+  of the largest group, or of the inserting group if none is larger). Each set of token buckets (the existing `RateLimiter`:
   known and first-time user-key targets, known and first-time discovery
   targets, clients) holds at most 10 000 keys; when full it drops idle buckets and
   otherwise refuses new keys (fail closed: `503`, `Retry-After: 1`), rather
