@@ -7,7 +7,7 @@ use axum::http::StatusCode;
 use re_ofscp_types::{Actor, Authority};
 
 use super::document::{self, KeySet};
-use crate::outbound::{OutboundClient, OutboundError};
+use crate::outbound::{OutboundClient, OutboundError, Reservation};
 use crate::signing::Signer;
 
 /// Where a signer's keys are published. Identity is the full actor or
@@ -69,11 +69,17 @@ pub enum Fetched {
     Refused(String),
 }
 
-/// Fetch `source` and classify the answer. `now` reads the clock once the
-/// response is in (unix seconds).
-pub async fn fetch(client: &OutboundClient, source: &Source, now: impl FnOnce() -> i64) -> Fetched {
+/// Fetch `source` through `reservation` (made by `client` for
+/// `source.host()` and `source.path()`) and classify the answer. `now`
+/// reads the clock once the response is in (unix seconds).
+pub async fn fetch(
+    client: &OutboundClient,
+    source: &Source,
+    reservation: Reservation,
+    now: impl FnOnce() -> i64,
+) -> Fetched {
     let host = source.host();
-    let res = match client.get(host, &source.path()).await {
+    let res = match client.get_reserved(reservation).await {
         Ok(res) => res,
         Err(OutboundError::Refused(why)) => return Fetched::Refused(why),
         Err(e) => return Fetched::Failed(e.to_string()),

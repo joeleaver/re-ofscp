@@ -1,118 +1,19 @@
 //! Remote key resolution (spec §4.6, §8.1, lost-conn/ofscp#19 and #20,
 //! docs/decisions/0006) against a local https peer, on an injected clock.
+//! The fetch budgets are in `remote_keys_budgets.rs`.
 
 mod common;
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::harness::{SIGNED_AT, SettableClock, new_key};
+use common::harness::new_key;
+use common::key_setup::{Setup, cached, client, fetched, unavailable};
 use common::remote_peer::{DISCOVERY_PATH, RemotePeer, Reply, discovery_doc, keys_doc, keys_path};
-use ed25519_dalek::VerifyingKey;
-use re_ofscp_server::outbound::OutboundClient;
-use re_ofscp_server::remote_keys::RemoteKeys;
-use re_ofscp_server::signing::{KeyError, KeyResolver, Requester, Resolved, Signer};
+use re_ofscp_server::signing::{KeyError, KeyResolver, Signer};
 use re_ofscp_server::timefmt::rfc3339;
 use re_ofscp_types::Actor;
 use serde_json::json;
-
-struct Setup {
-    peer: RemotePeer,
-    keys: Arc<RemoteKeys>,
-    clock: Arc<SettableClock>,
-}
-
-impl Setup {
-    async fn new() -> Self {
-        let peer = RemotePeer::start().await;
-        let client = Arc::new(peer.allowed_client());
-        Self::with_client(peer, client)
-    }
-
-    fn with_client(peer: RemotePeer, client: Arc<OutboundClient>) -> Self {
-        let clock = SettableClock::at(SIGNED_AT);
-        let keys = Arc::new(RemoteKeys::new(client, clock.clone()));
-        Self { peer, keys, clock }
-    }
-
-    fn actor_id(&self, handle: &str) -> String {
-        format!("{handle}@{}", self.peer.authority())
-    }
-
-    fn actor(&self, handle: &str) -> Signer {
-        Signer::Actor(Actor::parse_canonical(&self.actor_id(handle)).unwrap())
-    }
-
-    fn provider(&self) -> Signer {
-        Signer::Provider(self.peer.authority())
-    }
-
-    /// Unix seconds now, on the test clock.
-    fn now(&self) -> i64 {
-        use re_ofscp_server::signing::Clock as _;
-        self.clock.now().unix_timestamp()
-    }
-
-    fn advance(&self, secs: i64) {
-        self.clock
-            .set(time::OffsetDateTime::from_unix_timestamp(self.now() + secs).unwrap());
-    }
-
-    /// Serve `handle`'s keys, cacheable for `ttl` seconds from now.
-    fn serve_keys(&self, handle: &str, keys: &[(&str, VerifyingKey)], ttl: i64) {
-        let doc = keys_doc(&self.actor_id(handle), keys, &rfc3339(self.now() + ttl));
-        self.peer.set(&keys_path(handle), Reply::json(200, &doc));
-    }
-
-    fn hits(&self, handle: &str) -> usize {
-        self.peer.hits(&keys_path(handle))
-    }
-
-    async fn resolve(
-        &self,
-        signer: &Signer,
-        key_id: &str,
-        fresh: bool,
-    ) -> Result<Resolved, KeyError> {
-        self.resolve_as(&client(), signer, key_id, fresh).await
-    }
-
-    /// Resolve on behalf of `requester`.
-    async fn resolve_as(
-        &self,
-        requester: &Requester,
-        signer: &Signer,
-        key_id: &str,
-        fresh: bool,
-    ) -> Result<Resolved, KeyError> {
-        self.keys.resolve(signer, key_id, fresh, requester).await
-    }
-}
-
-/// The client most tests make their lookups for.
-fn client() -> Requester {
-    Requester::new("203.0.113.7")
-}
-
-/// The `n`th of many distinct clients.
-fn nth_client(n: u32) -> Requester {
-    Requester::new(format!("198.51.100.{n}"))
-}
-
-fn unavailable(r: Result<Resolved, KeyError>) -> u64 {
-    match r {
-        Err(KeyError::Unavailable { retry_after, .. }) => retry_after,
-        other => panic!("expected 503, got {other:?}"),
-    }
-}
-
-fn fetched(key: Option<VerifyingKey>) -> Result<Resolved, KeyError> {
-    Ok(Resolved::authoritative(key))
-}
-
-fn cached(key: Option<VerifyingKey>) -> Result<Resolved, KeyError> {
-    Ok(Resolved::cached(key))
-}
 
 #[tokio::test]
 async fn a_valid_list_is_used() {
@@ -409,42 +310,6 @@ async fn the_clock_moving_during_a_fetch_is_respected() {
 }
 
 #[tokio::test]
-async fn fetches_to_one_host_share_a_token_bucket() {
-    let s = Setup::new().await;
-    // Twenty distinct actors (nothing served: 404s), each looked up for a
-    // different client, use up the target's burst.
-    for i in 0..20 {
-        assert_eq!(
-            s.resolve_as(
-                &nth_client(i),
-                &s.actor(&format!("user{i:02}")),
-                "dk_1",
-                false
-            )
-            .await,
-            fetched(None)
-        );
-    }
-    // The 21st waits for a token (30/min: one every 2 s).
-    assert_eq!(
-        unavailable(s.resolve(&s.actor("user20"), "dk_1", false).await),
-        2
-    );
-    assert_eq!(s.peer.total_hits(), 20);
-    s.advance(2);
-    assert_eq!(
-        s.resolve(&s.actor("user20"), "dk_1", false).await,
-        fetched(None)
-    );
-    // Cached answers cost no token.
-    assert_eq!(
-        s.resolve(&s.actor("user00"), "dk_1", false).await,
-        cached(None)
-    );
-    assert_eq!(s.peer.total_hits(), 21);
-}
-
-#[tokio::test]
 async fn concurrent_lookups_share_one_fetch() {
     let s = Setup::new().await;
     let k = new_key().verifying_key();
@@ -496,8 +361,9 @@ async fn a_dropped_lookup_does_not_cancel_the_shared_fetch() {
 
 #[tokio::test]
 async fn an_outbound_refusal_is_401() {
-    // The peer is on loopback and not allowed: by name (refused after DNS)
-    // and by address (refused before anything is sent).
+    // The peer is on loopback and not allowed: by name (`localhost` is not
+    // under a known public suffix, so refused before any lookup) and by
+    // address (refused before anything is sent).
     let peer = RemotePeer::start().await;
     let ip = peer.ip_authority();
     let client = Arc::new(peer.strict_client());
@@ -519,141 +385,4 @@ async fn an_outbound_refusal_is_401() {
         }
     }
     assert_eq!(s.peer.total_hits(), 0);
-}
-
-/// Twenty user-key fetches (404s) at the peer, each for its own client:
-/// the user-keys bucket of the peer's domain is then empty.
-async fn drain_user_keys_bucket(s: &Setup) {
-    for i in 0..20 {
-        let actor = s.actor(&format!("drain{i:02}"));
-        assert_eq!(
-            s.resolve_as(&nth_client(i), &actor, "dk_1", false).await,
-            fetched(None)
-        );
-    }
-}
-
-#[tokio::test]
-async fn another_port_of_the_host_shares_its_bucket() {
-    let s = Setup::new().await;
-    drain_user_keys_bucket(&s).await;
-    // `localhost:{other port}` is the same target: refused by the empty
-    // bucket before anything is fetched (otherwise our outbound rules would
-    // refuse its loopback address: 401).
-    let other_port = s.peer.port.wrapping_add(1).max(1);
-    let elsewhere =
-        Signer::Actor(Actor::parse_canonical(&format!("xxx@localhost:{other_port}")).unwrap());
-    assert_eq!(
-        unavailable(
-            s.resolve_as(&nth_client(99), &elsewhere, "dk_1", false)
-                .await
-        ),
-        2
-    );
-    assert_eq!(s.peer.total_hits(), 20);
-}
-
-#[tokio::test]
-async fn discovery_works_while_the_user_keys_bucket_is_empty() {
-    let s = Setup::new().await;
-    drain_user_keys_bucket(&s).await;
-    assert_eq!(
-        unavailable(
-            s.resolve_as(&nth_client(99), &s.actor("bob"), "dk_1", false)
-                .await
-        ),
-        2
-    );
-    let k = new_key().verifying_key();
-    let authority = s.peer.authority().to_string();
-    s.peer.set(
-        DISCOVERY_PATH,
-        Reply::json(200, &discovery_doc(&authority, &[("pk_1", k)])),
-    );
-    assert_eq!(
-        s.resolve_as(&nth_client(99), &s.provider(), "pk_1", false)
-            .await,
-        fetched(Some(k))
-    );
-}
-
-#[tokio::test]
-async fn a_client_is_charged_only_for_fetches_it_causes() {
-    let s = Setup::new().await;
-    let k = new_key().verifying_key();
-    s.serve_keys("alice", &[("dk_1", k)], 600);
-    let alice = s.actor("alice");
-    let me = client();
-    assert_eq!(
-        s.resolve_as(&me, &alice, "dk_1", false).await,
-        fetched(Some(k))
-    );
-    // Cache hits are free.
-    for _ in 0..20 {
-        assert_eq!(
-            s.resolve_as(&me, &alice, "dk_1", false).await,
-            cached(Some(k))
-        );
-    }
-    // Nine more fetches spend the burst of ten ...
-    for i in 0..9 {
-        let actor = s.actor(&format!("user{i}"));
-        assert_eq!(
-            s.resolve_as(&me, &actor, "dk_1", false).await,
-            fetched(None)
-        );
-    }
-    // ... after which this client's next fetch is refused, but its cache
-    // hits still work, and so do other clients' fetches.
-    assert_eq!(
-        unavailable(s.resolve_as(&me, &s.actor("user9"), "dk_1", false).await),
-        2
-    );
-    assert_eq!(
-        s.resolve_as(&me, &alice, "dk_1", false).await,
-        cached(Some(k))
-    );
-    // A re-fetch would be charged too: the unexpired cached key stands in.
-    assert_eq!(
-        s.resolve_as(&me, &alice, "dk_1", true).await,
-        cached(Some(k))
-    );
-    assert_eq!(
-        s.resolve_as(&nth_client(1), &s.actor("user9"), "dk_1", false)
-            .await,
-        fetched(None)
-    );
-    assert_eq!(s.peer.total_hits(), 11);
-}
-
-#[tokio::test]
-async fn joining_a_fetch_under_way_is_free() {
-    let s = Setup::new().await;
-    let broke = nth_client(1);
-    for i in 0..10 {
-        let actor = s.actor(&format!("user{i}"));
-        assert_eq!(
-            s.resolve_as(&broke, &actor, "dk_1", false).await,
-            fetched(None)
-        );
-    }
-    let k = new_key().verifying_key();
-    let doc = keys_doc(&s.actor_id("slow"), &[("dk_1", k)], &rfc3339(s.now() + 600));
-    s.peer.set(
-        &keys_path("slow"),
-        Reply::json(200, &doc).delayed(Duration::from_millis(300)),
-    );
-    let slow = s.actor("slow");
-    let first = tokio::spawn({
-        let (keys, slow) = (s.keys.clone(), slow.clone());
-        async move { keys.resolve(&slow, "dk_1", false, &nth_client(2)).await }
-    });
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    // Out of budget, but it only waits for the fetch another client started.
-    assert_eq!(
-        s.resolve_as(&broke, &slow, "dk_1", false).await,
-        fetched(Some(k))
-    );
-    assert_eq!(first.await.unwrap(), fetched(Some(k)));
-    assert_eq!(s.hits("slow"), 1);
 }

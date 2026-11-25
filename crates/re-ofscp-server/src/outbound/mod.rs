@@ -28,8 +28,8 @@ use tokio::sync::Semaphore;
 use url::{Host, Url};
 
 use self::dns::{RefusedAddress, VettingResolver};
-use self::inflight::PerTarget;
-use crate::registrable::registrable_group;
+use self::inflight::{PerTarget, TargetSlot};
+use crate::registrable::{host_of, registrable_group};
 
 /// Limits and trust settings for an [`OutboundClient`].
 #[derive(Debug, Clone)]
@@ -109,6 +109,15 @@ pub struct OutboundResponse {
     pub body: Vec<u8>,
 }
 
+/// A checked target holding one of its per-target slots
+/// ([`OutboundClient::reserve`]).
+#[derive(Debug)]
+pub struct Reservation {
+    authority: Authority,
+    url: Url,
+    _slot: TargetSlot,
+}
+
 /// Could not build the client (TLS setup).
 #[derive(Debug, thiserror::Error)]
 #[error("cannot build the outbound HTTP client: {0}")]
@@ -121,8 +130,10 @@ pub struct OutboundClient {
     /// For operator-allowed authorities only.
     allowed: reqwest::Client,
     allow_hosts: HashSet<Authority>,
+    /// The host names of `allow_hosts`, ports dropped.
+    allow_host_names: HashSet<String>,
     slots: Arc<Semaphore>,
-    per_target: PerTarget,
+    per_target: Arc<PerTarget>,
     timeout: Duration,
     max_body: usize,
 }
@@ -156,8 +167,13 @@ impl OutboundClient {
             strict: build(true)?,
             allowed: build(false)?,
             allow_hosts: config.allow_hosts.iter().cloned().collect(),
+            allow_host_names: config
+                .allow_hosts
+                .iter()
+                .map(|a| host_of(a.as_str()).to_owned())
+                .collect(),
             slots: Arc::new(Semaphore::new(config.max_in_flight.max(1))),
-            per_target: PerTarget::new(config.max_in_flight_per_target),
+            per_target: Arc::new(PerTarget::new(config.max_in_flight_per_target)),
             timeout: config.timeout,
             max_body: config.max_body,
         })
@@ -194,18 +210,56 @@ impl OutboundClient {
         }
     }
 
+    /// Whether the operator allowed `authority`'s host name, on any port,
+    /// in `allow_hosts`. The address rule stays per whole authority; this
+    /// only lets callers exempt operator-chosen names (`localhost`,
+    /// `peer.test`) from rules about names themselves, such as the remote
+    /// key resolver's unknown-suffix refusal.
+    pub fn allows_host_name(&self, authority: &Authority) -> bool {
+        self.allow_host_names.contains(host_of(authority.as_str()))
+    }
+
     /// `GET https://{authority}{path}`, reading the whole (capped) body.
     pub async fn get(
         &self,
         authority: &Authority,
         path: &str,
     ) -> Result<OutboundResponse, OutboundError> {
+        self.get_reserved(self.reserve(authority, path)?).await
+    }
+
+    /// Check the target (as [`Self::target`]) and take one of its
+    /// per-target slots now, for a request sent later with
+    /// [`Self::get_reserved`]: [`OutboundError::Busy`] when the target
+    /// already has its cap in flight. Callers that pay for a request
+    /// (budgets, intervals) reserve first, so a busy target costs nothing.
+    /// Dropping the reservation unused frees the slot.
+    pub fn reserve(&self, authority: &Authority, path: &str) -> Result<Reservation, OutboundError> {
         let url = self.target(authority, path)?;
         let group = registrable_group(authority.as_str());
-        let Some(_target_slot) = self.per_target.try_acquire(group.clone()) else {
+        let Some(slot) = self.per_target.try_acquire(group.clone()) else {
             return Err(OutboundError::Busy(group));
         };
-        let client = if self.allow_hosts.contains(authority) {
+        Ok(Reservation {
+            authority: authority.clone(),
+            url,
+            _slot: slot,
+        })
+    }
+
+    /// `GET` the reserved URL, reading the whole (capped) body. The
+    /// per-target slot is held until this returns.
+    pub async fn get_reserved(
+        &self,
+        reservation: Reservation,
+    ) -> Result<OutboundResponse, OutboundError> {
+        // `_slot` stays bound (not `_`) so the slot is held to the end.
+        let Reservation {
+            authority,
+            url,
+            _slot,
+        } = reservation;
+        let client = if self.allow_hosts.contains(&authority) {
             &self.allowed
         } else {
             &self.strict

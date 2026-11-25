@@ -1,5 +1,6 @@
-//! The resolver's bounded tables: cached documents, fetches in flight, and
-//! when each source was last re-fetched on a miss.
+//! The resolver's bounded tables: cached documents, fetches in flight,
+//! when each source was last re-fetched on a miss, and which sources are
+//! known (their last completed fetch found keys).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -42,6 +43,10 @@ pub struct Tables {
     pub flights: HashMap<Source, Flight>,
     /// When each source was last re-fetched for a `fresh` lookup.
     refetched: HashMap<Source, i64>,
+    /// Known sources: those whose last completed fetch returned a
+    /// non-empty key list, with when that fetch completed. Their fetches
+    /// are charged to the targets' known budgets (docs/decisions/0006).
+    known: HashMap<Source, i64>,
 }
 
 impl Tables {
@@ -88,6 +93,26 @@ impl Tables {
         let last = *self.refetched.get(source)?;
         let wait = last + REFETCH_INTERVAL_SECS - now;
         (wait > 0).then(|| wait.unsigned_abs())
+    }
+
+    /// Whether `source` is known: its last completed fetch found keys.
+    pub fn is_known(&self, source: &Source) -> bool {
+        self.known.contains_key(source)
+    }
+
+    /// Record the outcome of a completed fetch of `source` at `now`: it
+    /// found keys (`found`), so `source` is known, or an empty list or
+    /// `404`, so it is not (any more). Failures and refusals say nothing
+    /// about the source and are not recorded. Past [`MAX_ENTRIES`] the
+    /// source confirmed longest ago is forgotten; it is then charged as a
+    /// first-time lookup until a fetch finds its keys again.
+    pub fn note_found(&mut self, source: &Source, found: bool, now: i64) {
+        if !found {
+            self.known.remove(source);
+            return;
+        }
+        make_room(&mut self.known, source, |_| false, |&at| at);
+        self.known.insert(source.clone(), now);
     }
 
     /// Note a `fresh` re-fetch of `source` at `now`.
@@ -159,6 +184,33 @@ mod tests {
         assert_eq!(t.refetch_wait(&s, 100), Some(60));
         assert_eq!(t.refetch_wait(&s, 159), Some(1));
         assert_eq!(t.refetch_wait(&s, 160), None);
+    }
+
+    #[test]
+    fn sources_are_known_while_their_last_fetch_found_keys() {
+        let mut t = Tables::default();
+        let s = source(0);
+        assert!(!t.is_known(&s));
+        t.note_found(&s, true, 100);
+        assert!(t.is_known(&s));
+        t.note_found(&s, false, 200);
+        assert!(!t.is_known(&s), "an empty list or 404 forgets it");
+    }
+
+    #[test]
+    fn known_sources_are_bounded_dropping_the_longest_unconfirmed() {
+        let mut t = Tables::default();
+        for i in 0..MAX_ENTRIES {
+            t.note_found(&source(i), true, if i == 0 { 5 } else { 10 });
+        }
+        // Re-confirming an entry does not grow the table.
+        t.note_found(&source(1), true, 20);
+        assert_eq!(t.known.len(), MAX_ENTRIES);
+        t.note_found(&source(MAX_ENTRIES), true, 30);
+        assert_eq!(t.known.len(), MAX_ENTRIES);
+        assert!(!t.is_known(&source(0)), "confirmed longest ago");
+        assert!(t.is_known(&source(1)));
+        assert!(t.is_known(&source(MAX_ENTRIES)));
     }
 
     #[test]

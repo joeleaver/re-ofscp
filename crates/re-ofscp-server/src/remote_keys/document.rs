@@ -37,8 +37,17 @@ struct RawKey {
     key_id: String,
     algorithm: String,
     public_key: String,
-    #[serde(default)]
+    /// Absent is `None`; present it must be a string (`null` is invalid,
+    /// as the schemas require a string wherever the field appears).
+    #[serde(default, deserialize_with = "present_string")]
     created_at: Option<String>,
+}
+
+/// A field that, when present, must be a string: `null` is rejected rather
+/// than read as absent (serde's `Option` would accept it). Absence is
+/// handled by `#[serde(default)]`.
+fn present_string<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    String::deserialize(d).map(Some)
 }
 
 /// Whether entries must carry `created_at`: the user keys schema requires
@@ -310,6 +319,9 @@ mod tests {
         );
         let bad = json!([{ "key_id": "pk_1", "algorithm": "Ed25519", "public_key": KEY, "created_at": "2026-01-01" }]);
         assert!(discovery(&discovery_doc("remote.example", bad), &remote).is_err());
+        // Present means a string: `null` is not "absent".
+        let null = json!([{ "key_id": "pk_1", "algorithm": "Ed25519", "public_key": KEY, "created_at": null }]);
+        assert!(discovery(&discovery_doc("remote.example", null), &remote).is_err());
         let missing_key = json!([{ "key_id": "pk_1", "algorithm": "Ed25519" }]);
         assert!(discovery(&discovery_doc("remote.example", missing_key), &remote).is_err());
     }

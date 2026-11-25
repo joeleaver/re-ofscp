@@ -7,7 +7,7 @@
 //! than queueing behind the stalled ones.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 /// Requests in flight per target group.
 #[derive(Debug)]
@@ -30,15 +30,19 @@ impl PerTarget {
     }
 
     /// Take a slot for `group`, or `None` when it already has `cap` requests
-    /// in flight. The slot is released when the returned guard drops.
-    pub fn try_acquire(&self, group: String) -> Option<TargetSlot<'_>> {
+    /// in flight. The slot is released when the returned guard drops; it
+    /// owns a handle to the table, so it can move into a spawned task.
+    pub fn try_acquire(self: &Arc<Self>, group: String) -> Option<TargetSlot> {
         let mut counts = self.counts();
         let count = counts.entry(group.clone()).or_insert(0);
         if *count >= self.cap {
             return None;
         }
         *count += 1;
-        Some(TargetSlot { owner: self, group })
+        Some(TargetSlot {
+            owner: Arc::clone(self),
+            group,
+        })
     }
 
     /// Requests in flight for `group`.
@@ -51,12 +55,12 @@ impl PerTarget {
 /// One request in flight to a group. Dropping it frees the slot; a group
 /// with none left is forgotten, so the table holds only groups in use.
 #[derive(Debug)]
-pub struct TargetSlot<'a> {
-    owner: &'a PerTarget,
+pub struct TargetSlot {
+    owner: Arc<PerTarget>,
     group: String,
 }
 
-impl Drop for TargetSlot<'_> {
+impl Drop for TargetSlot {
     fn drop(&mut self) {
         let mut counts = self.owner.counts();
         if let Some(count) = counts.get_mut(&self.group) {
@@ -74,7 +78,7 @@ mod tests {
 
     #[test]
     fn the_cap_is_per_group_and_slots_are_released() {
-        let t = PerTarget::new(2);
+        let t = Arc::new(PerTarget::new(2));
         let a1 = t.try_acquire("a.example".to_owned()).unwrap();
         let _a2 = t.try_acquire("a.example".to_owned()).unwrap();
         assert!(t.try_acquire("a.example".to_owned()).is_none());
@@ -86,7 +90,7 @@ mod tests {
 
     #[test]
     fn idle_groups_are_forgotten() {
-        let t = PerTarget::new(1);
+        let t = Arc::new(PerTarget::new(1));
         drop(t.try_acquire("a.example".to_owned()));
         assert!(t.counts().is_empty());
     }

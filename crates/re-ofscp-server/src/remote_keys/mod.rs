@@ -10,9 +10,13 @@
 //!   is allowed when the failed fetch was itself a re-fetch), and an
 //!   outbound refusal `401`, unless an **unexpired** cached key with that id
 //!   exists, which is then used;
-//! * a fetch stopped by a rate limit or budget ([`budget`]) is `503` with
-//!   the `Retry-After` of that limit, again unless an unexpired cached key
-//!   matches.
+//! * a fetch stopped by a rate limit or budget ([`budget`]), or because the
+//!   target already has its cap of requests in flight, is `503` with the
+//!   `Retry-After` of that limit, again unless an unexpired cached key
+//!   matches;
+//! * a host under a public suffix the PSL does not know is refused like an
+//!   outbound refusal (`401`), before any budget is consulted, unless the
+//!   operator allowed its name in `OUTBOUND_ALLOW_HOSTS`.
 //!
 //! Lookups for the same source share one fetch (single flight). Fetches run
 //! in their own task, so a lookup that gives up (its request was dropped)
@@ -27,10 +31,11 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use tokio::sync::watch;
 
-use self::budget::Budgets;
+use self::budget::{Budgets, Standing};
 use self::fetch::{Fetched, Source};
 use self::state::{Flight, MAX_ENTRIES, Tables};
-use crate::outbound::{OutboundClient, OutboundError};
+use crate::outbound::{OutboundClient, OutboundError, Reservation};
+use crate::registrable::has_unknown_suffix;
 use crate::signing::{Clock, KeyError, KeyFuture, KeyResolver, Requester, Resolved, Signer};
 
 pub use self::budget::{CLIENT_BURST, CLIENT_PER_MINUTE, DOMAIN_BURST, DOMAIN_PER_MINUTE};
@@ -139,6 +144,16 @@ impl Inner {
                 KeyError::Unresolvable(why)
             }));
         }
+        // Under a suffix the PSL does not know, every name would be its own
+        // target group (and fill the budgets' tables): refused like an
+        // outbound refusal, at no cost. Operator-allowed names (dev peers
+        // on `localhost` or `*.test`) are exempt.
+        let host = source.host();
+        if has_unknown_suffix(host.as_str()) && !self.client.allows_host_name(host) {
+            return Plan::Answer(fallback(&tables, source, key_id, now, || {
+                KeyError::Unresolvable(format!("{host} is not under a known public suffix"))
+            }));
+        }
         let limited = |retry_after: u64, why: &str| {
             fallback(&tables, source, key_id, now, || KeyError::Unavailable {
                 reason: format!("{why} for {}", source.host()),
@@ -153,7 +168,28 @@ impl Inner {
         if tables.flights.len() >= MAX_ENTRIES {
             return Plan::Answer(limited(1, "too many key fetches in flight"));
         }
-        if let Err(over) = self.budgets.charge(source, requester, now) {
+        // The target's in-flight slot is taken before anything is charged,
+        // so a busy target costs no budget and starts no re-fetch interval.
+        let reservation = match self.client.reserve(host, &source.path()) {
+            Ok(reservation) => reservation,
+            Err(OutboundError::Busy(_)) => {
+                return Plan::Answer(limited(
+                    FAILURE_RETRY_SECS,
+                    "too many requests in flight to the target",
+                ));
+            }
+            Err(e) => {
+                return Plan::Answer(fallback(&tables, source, key_id, now, || {
+                    KeyError::Unresolvable(e.to_string())
+                }));
+            }
+        };
+        let standing = if tables.is_known(source) {
+            Standing::Known
+        } else {
+            Standing::FirstTime
+        };
+        if let Err(over) = self.budgets.charge(source, standing, requester, now) {
             return Plan::Answer(limited(over.retry_after, over.why));
         }
         if fresh {
@@ -166,12 +202,17 @@ impl Inner {
         };
         tables.flights.insert(source.clone(), flight.clone());
         drop(tables);
-        tokio::spawn(self.clone().run_flight(source.clone(), tx));
+        tokio::spawn(self.clone().run_flight(source.clone(), reservation, tx));
         Plan::Wait(flight)
     }
 
     /// Fetch, update the cache, then wake every waiter.
-    async fn run_flight(self: Arc<Self>, source: Source, tx: watch::Sender<Option<Fetched>>) {
+    async fn run_flight(
+        self: Arc<Self>,
+        source: Source,
+        reservation: Reservation,
+        tx: watch::Sender<Option<Fetched>>,
+    ) {
         // Whatever happens (even a panic), the flight is removed, so later
         // lookups are never stuck waiting on a fetch that will not answer.
         let mut guard = FlightGuard {
@@ -179,13 +220,15 @@ impl Inner {
             source: &source,
             armed: true,
         };
-        let fetched = fetch::fetch(&self.client, &source, || self.now()).await;
+        let fetched = fetch::fetch(&self.client, &source, reservation, || self.now()).await;
         {
             let mut tables = self.tables();
             tables.flights.remove(&source);
             guard.armed = false;
             if let Fetched::Keys { keys, expires } = &fetched {
-                tables.store(&source, keys.clone(), *expires, self.now());
+                let now = self.now();
+                tables.store(&source, keys.clone(), *expires, now);
+                tables.note_found(&source, !keys.is_empty(), now);
             }
         }
         match &fetched {

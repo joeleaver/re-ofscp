@@ -25,9 +25,10 @@ used** (#20): an expired entry never stands in for anything.
 |---|---|
 | `200` with a valid list | use it; an empty list or no matching `key_id` → `401` |
 | `404` (user keys only; for discovery a `404` is a failure, §8.1) | no key matches → `401` |
-| anything else (network error including a name that does not resolve, timeout, `3xx`, `5xx`, `429`, other `4xx`, invalid body, too many requests to that target in flight) | fetch failure: a matching cached key is used; otherwise `503 service_unavailable`, `Retry-After: 5` (or longer after a failed re-fetch, below) |
+| anything else (network error including a name that does not resolve, timeout, `3xx`, `5xx`, `429`, other `4xx`, invalid body) | fetch failure: a matching cached key is used; otherwise `503 service_unavailable`, `Retry-After: 5` (or longer after a failed re-fetch, below) |
 | fetch suppressed by a rate limit or budget | a matching cached key is used; otherwise `503` with `Retry-After` = time until the fetch is allowed |
-| our outbound rules refuse the fetch | a matching cached key is used; otherwise `401` |
+| fetch not started because the target already has its cap of requests in flight | a matching cached key is used; otherwise `503`, `Retry-After: 5` |
+| our outbound rules refuse the fetch, or the host is under a public suffix the PSL does not know | a matching cached key is used; otherwise `401` |
 
 ## Decision
 
@@ -68,7 +69,9 @@ One client for every request to a host someone else chose. Later features
   domain (below). A request over the per-target cap fails at once
   (`OutboundError::Busy`) rather than queueing, so a few hosts that stall
   every response until the timeout cannot hold all 64 slots and starve
-  requests to everyone else.
+  requests to everyone else. A caller that pays for a request (budgets,
+  intervals) takes the slot first with `OutboundClient::reserve` and sends
+  with `get_reserved`, so a busy target is refused before anything is paid.
 - **Target groups.** Wherever the outbound rules count per target, a target
   is its host's **registrable domain** (eTLD+1 by the Public Suffix List, the
   `psl` crate, as the replay store's per-domain quotas already do), port
@@ -84,7 +87,10 @@ One client for every request to a host someone else chose. Later features
   authorities, canonicalized; matched as a whole authority, port included)
   skips the address check for those hosts only. Allowed hosts go through a
   second client whose resolver does not vet addresses, so the exception
-  cannot leak to another port or host. It is for
+  cannot leak to another port or host. The allowed host *names* (any
+  port) are also exempt from the resolver's unknown-suffix refusal (below),
+  since dev peers live on `localhost` or `*.test`; that exemption grants no
+  address exception, and the name is still one target group. It is for
   development and private peerings; https and every other rule still apply.
   Tests use it together with a test-only extra root certificate.
 
@@ -111,7 +117,8 @@ Replaces `NoRemoteKeys` behind `ProviderKeys`' `remote` slot.
   `algorithm` exactly `"Ed25519"` (the schemas' only value: any other
   algorithm makes the document invalid) and a valid 32-byte base64
   `public_key`. User-key entries also need `created_at` (RFC 3339);
-  discovery entries may omit it, but when present it must be RFC 3339. A
+  discovery entries may omit it, but when present it must be an RFC 3339
+  string (`null` is not "absent": it is invalid). A
   `key_id` that appears twice makes the whole document invalid. Anything
   else is an invalid body, so a fetch failure.
 - **Caching.** User keys are cached until `min(cache_until, now + 1 h)` (the
@@ -130,34 +137,76 @@ Replaces `NoRemoteKeys` behind `ProviderKeys`' `remote` slot.
   not verify, it resolves again with `fresh = true`, which re-fetches. An
   answer that already came from a fetch made for this request is final: it
   is not fetched twice.
+- **Unknown public suffixes.** A host whose public suffix is not on the
+  PSL (`n1.zzqq`, `n2.zzqq`, …) is refused before anything else is planned
+  or charged. The PSL's implicit `*` rule would make each such name a
+  registrable domain, so a target group, of its own: requests naming them
+  would each get a fresh per-target budget and fill the budgets' 10 000-key
+  tables. Like an outbound refusal it answers `401`, costs no token, and is
+  subject to #20 (an unexpired cached key is still used; in practice none
+  is ever cached for such a host). IP literals have no suffix and are
+  judged by the address rule instead; operator-allowed host names are
+  exempt (above). The replay store groups by the same
+  `registrable_group`, unchanged: a signer under an unknown suffix can no
+  longer get a key verified, so it never reaches the replay store.
 - **Rate limits.**
   - *Per source:* at most one `fresh` re-fetch per actor (or provider) per
     60 s. Expiry-driven fetches are not held to this; only failure re-fetches
     are, as #19 describes.
-  - *Per target:* a token bucket over **every** fetch to that target
-    (registrable domain, see "Target groups"; burst 20, 30 per minute), so
-    a stream of requests naming random handles, key ids, ports or
-    subdomains at one domain cannot make us hammer it. User-key fetches and
-    provider-discovery fetches have **separate** buckets, so spam naming
-    random handles at a domain cannot stop us from verifying that domain's
-    provider.
+  - *Per target:* token buckets over **every** fetch to that target
+    (registrable domain, see "Target groups"), so a stream of requests
+    naming random handles, key ids, ports or subdomains at one domain cannot
+    make us hammer it. Each target has four buckets, each burst 20, 30 per
+    minute:
+    - user-key fetches and provider-discovery fetches apart, so spam naming
+      random handles at a domain cannot stop us from verifying that
+      domain's provider;
+    - each of those split into **known** sources and **first-time**
+      lookups. A source is known when its last completed fetch returned a
+      non-empty key list; it stops being known when a fetch returns an
+      empty list or a user-keys `404` (failures and refusals change
+      nothing). Known sources' fetches (expiry re-fetches, and re-fetches
+      on a miss, e.g. after a key rotation) use the known bucket; every
+      other fetch (never fetched, last seen empty or `404`) the first-time
+      bucket. Requests naming random handles or subdomains are all
+      first-time, so however many clients send them, they can only empty
+      the first-time bucket: the peer's existing users keep verifying.
+      New users of that peer get `503` while it lasts, which is the cost
+      that remains (see the trade-off below). Known sources are
+      remembered in a table of at most 10 000; past that, the one confirmed
+      longest ago is forgotten and is charged as first-time until a fetch
+      finds its keys again. Filling the table takes real non-empty key
+      lists, served from domains the attacker controls, each fetch paid
+      from its own client and first-time budgets.
   - *Per client:* a token bucket per client address (the same key as the
     login rate limits: the `CLIENT_IP_HEADER` entry our proxy appends, else
-    the TCP peer; IPv6 by /64), burst 10, 30 per minute. The signature
-    layer passes the client to `KeyResolver::resolve` as a `Requester`, so
-    one anonymous client cannot spend a peer's whole per-target budget and
-    lock that peer's real users out with `503`s.
+    the TCP peer; IPv6 by /64), burst 10, **10 per minute**. The signature
+    layer passes the client to `KeyResolver::resolve` as a `Requester`.
+    The rate is a third of a target bucket's refill, so one client can
+    never keep any of a peer's buckets empty: at most it borrows ten of a
+    burst of twenty, and the bucket refills three times faster than the
+    client can spend. (At the earlier 30 per minute, equal to the target
+    refill, one IPv4 address or IPv6 /64 could hold a peer's bucket empty
+    indefinitely.) Ten fetches a minute is still far above what an honest
+    client causes: a request needs at most two fetches (one normal, one
+    re-fetch on a miss), and cache hits and joined fetches are free.
   - A fetch is charged to the target's and the client's bucket together,
     or to neither, and only when it is about to start: cache hits and
     lookups that join a fetch already under way cost nothing, and every
-    other refusal (re-fetch interval, in-flight table full) is decided
-    before any bucket is touched.
+    other refusal (unknown suffix, re-fetch interval, in-flight table full,
+    target busy) is decided before any bucket is touched. In particular a
+    target already at its in-flight cap answers `503` (`Retry-After: 5`, or
+    a matching unexpired cached key) without spending a token or starting
+    the 60 s re-fetch interval, which would otherwise make the next lookup
+    wait a minute for a fetch that never happened.
   - When a limit stops a fetch: an unexpired cached key with that `key_id`
     is still used; otherwise `503` with `Retry-After` until the fetch would
     be allowed.
   - *Trade-off:* the per-client bound is per source address, so a botnet
-    with many addresses can still spend a peer's per-target budget and
-    cause `503`s for that peer's users until it refills. Cached keys keep
+    with many addresses can still spend a peer's first-time budget (new
+    users of that peer get `503`s until it refills) and, by naming known
+    actors with fresh lookups (one re-fetch per actor per minute), its
+    known budget. Cached keys keep
     working meanwhile, and the target bucket still caps what reaches the
     peer, which is the property §8 requires.
 - **Fetch failure:** an unexpired cached key with that `key_id` is still
@@ -182,10 +231,11 @@ Replaces `NoRemoteKeys` behind `ProviderKeys`' `remote` slot.
   resolve at all (NXDOMAIN, SERVFAIL, timeout) is a network error, so a fetch
   failure (`503`), not a refusal.
 - **Bounds:** at most 10 000 cached sources, 10 000 per-source re-fetch
-  times and 10 000 fetches in flight; past that, expired entries go first,
-  then the oldest (in flight: `503`, `Retry-After: 1`). Each set of token
-  buckets (the existing `RateLimiter`: user-key targets, discovery targets,
-  clients) holds at most 10 000 keys; when full it drops idle buckets and
+  times, 10 000 known sources and 10 000 fetches in flight; past that,
+  expired entries go first, then the oldest (in flight: `503`,
+  `Retry-After: 1`). Each set of token buckets (the existing `RateLimiter`:
+  known and first-time user-key targets, known and first-time discovery
+  targets, clients) holds at most 10 000 keys; when full it drops idle buckets and
   otherwise refuses new keys (fail closed: `503`, `Retry-After: 1`), rather
   than forget one that is being limited.
 
