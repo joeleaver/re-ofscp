@@ -212,11 +212,12 @@ impl Config {
         };
         let contact = match get("PROVIDER_CONTACT").map(|v| v.trim().to_owned()) {
             None => format!("mailto:admin@{}", host_of(&domain)),
-            Some(v) if !v.is_empty() && !v.chars().any(char::is_control) => v,
+            Some(v) if is_contact_uri(&v) => v,
             Some(_) => {
                 return Err(ConfigError::Invalid {
                     name: "PROVIDER_CONTACT",
-                    reason: "must be a non-empty URI such as mailto:ops@example.com".to_owned(),
+                    reason: "must be a mailto: or https: URI, e.g. mailto:ops@example.com"
+                        .to_owned(),
                 });
             }
         };
@@ -242,6 +243,15 @@ impl Config {
 fn is_loopback_name(domain: &Authority) -> bool {
     let host = host_of(domain);
     host == "localhost" || host.ends_with(".localhost")
+}
+
+/// A `mailto:` or `https:` URI with something after the scheme and no
+/// whitespace or control characters.
+fn is_contact_uri(v: &str) -> bool {
+    let rest = v
+        .strip_prefix("mailto:")
+        .or_else(|| v.strip_prefix("https://"));
+    rest.is_some_and(|r| !r.is_empty()) && !v.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
 /// `domain` without its `:port` (an IPv6 literal keeps its brackets).
@@ -351,7 +361,16 @@ mod tests {
             contact("a.example", Some(" https://a.example/about ")).unwrap(),
             "https://a.example/about"
         );
-        for bad in ["", "  ", "mailto:a@b\nX: y"] {
+        for bad in [
+            "",
+            "  ",
+            "mailto:a@b\nX: y",
+            "foo bar",
+            "ops@example.com",
+            "http://a.example",
+            "mailto:",
+            "https://",
+        ] {
             assert!(matches!(
                 contact("a.example", Some(bad)),
                 Err(ConfigError::Invalid {

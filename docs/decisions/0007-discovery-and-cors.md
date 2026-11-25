@@ -43,6 +43,12 @@ our provider signing keys.
   The admin console uses a `SameSite=Strict` session cookie plus CSRF
   protection and stays same-origin (0005). A cross-origin preflight to it
   gets no `204` and no CORS headers, so browsers refuse the request.
+  §3.4 literally says "every `/api/…`" endpoint. We read it with §3.2
+  ("additional, non-standard endpoints … are out of scope"): the MUST
+  covers the endpoints the spec defines, not a provider's own
+  cookie-authenticated administration. This was raised with the OFSCP
+  oracle (2026-11-25) as a spec clarification; if the spec settles the
+  other way, the admin API moves off `/api/` rather than gaining CORS.
 
 ### Provider signing key (§8.1)
 
