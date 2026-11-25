@@ -18,9 +18,9 @@
 //! 3. otherwise (no entry of any group has expired) the inserting group
 //!    gives up its own oldest entry if no other group is larger than it,
 //!    and else the **largest** group (on a tie, the one that most
-//!    recently gained an entry) gives up its oldest. A group is therefore only ever cut back while no other group
-//!    is bigger, and never to make room for a group that would then be
-//!    bigger than it.
+//!    recently gained an entry) gives up its oldest. A group is therefore
+//!    only ever cut back while no other group is bigger, and never to make
+//!    room for a group that would then be bigger than it.
 //!
 //! Groups are target groups: registrable domains by the ICANN section of
 //! the Public Suffix List (`crate::registrable`), so the free names under

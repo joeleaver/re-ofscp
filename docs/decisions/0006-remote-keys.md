@@ -232,6 +232,13 @@ Replaces `NoRemoteKeys` behind `ProviderKeys`' `remote` slot.
       own entries; it never pushes out a smaller domain's known sources.
       With *k* groups filled by an attacker, a peer keeps its known
       sources up to 10 000 / (*k* + 1).
+      A forgotten source is first-time until a fetch finds its keys
+      again, which degrades only to the first-time bucket, never to a
+      refusal. (An earlier revision also capped each group at 500; a
+      peer with more active users than that evicted its own users even
+      while the table was mostly empty, so the per-group cap was
+      dropped.) All operations are O(log n) (per-group ordered maps and a
+      ranking of groups by size).
       - *What a group costs.* Each group is a separately registered ICANN
         domain (target groups ignore the PSL's private section, see
         "Target groups"; before that, a group was a free subdomain of
@@ -245,16 +252,10 @@ Replaces `NoRemoteKeys` behind `ProviderKeys`' `remote` slot.
         registered domains (about 900 fetches each, at 30 a minute) and
         about 35 IPv4 addresses (or 7 IPv6 /48s) could thus bring a peer
         down to about 900 known sources in about half an hour, and keep
-        it there by re-confirming their own; more domains fill faster. That is the bound we accept: it
-        degrades the peer's evicted users to the first-time bucket, never
-        to a refusal by itself, and it costs real registrations that can
-        be blocked by name once seen. A forgotten source is first-time until a fetch finds its
-      keys again, which degrades only to the first-time bucket, never to
-      a refusal. (An earlier revision also capped each group at 500; a
-      peer with more active users than that evicted its own users even
-      while the table was mostly empty, so the per-group cap was
-      dropped.) All operations are O(log n) (per-group ordered maps and a
-      ranking of groups by size).
+        it there by re-confirming their own; more domains fill faster.
+        That is the bound we accept: it degrades the peer's evicted users
+        to the first-time bucket, never to a refusal by itself, and it
+        costs real registrations that can be blocked by name once seen.
     - *Cached documents with keys are bounded the same way,* and for the
       same reason (and with the same cost per group, except that cached
       documents expire within an hour, so an attacker must keep re-fetching
@@ -310,7 +311,8 @@ Replaces `NoRemoteKeys` behind `ProviderKeys`' `remote` slot.
     client causes: a request needs at most two fetches (one normal, one
     re-fetch on a miss), and cache hits and joined fetches are free.
   - A fetch is charged to the target's, the client's and (for IPv6) the
-    client's /48 bucket together, or to none, and only when it is about to start: cache hits and
+    client's /48 bucket together, or to none, and only when it is about to
+    start: cache hits and
     lookups that join a fetch already under way cost nothing, and every
     other refusal (unknown suffix, re-fetch interval, in-flight table full,
     target busy) is decided before any bucket is touched. In particular a
@@ -324,7 +326,8 @@ Replaces `NoRemoteKeys` behind `ProviderKeys`' `remote` slot.
   - *Trade-off:* the per-client bound is per source address, and the
     client rate (10 a minute) is a third of a target bucket's refill, so
     a handful of addresses (four IPv4 addresses, or one IPv6 /48, are
-    enough) can keep a peer's first-time buckets empty: new users of that peer, and key rotations
+    enough) can keep a peer's first-time buckets empty: new users of that
+    peer, and key rotations
     of its existing users (see above), get `503`s until the spam stops or
     the rotated user's cached document expires. They cannot touch its
     known buckets, which only expiry-driven fetches use. Cached keys keep
@@ -377,9 +380,11 @@ Replaces `NoRemoteKeys` behind `ProviderKeys`' `remote` slot.
   cap gives up its own expired entry, else its own oldest, and only its
   own entries are considered; otherwise a full table gives up an expired
   entry of any group first, then the oldest of the largest group, or of
-  the inserting group if none is larger. Each set of token buckets (the existing `RateLimiter`:
+  the inserting group if none is larger. Each set of token buckets (the
+  existing `RateLimiter`:
   known and first-time user-key targets, known and first-time discovery
-  targets, clients, client /48s) holds at most 10 000 keys; when full it drops idle buckets and
+  targets, clients, client /48s) holds at most 10 000 keys; when full it
+  drops idle buckets and
   otherwise refuses new keys (fail closed: `503`, `Retry-After: 1`), rather
   than forget one that is being limited.
 

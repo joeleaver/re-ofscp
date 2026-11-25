@@ -63,8 +63,10 @@ surface:
     (0006, "Target groups"), so one rule holds everywhere.
     - *Cost:* independent OFSCP providers hosted under one shared suffix
       (two providers at `a.github.io` and `b.github.io`, or on
-      `*.workers.dev`) now share one quota of 25 000 live nonces, about
-      40 signed requests a second sustained across all of them. If one of
+      `*.workers.dev`) now share one quota of 25 000 live nonces: between
+      about 40 and 80 signed requests a second sustained across all of
+      them, depending on their clock offsets (a nonce is kept until its
+      timestamp plus the skew window). If one of
       them is abusive, the others get `429`s with it. A provider that needs
       its own quota needs its own registered domain, which any real
       deployment has anyway (`DOMAIN` must be its stable public host).
