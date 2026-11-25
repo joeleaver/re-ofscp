@@ -20,6 +20,8 @@ fn schema_rhype_parses() {
 async fn health_reports_degraded_without_a_database() {
     let config = Config::from_lookup(|k| match k {
         "DOMAIN" => Some("test.example".into()),
+        // Any valid seed (bytes 32..64).
+        "PROVIDER_SIGNING_KEY" => Some("ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=".into()),
         // Nothing listens here, so the database probe must fail fast.
         "RHYPEDB_ADDR" => Some("127.0.0.1:9".into()),
         _ => None,

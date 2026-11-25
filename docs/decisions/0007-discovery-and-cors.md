@@ -64,12 +64,30 @@ invalid for every reader, so we publish a real key.
   drift out of step with the key.
 - **`created_at`** is omitted (it is optional and the server cannot know
   when the secret was generated).
-- **Rotation** today is replacing the secret. Peers holding the old key
-  re-fetch discovery when a provider-signed request names an unknown
-  `X-OFSCP-Key-ID` (§8.1), and discovery's `max-age` is 300 s. Publishing
-  the previous key alongside the new one during a rotation window is
-  future work, needed once we send provider-signed requests (webhooks,
-  §10). Nothing signs with the key yet.
+- **Our own signatures:** a provider-signed request naming this provider
+  (`X-OFSCP-Provider` = `DOMAIN`) is verified against the published keys
+  held in memory (`ProviderKey::published`, passed to the account
+  resolver), never by fetching our own discovery document. An unknown key
+  id is `401`.
+- **Rotation (planned, not built):** nothing signs with the key yet, so
+  replacing the secret is safe today. Once we send provider-signed requests
+  (webhooks, §10), rotation becomes a window:
+  1. Add an optional `PROVIDER_SIGNING_KEY_PREVIOUS` (a seed, like the
+     current key). Its public half is published in `provider.publicKeys`
+     after the current key and accepted by our own-signature check;
+     outbound requests are signed with the current key only.
+  2. To rotate: move the current seed to `PROVIDER_SIGNING_KEY_PREVIOUS`,
+     set a new `PROVIDER_SIGNING_KEY`, deploy.
+  3. Peers that cached the old document re-fetch on the unknown key id
+     (§8.1). Any request signed with the old key and still in flight or
+     queued for retry still verifies, because the old key is still
+     published.
+  4. After the longest retry horizon of anything signed with the old key
+     (at least discovery's `max-age`, 300 s, plus the 300 s skew window),
+     remove `PROVIDER_SIGNING_KEY_PREVIOUS` and deploy.
+
+  `ProviderKey::published` already returns a list, so step 1 only adds an
+  entry to it and to the discovery document.
 
 ### Discovery document (§3.1)
 

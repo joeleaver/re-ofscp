@@ -58,6 +58,7 @@ async fn requests_during_restart_warm_up_get_503_with_retry_after() {
 async fn production_state_warms_up_for_one_skew_window() {
     let config = re_ofscp_server::Config::from_lookup(|k| match k {
         "DOMAIN" => Some("providera.com".into()),
+        "PROVIDER_SIGNING_KEY" => Some(common::PROVIDER_SIGNING_KEY.into()),
         "RHYPEDB_ADDR" => Some("127.0.0.1:9".into()),
         _ => None,
     })

@@ -11,6 +11,7 @@ use axum::http::StatusCode;
 use common::harness::{SIGNED_AT, SettableClock, new_key, send, signed_as};
 use common::remote_peer::{DISCOVERY_PATH, RemotePeer, Reply, discovery_doc, keys_doc, keys_path};
 use re_ofscp_server::outbound::OutboundClient;
+use re_ofscp_server::provider_key::ProviderKey;
 use re_ofscp_server::replay::NoLedger;
 use re_ofscp_server::timefmt::rfc3339;
 use re_ofscp_server::{AppState, Config, router};
@@ -24,6 +25,7 @@ fn app(peer: &RemotePeer) -> Router {
     let allow = peer.authority().to_string();
     let config = Config::from_lookup(|k| match k {
         "DOMAIN" => Some("providera.com".into()),
+        "PROVIDER_SIGNING_KEY" => Some(common::PROVIDER_SIGNING_KEY.into()),
         // No database: remote signers never touch the account store.
         "RHYPEDB_ADDR" => Some("127.0.0.1:9".into()),
         "OUTBOUND_ALLOW_HOSTS" => Some(allow.clone()),
@@ -177,23 +179,49 @@ async fn a_provider_on_a_refused_address_is_401() {
 }
 
 #[tokio::test]
-async fn a_provider_signature_naming_this_provider_is_401_without_a_fetch() {
-    // This provider publishes no signing keys yet, so a signature claiming
-    // to be from it cannot verify, and it must not fetch its own discovery
-    // document to find that out.
+async fn a_provider_signature_naming_this_provider_uses_its_own_key_without_a_fetch() {
+    // Signatures claiming to be from this provider are checked against the
+    // key it publishes (§8.1), held in memory: it never fetches its own
+    // discovery document (providera.com is not even reachable here).
     let peer = RemotePeer::start().await;
     let app = app(&peer);
-    let req = signed_as(
-        &new_key(),
+    let seed: [u8; 32] = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        common::PROVIDER_SIGNING_KEY,
+    )
+    .unwrap()
+    .try_into()
+    .unwrap();
+    let own = ProviderKey::from_seed(&seed);
+    let ours = signed_as(
+        own.signing_key(),
         ("x-ofscp-provider", "providera.com"),
-        "psk_1",
+        own.key_id(),
         "GET",
         "/api/health",
         "",
         TIMESTAMP,
     );
-    let (status, json, _, retry) = send(&app, req).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert_eq!(json["errorCode"], "unauthorized");
-    assert_eq!(retry, None);
+    let (status, _, text, _) = send(&app, ours).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+
+    // Another key under our key id, and our key under an unknown id: 401.
+    for (key, key_id) in [
+        (new_key(), own.key_id()),
+        (own.signing_key().clone(), "psk_1"),
+    ] {
+        let req = signed_as(
+            &key,
+            ("x-ofscp-provider", "providera.com"),
+            key_id,
+            "GET",
+            "/api/health",
+            "",
+            TIMESTAMP,
+        );
+        let (status, json, _, retry) = send(&app, req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{key_id}");
+        assert_eq!(json["errorCode"], "unauthorized");
+        assert_eq!(retry, None);
+    }
 }

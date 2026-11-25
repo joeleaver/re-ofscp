@@ -51,6 +51,13 @@ impl ProviderKey {
         &self.signing
     }
 
+    /// Every key this provider publishes, as (key id, public key), for
+    /// verifying its own provider signatures. One today; a rotation window
+    /// would add the previous key (docs/decisions/0007).
+    pub fn published(&self) -> Vec<(String, ed25519_dalek::VerifyingKey)> {
+        vec![(self.key_id.clone(), self.signing.verifying_key())]
+    }
+
     /// The public half as published in discovery.
     pub fn public_entry(&self) -> ProviderPublicKey {
         ProviderPublicKey {

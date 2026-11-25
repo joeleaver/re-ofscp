@@ -15,6 +15,7 @@ use tower::ServiceExt;
 fn app() -> axum::Router {
     let config = Config::from_lookup(|k| match k {
         "DOMAIN" => Some("social.example".into()),
+        "PROVIDER_SIGNING_KEY" => Some(common::PROVIDER_SIGNING_KEY.into()),
         "RHYPEDB_ADDR" => Some("127.0.0.1:9".into()),
         _ => None,
     })
