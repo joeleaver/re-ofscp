@@ -18,9 +18,22 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("binding {}", config.bind))?;
     tracing::info!(domain = %config.domain, bind = %config.bind, "re-ofscp listening");
 
-    // Local accounts' keys come from rhypedb. Remote signers are refused
-    // until the SSRF-safe remote resolver lands.
-    let state = AppState::builder(config).build();
+    if !config.outbound_allow_hosts.is_empty() {
+        let hosts: Vec<&str> = config
+            .outbound_allow_hosts
+            .iter()
+            .map(|a| a.as_str())
+            .collect();
+        tracing::warn!(
+            hosts = %hosts.join(","),
+            "OUTBOUND_ALLOW_HOSTS is set: these peers may be on internal addresses"
+        );
+    }
+    // Local accounts' keys come from rhypedb; remote signers' keys are
+    // fetched through the SSRF-safe outbound client (docs/decisions/0006).
+    let state = AppState::builder(config)
+        .build()
+        .context("building application state")?;
     match tokio::time::timeout(RESTORE_TIMEOUT, state.restore_replay()).await {
         Ok(Ok(n)) => tracing::info!(restored = n, "replay store restored from the ledger"),
         Ok(Err(e)) => tracing::warn!(

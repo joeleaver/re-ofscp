@@ -53,6 +53,17 @@ impl RateLimiter {
 
     /// Take one token for `key` at `now` (unix seconds).
     pub fn check(&self, key: &str, now: i64) -> Result<(), Limited> {
+        self.take(key, now, true)
+    }
+
+    /// Whether [`check`](Self::check) would take a token for `key` at
+    /// `now`, without taking it. Lets a caller that needs tokens from
+    /// several limiters take either all of them or none.
+    pub fn peek(&self, key: &str, now: i64) -> Result<(), Limited> {
+        self.take(key, now, false)
+    }
+
+    fn take(&self, key: &str, now: i64, consume: bool) -> Result<(), Limited> {
         let mut map = self.buckets.lock().unwrap_or_else(PoisonError::into_inner);
         if !map.contains_key(key) && map.len() >= self.capacity {
             // Drop buckets that have refilled completely (idle keys).
@@ -62,22 +73,25 @@ impl RateLimiter {
                 return Err(Limited { retry_after: 1 });
             }
         }
-        let b = map.entry(key.to_owned()).or_insert(Bucket {
+        let fresh = Bucket {
             tokens: self.burst,
             updated: now,
-        });
+        };
+        let mut b = map.get(key).copied().unwrap_or(fresh);
         let elapsed = (now - b.updated).max(0) as f64;
         b.tokens = (b.tokens + elapsed * self.per_sec).min(self.burst);
         b.updated = b.updated.max(now);
-        if b.tokens >= 1.0 {
-            b.tokens -= 1.0;
-            Ok(())
-        } else {
+        if b.tokens < 1.0 {
             let wait = ((1.0 - b.tokens) / self.per_sec).ceil();
-            Err(Limited {
+            return Err(Limited {
                 retry_after: (wait as u64).max(1),
-            })
+            });
         }
+        if consume {
+            b.tokens -= 1.0;
+            map.insert(key.to_owned(), b);
+        }
+        Ok(())
     }
 }
 
@@ -215,6 +229,23 @@ mod tests {
         assert_eq!(r.check("a", T), Err(Limited { retry_after: 10 }));
         assert!(r.check("a", T + 9).is_err());
         assert_eq!(r.check("a", T + 10), Ok(()));
+    }
+
+    #[test]
+    fn peeking_takes_no_token() {
+        let r = RateLimiter::new(2, 6, 100);
+        for _ in 0..5 {
+            assert_eq!(r.peek("a", T), Ok(()));
+        }
+        r.check("a", T).unwrap();
+        r.check("a", T).unwrap();
+        assert_eq!(r.peek("a", T), Err(Limited { retry_after: 10 }));
+        assert_eq!(r.peek("a", T + 10), Ok(()));
+        assert_eq!(r.check("a", T + 10), Ok(()));
+        // A full table refuses a peek for a new key the same way.
+        let full = RateLimiter::new(1, 60, 1);
+        full.check("a", T).unwrap();
+        assert!(full.peek("b", T).is_err());
     }
 
     #[test]

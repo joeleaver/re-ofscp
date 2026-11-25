@@ -13,7 +13,9 @@ use ed25519_dalek::SigningKey;
 use http_body_util::BodyExt;
 use re_ofscp_server::replay::{NoLedger, ReplayLimits, ReplayStore};
 use re_ofscp_server::signing::canonical::sign;
-use re_ofscp_server::signing::{Authenticated, Clock, Verifier, authenticate};
+use re_ofscp_server::signing::{
+    Authenticated, Clock, Requester, SignatureLayer, Verifier, authenticate,
+};
 
 #[tokio::test]
 async fn replay_is_refused() {
@@ -66,7 +68,8 @@ async fn production_state_warms_up_for_one_skew_window() {
         .keys(Arc::new(alice_keys()))
         .ledger(Arc::new(re_ofscp_server::replay::NoLedger))
         .clock(Arc::new(FixedClock(SIGNED_AT)))
-        .build();
+        .build()
+        .unwrap();
     let app = re_ofscp_server::router(state);
     let req = Req::health().build();
     let (status, json, _, retry) = send(&app, req).await;
@@ -135,7 +138,10 @@ async fn replay_refused_through_the_last_acceptable_second() {
     ));
     let app = Router::new()
         .route(PATH, post(|_: Authenticated| async { "ok" }))
-        .layer(middleware::from_fn_with_state(verifier, authenticate));
+        .layer(middleware::from_fn_with_state(
+            SignatureLayer::new(verifier, None),
+            authenticate,
+        ));
     let mut r = Req::vector();
     r.timestamp = "2026-01-01T12:05:00Z".into();
     assert_eq!(send(&app, r.build()).await.0, StatusCode::OK);
@@ -199,10 +205,11 @@ async fn slow_copy_cannot_record_with_a_stale_clock() {
     };
     let first = v.precheck(rp).unwrap();
     let second = v.precheck(rp).unwrap();
-    v.complete(first, rp, &body).await.unwrap();
+    let client = Requester::new("unknown");
+    v.complete(first, rp, &body, &client).await.unwrap();
     clock.set(SIGNED_AT + time::Duration::seconds(301));
     assert!(replay.is_empty(clock.now().unix_timestamp()));
-    let err = v.complete(second, rp, &body).await.unwrap_err();
+    let err = v.complete(second, rp, &body, &client).await.unwrap_err();
     assert_eq!(
         err.to_string(),
         "X-OFSCP-Timestamp expired while the request was in flight"

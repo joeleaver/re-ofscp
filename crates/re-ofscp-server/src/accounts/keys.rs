@@ -1,10 +1,11 @@
 //! Resolving signing keys (spec §4.5 step 6, §4.6).
 //!
 //! [`ProviderKeys`] answers for actors of this provider from the account
-//! store, and hands everything else (remote actors, provider signatures) to
-//! a remote resolver. Remote fetching, with the outbound-request rules of
-//! §8, is a separate component; until it lands, [`NoRemoteKeys`] refuses
-//! every remote signer.
+//! store, and hands remote actors and remote providers to a remote resolver
+//! (`crate::remote_keys`, docs/decisions/0006). A provider signature naming
+//! this provider itself is never fetched (that would only fetch our own
+//! discovery document): this provider publishes no signing keys yet (§8.1),
+//! so no such signature can verify.
 //!
 //! Local keys are cached briefly (positive results only). Revoking a key or
 //! disabling an account invalidates the cache at once, in this process; a
@@ -20,20 +21,20 @@ use re_ofscp_types::Authority;
 
 use super::store::AccountStore;
 use crate::signing::canonical::decode_public_key;
-use crate::signing::{KeyError, KeyFuture, KeyResolver, Signer};
+use crate::signing::{KeyError, KeyFuture, KeyResolver, Requester, Resolved, Signer};
 
 /// How long a resolved local key is cached.
 const CACHE_TTL: Duration = Duration::from_secs(60);
 /// Most cached keys; past this the cache is cleared and refilled on demand.
 const CACHE_MAX: usize = 10_000;
+/// `Retry-After` when the account store cannot be read.
+const STORE_RETRY_SECS: u64 = 2;
 
-/// Refuses every signer: no remote resolution is configured yet.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct NoRemoteKeys;
-
-impl KeyResolver for NoRemoteKeys {
-    fn resolve<'a>(&'a self, _signer: &'a Signer, _key_id: &'a str, _fresh: bool) -> KeyFuture<'a> {
-        Box::pin(async { Ok(None) })
+/// The account store could not be read: `503`, retry shortly.
+fn store_unavailable(reason: String) -> KeyError {
+    KeyError::Unavailable {
+        reason,
+        retry_after: STORE_RETRY_SECS,
     }
 }
 
@@ -95,7 +96,7 @@ impl ProviderKeys {
         handle: &str,
         key_id: &str,
         fresh: bool,
-    ) -> Result<Option<VerifyingKey>, KeyError> {
+    ) -> Result<Resolved, KeyError> {
         let cache_key = (handle.to_owned(), key_id.to_owned());
         let epoch = {
             let cache = self.cache();
@@ -103,7 +104,7 @@ impl ProviderKeys {
                 && let Some((key, at)) = cache.entries.get(&cache_key)
                 && at.elapsed() < CACHE_TTL
             {
-                return Ok(Some(*key));
+                return Ok(Resolved::cached(Some(*key)));
             }
             cache.epoch
         };
@@ -111,20 +112,20 @@ impl ProviderKeys {
             .store
             .find_user(handle)
             .await
-            .map_err(|e| KeyError::Unavailable(e.to_string()))?;
+            .map_err(|e| store_unavailable(e.to_string()))?;
         if !user.is_some_and(|u| u.is_active()) {
-            return Ok(None);
+            return Ok(Resolved::authoritative(None));
         }
         let Some(stored) = self
             .store
             .active_key(handle, key_id)
             .await
-            .map_err(|e| KeyError::Unavailable(e.to_string()))?
+            .map_err(|e| store_unavailable(e.to_string()))?
         else {
-            return Ok(None);
+            return Ok(Resolved::authoritative(None));
         };
         let Some(key) = decode_public_key(&stored.public_key) else {
-            return Err(KeyError::Unavailable(format!(
+            return Err(store_unavailable(format!(
                 "stored key {key_id} is not a valid Ed25519 key"
             )));
         };
@@ -137,18 +138,27 @@ impl ProviderKeys {
             }
             cache.entries.insert(cache_key, (key, Instant::now()));
         }
-        Ok(Some(key))
+        Ok(Resolved::authoritative(Some(key)))
     }
 }
 
 impl KeyResolver for ProviderKeys {
-    fn resolve<'a>(&'a self, signer: &'a Signer, key_id: &'a str, fresh: bool) -> KeyFuture<'a> {
+    fn resolve<'a>(
+        &'a self,
+        signer: &'a Signer,
+        key_id: &'a str,
+        fresh: bool,
+        requester: &'a Requester,
+    ) -> KeyFuture<'a> {
         Box::pin(async move {
             match signer {
                 Signer::Actor(actor) if actor.is_local_to(&self.local) => {
                     self.resolve_local(actor.handle(), key_id, fresh).await
                 }
-                _ => self.remote.resolve(signer, key_id, fresh).await,
+                Signer::Provider(authority) if *authority == self.local => {
+                    Ok(Resolved::authoritative(None))
+                }
+                _ => self.remote.resolve(signer, key_id, fresh, requester).await,
             }
         })
     }

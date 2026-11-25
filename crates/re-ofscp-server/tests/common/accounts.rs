@@ -71,7 +71,7 @@ pub async fn env_with(opts: EnvOptions) -> Env {
     if let Some(r) = opts.remote {
         b = b.remote_keys(Arc::new(r));
     }
-    let state = b.build();
+    let state = b.build().unwrap();
     state.restore_replay().await.unwrap();
     clock.set(SIGNED_AT);
     let app = router(state.clone());

@@ -25,7 +25,12 @@ async fn health_reports_degraded_without_a_database() {
         _ => None,
     })
     .unwrap();
-    let app = router(AppState::builder(config).ledger(Arc::new(NoLedger)).build());
+    let app = router(
+        AppState::builder(config)
+            .ledger(Arc::new(NoLedger))
+            .build()
+            .unwrap(),
+    );
 
     let res = app
         .oneshot(Request::get("/api/health").body(Body::empty()).unwrap())

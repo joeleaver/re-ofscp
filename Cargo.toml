@@ -20,7 +20,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 anyhow = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time", "sync"] }
 axum = "0.8"
 tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"
@@ -38,6 +38,13 @@ chacha20poly1305 = "0.10"
 subtle = "2"
 data-encoding = "2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# Outbound HTTPS (docs/decisions/0006): rustls with our own root store (the
+# bundled Mozilla roots), no default features (no proxy discovery, no
+# decompression, no native TLS).
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
+url = "2"
 
 # rhypedb (the database) — pinned to an exact upstream commit. Bump deliberately.
 rhypedb-client = { git = "https://github.com/joeleaver/rhypedb", rev = "c73cc88d14fbebc5a7dbc4ef2f2ef6f99f5a0192", features = ["async"] }

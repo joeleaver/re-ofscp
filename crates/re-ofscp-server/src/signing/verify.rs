@@ -4,17 +4,15 @@
 //! status the spec names. The replay store is only read at step 4 and written
 //! after step 7 succeeds.
 
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use axum::http::{HeaderMap, Method, Uri, header};
-use ed25519_dalek::VerifyingKey;
 use re_ofscp_types::{Actor, Authority};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use super::canonical::{self, CanonicalRequest};
+use super::keys::{KeyError, KeyResolver, Requester};
 use crate::problem::Problem;
 use crate::replay::{
     LedgerError, NonceLedger, NonceUse, ReplayError, ReplayStore, SignerKind, StoredNonce, Surface,
@@ -82,39 +80,6 @@ pub struct Verified {
     pub key_id: String,
 }
 
-/// A failure to resolve keys.
-#[derive(Debug, Clone, thiserror::Error)]
-pub enum KeyError {
-    /// The signer's keys could not be obtained from *them* (their provider
-    /// unreachable, a malformed key document, denied by federation policy).
-    /// §4.5 step 6: `401`.
-    #[error("keys unresolvable: {0}")]
-    Unresolvable(String),
-    /// *This* provider could not look the key up (its own database is
-    /// down). Not the client's fault: `503`, so it retries rather than
-    /// concluding its credentials are bad.
-    #[error("key store unavailable: {0}")]
-    Unavailable(String),
-}
-
-/// Boxed future returned by [`KeyResolver::resolve`].
-pub type KeyFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<Option<VerifyingKey>, KeyError>> + Send + 'a>>;
-
-/// Finds the active (non-revoked) public key a signer uses under a key id.
-///
-/// `fresh = false` may answer from cache. The verifier calls again with
-/// `fresh = true` when the key is unknown or the signature fails, so rotated
-/// keys are picked up (§4.6, §8.1). That happens on *every* failed
-/// signature, forgeries included, so an implementation that fetches remotely
-/// **must** rate-limit fresh lookups per signer domain and answer from cache
-/// when the limit is hit (§8 "Outbound requests"); otherwise a stream of
-/// forged requests becomes a stream of outbound fetches.
-pub trait KeyResolver: Send + Sync {
-    /// Resolve `key_id` for `signer`. `Ok(None)` means "no such active key".
-    fn resolve<'a>(&'a self, signer: &'a Signer, key_id: &'a str, fresh: bool) -> KeyFuture<'a>;
-}
-
 /// Source of the current time (injectable for tests).
 pub trait Clock: Send + Sync {
     /// Now.
@@ -174,13 +139,19 @@ pub enum VerifyError {
     /// Step 5: body digest mismatch.
     #[error("X-OFSCP-Content-Digest does not match the body")]
     Digest,
-    /// Step 6: no active key with that id (or the signer's keys could not
-    /// be obtained).
+    /// Step 6: no active key with that id, or no key for this signer can
+    /// ever be checked (its provider is refused by our outbound rules).
     #[error("unknown or revoked key")]
     UnknownKey,
-    /// Step 6: this provider's own key store is unavailable.
-    #[error("key store unavailable; retry shortly")]
-    KeysUnavailable,
+    /// Step 6: the signer's keys could not be obtained right now (their
+    /// provider failed to answer, a re-fetch was rate-limited, or our own
+    /// key store is down). §4.6: `503`, never `401`, because the signature
+    /// was never checked.
+    #[error("signing keys could not be obtained; retry shortly")]
+    KeysUnavailable {
+        /// Seconds to wait.
+        retry_after: u64,
+    },
     /// Step 7: bad signature.
     #[error("signature does not verify")]
     Signature,
@@ -190,12 +161,12 @@ impl From<VerifyError> for Problem {
     fn from(e: VerifyError) -> Self {
         let p = match e {
             VerifyError::Digest => Problem::bad_request(),
-            VerifyError::StoreFull { retry_after } | VerifyError::WarmingUp { retry_after } => {
+            VerifyError::StoreFull { retry_after }
+            | VerifyError::WarmingUp { retry_after }
+            | VerifyError::KeysUnavailable { retry_after } => {
                 Problem::service_unavailable(retry_after)
             }
-            VerifyError::LedgerUnavailable | VerifyError::KeysUnavailable => {
-                Problem::service_unavailable(LEDGER_RETRY_SECS)
-            }
+            VerifyError::LedgerUnavailable => Problem::service_unavailable(LEDGER_RETRY_SECS),
             VerifyError::RateLimited { retry_after } => Problem::too_many_requests(retry_after),
             _ => Problem::unauthorized(),
         };
@@ -297,14 +268,16 @@ impl Verifier {
         self.clock.now().unix_timestamp()
     }
 
-    /// Run §4.5 steps 1–7 and record the nonce.
+    /// Run §4.5 steps 1–7 and record the nonce. Remote key fetches are
+    /// charged to `requester`.
     pub async fn verify(
         &self,
         req: RequestParts<'_>,
         body: &[u8],
+        requester: &Requester,
     ) -> Result<Verified, VerifyError> {
         let pre = self.precheck(req)?;
-        self.complete(pre, req, body).await
+        self.complete(pre, req, body, requester).await
     }
 
     /// §4.5 steps 1–4, which need no body.
@@ -357,21 +330,26 @@ impl Verifier {
     }
 
     /// §4.5 steps 5–7, then record the nonce. `req` must be the request
-    /// `pre` came from.
+    /// `pre` came from; remote key fetches are charged to `requester`, the
+    /// client that sent it.
     pub async fn complete(
         &self,
         pre: Precheck,
         req: RequestParts<'_>,
         body: &[u8],
+        requester: &Requester,
     ) -> Result<Verified, VerifyError> {
         // Step 5: body digest.
         if canonical::content_digest(body) != pre.digest {
             return Err(VerifyError::Digest);
         }
 
-        // Steps 6 and 7: resolve the key and verify; on failure re-fetch once
-        // so a freshly rotated key is honoured (§4.6, §8.1). Resolvers that
-        // fetch remotely rate-limit fresh lookups (see `KeyResolver`).
+        // Steps 6 and 7: resolve the key and verify. If a *cached* answer
+        // has no such key or its key does not verify, ask again with
+        // `fresh` so a newly registered or rotated key is honoured (§4.6,
+        // §8.1, lost-conn/ofscp#19). An answer fetched for this request is
+        // final: fetching it twice could not change it. Resolvers that fetch
+        // remotely rate-limit fresh lookups (see `KeyResolver`).
         let canonical = CanonicalRequest {
             authority: self.authority.as_str(),
             method: req.method.as_str(),
@@ -382,11 +360,15 @@ impl Verifier {
             content_digest: &pre.digest,
         }
         .render();
-        let mut outcome = self.try_key(&pre, &canonical, false).await;
-        if outcome.is_err() {
-            outcome = self.try_key(&pre, &canonical, true).await;
+        match self.try_key(&pre, &canonical, false, requester).await {
+            Ok(()) => {}
+            Err(failure) if failure.retry => {
+                self.try_key(&pre, &canonical, true, requester)
+                    .await
+                    .map_err(|f| f.error)?;
+            }
+            Err(failure) => return Err(failure.error),
         }
-        outcome?;
 
         // Re-check and record atomically, on a fresh clock reading (reading
         // the body and resolving keys take time). The store re-checks
@@ -422,28 +404,58 @@ impl Verifier {
         })
     }
 
+    /// Resolve the key (step 6) and check the signature (step 7).
     async fn try_key(
         &self,
         pre: &Precheck,
         canonical: &str,
         fresh: bool,
-    ) -> Result<(), VerifyError> {
-        let key = match self.keys.resolve(&pre.signer, &pre.key_id, fresh).await {
-            Ok(Some(key)) => key,
-            Ok(None) => return Err(VerifyError::UnknownKey),
+        requester: &Requester,
+    ) -> Result<(), KeyFailure> {
+        let resolved = match self
+            .keys
+            .resolve(&pre.signer, &pre.key_id, fresh, requester)
+            .await
+        {
+            Ok(resolved) => resolved,
             Err(KeyError::Unresolvable(e)) => {
-                tracing::debug!(error = %e, key_id = pre.key_id, "key resolution failed");
-                return Err(VerifyError::UnknownKey);
+                tracing::info!(error = %e, key_id = pre.key_id, "signer's keys are unresolvable");
+                return Err(KeyFailure::terminal(VerifyError::UnknownKey));
             }
-            Err(KeyError::Unavailable(e)) => {
-                tracing::error!(error = %e, key_id = pre.key_id, "key store unavailable");
-                return Err(VerifyError::KeysUnavailable);
+            Err(KeyError::Unavailable {
+                reason,
+                retry_after,
+            }) => {
+                tracing::warn!(error = %reason, key_id = pre.key_id, "signing keys unavailable");
+                return Err(KeyFailure::terminal(VerifyError::KeysUnavailable {
+                    retry_after,
+                }));
             }
         };
-        if canonical::verify(&key, canonical, &pre.signature) {
-            Ok(())
-        } else {
-            Err(VerifyError::Signature)
+        let error = match resolved.key {
+            Some(key) if canonical::verify(&key, canonical, &pre.signature) => return Ok(()),
+            Some(_) => VerifyError::Signature,
+            None => VerifyError::UnknownKey,
+        };
+        Err(KeyFailure {
+            error,
+            retry: resolved.from_cache,
+        })
+    }
+}
+
+/// Why steps 6–7 failed, and whether asking again with `fresh` could help.
+struct KeyFailure {
+    error: VerifyError,
+    /// The answer came from a cache: a fresh lookup may know better.
+    retry: bool,
+}
+
+impl KeyFailure {
+    fn terminal(error: VerifyError) -> Self {
+        Self {
+            error,
+            retry: false,
         }
     }
 }
@@ -542,30 +554,4 @@ fn parse_headers(headers: &HeaderMap) -> Result<SigHeaders<'_>, VerifyError> {
         digest,
         signature,
     })
-}
-
-/// A fixed set of keys, for tests and for statically configured peers.
-#[derive(Debug, Default, Clone)]
-pub struct StaticKeys {
-    keys: Vec<(Signer, String, VerifyingKey)>,
-}
-
-impl StaticKeys {
-    /// Add a key.
-    #[must_use]
-    pub fn with(mut self, signer: Signer, key_id: &str, key: VerifyingKey) -> Self {
-        self.keys.push((signer, key_id.to_owned(), key));
-        self
-    }
-}
-
-impl KeyResolver for StaticKeys {
-    fn resolve<'a>(&'a self, signer: &'a Signer, key_id: &'a str, _fresh: bool) -> KeyFuture<'a> {
-        let found = self
-            .keys
-            .iter()
-            .find(|(s, k, _)| s == signer && k == key_id)
-            .map(|(_, _, key)| *key);
-        Box::pin(async move { Ok(found) })
-    }
 }

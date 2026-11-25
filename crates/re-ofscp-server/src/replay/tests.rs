@@ -297,19 +297,6 @@ fn concurrent_records_have_exactly_one_winner() {
 }
 
 #[test]
-fn registrable_groups_ignore_subdomains_and_ports() {
-    assert_eq!(registrable_group("evil.example.com"), "example.com");
-    assert_eq!(
-        registrable_group("a.b.evil.example.com:8443"),
-        "example.com"
-    );
-    assert_eq!(registrable_group("x.foo.co.uk"), "foo.co.uk");
-    // Hosts without a registrable domain group by host.
-    assert_eq!(registrable_group("localhost:8080"), "localhost");
-    assert_eq!(registrable_group("10.0.0.1"), "10.0.0.1");
-}
-
-#[test]
 fn subdomains_and_ports_of_one_domain_share_a_quota() {
     let s = warm_with(ReplayLimits {
         per_remote_domain: 2,

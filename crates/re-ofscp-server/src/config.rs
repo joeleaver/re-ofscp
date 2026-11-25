@@ -54,6 +54,15 @@ pub struct Config {
     /// always resolve to loopback (RFC 6761 §6.3), so a public deployment
     /// cannot turn it on (docs/decisions/0005).
     pub admin_loopback_http: bool,
+    /// Peers the outbound-request address rule does not apply to
+    /// (`OUTBOUND_ALLOW_HOSTS`: comma-separated authorities, e.g.
+    /// `peer.internal,localhost:8443`; default none). Every other outbound
+    /// rule (https only, no redirects, time and size bounds) still applies.
+    /// For development and private peerings only: a listed host may be on
+    /// loopback or an internal network (spec §8 "Outbound requests",
+    /// docs/decisions/0006). Each entry is matched as a whole authority,
+    /// port included.
+    pub outbound_allow_hosts: Vec<Authority>,
 }
 
 /// A secret configuration value: `Debug` never prints it.
@@ -165,8 +174,23 @@ impl Config {
                 });
             }
         };
+        let outbound_allow_hosts = match get("OUTBOUND_ALLOW_HOSTS") {
+            None => Vec::new(),
+            Some(v) => v
+                .split(',')
+                .map(str::trim)
+                .filter(|h| !h.is_empty())
+                .map(|h| {
+                    Authority::canonicalize(h).map_err(|e| ConfigError::Invalid {
+                        name: "OUTBOUND_ALLOW_HOSTS",
+                        reason: format!("{h:?}: {e}"),
+                    })
+                })
+                .collect::<Result<_, _>>()?,
+        };
         Ok(Self {
             domain,
+            outbound_allow_hosts,
             admin_secret_key,
             admin_setup_token,
             admin_loopback_http,
@@ -349,6 +373,45 @@ mod tests {
                     })
                 ),
                 "{domain} {flag}"
+            );
+        }
+    }
+
+    #[test]
+    fn outbound_allow_hosts_are_canonical_authorities() {
+        let hosts = |v: Option<&str>| {
+            let mut pairs = vec![("DOMAIN", "a.example")];
+            if let Some(v) = v {
+                pairs.push(("OUTBOUND_ALLOW_HOSTS", v));
+            }
+            Config::from_lookup(env(&pairs)).map(|c| {
+                c.outbound_allow_hosts
+                    .iter()
+                    .map(|a| a.as_str().to_owned())
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert!(hosts(None).unwrap().is_empty());
+        assert!(hosts(Some("")).unwrap().is_empty());
+        assert_eq!(
+            hosts(Some(" Peer.Internal , localhost:8443,,b.example:443 ")).unwrap(),
+            ["peer.internal", "localhost:8443", "b.example"]
+        );
+        for bad in [
+            "http://peer.internal",
+            "peer internal",
+            "a.example:0x50",
+            "[::1]:8443",
+        ] {
+            assert!(
+                matches!(
+                    hosts(Some(bad)),
+                    Err(ConfigError::Invalid {
+                        name: "OUTBOUND_ALLOW_HOSTS",
+                        ..
+                    })
+                ),
+                "{bad}"
             );
         }
     }
