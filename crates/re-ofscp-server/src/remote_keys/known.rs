@@ -2,24 +2,15 @@
 //! non-empty key list (docs/decisions/0006). Their expiry re-fetches are
 //! charged to the targets' known budgets.
 //!
-//! The table is bounded per target group (registrable domain) as well as
-//! overall, so that one domain cannot push every other domain's sources
-//! out. Anyone running a provider that serves keys for any handle can make
-//! its own sources known; the per-group cap keeps that to its own share:
-//!
-//! * a group at [`MAX_KNOWN_PER_GROUP`] makes room by forgetting **its own**
-//!   source confirmed longest ago;
-//! * a full table ([`MAX_KNOWN`]) makes room in the **largest** group (on a
-//!   tie, the one that most recently gained a source), so a group is only
-//!   ever cut back while no other group is bigger.
-//!
-//! Every operation is O(log n).
+//! The table is a [`Grouped`] one, bounded per target group (registrable
+//! domain) as well as overall, so that one domain cannot push every other
+//! domain's sources out. Known sources never expire, so a group at
+//! [`MAX_KNOWN_PER_GROUP`] forgets its own source confirmed longest ago,
+//! and a full table ([`MAX_KNOWN`]) the one confirmed longest ago in the
+//! largest group. Every operation is O(log n).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::Arc;
-
-use super::budget::target_group;
 use super::fetch::Source;
+use super::grouped::Grouped;
 use super::state::MAX_ENTRIES;
 
 /// Most known sources in one target group.
@@ -27,38 +18,8 @@ pub const MAX_KNOWN_PER_GROUP: usize = 500;
 /// Most known sources in all.
 pub const MAX_KNOWN: usize = MAX_ENTRIES;
 
-/// Where a source sits in its group's order: when it was last confirmed,
-/// then a sequence number that makes the order total.
-type Order = (i64, u64);
-
-/// A group's rank among groups: its size, when it last gained a source,
-/// and its name. The last rank is the group to cut back first.
-type Rank = (usize, u64, Arc<str>);
-
-/// A known source's place.
-struct Slot {
-    group: Arc<str>,
-    order: Order,
-}
-
-/// The known sources of one target group.
-struct Group {
-    /// Its sources, confirmed longest ago first.
-    entries: BTreeMap<Order, Source>,
-    /// The sequence number of the last source it gained.
-    grown: u64,
-}
-
 /// The known sources, bounded per target group and overall.
-pub struct KnownSources {
-    slots: HashMap<Source, Slot>,
-    groups: HashMap<Arc<str>, Group>,
-    /// Every non-empty group, by [`Rank`].
-    ranks: BTreeSet<Rank>,
-    seq: u64,
-    per_group: usize,
-    total: usize,
-}
+pub struct KnownSources(Grouped<()>);
 
 impl Default for KnownSources {
     fn default() -> Self {
@@ -70,106 +31,29 @@ impl KnownSources {
     /// A table holding at most `per_group` sources of one target group and
     /// `total` in all.
     pub fn with_caps(per_group: usize, total: usize) -> Self {
-        Self {
-            slots: HashMap::new(),
-            groups: HashMap::new(),
-            ranks: BTreeSet::new(),
-            seq: 0,
-            per_group: per_group.max(1),
-            total: total.max(1),
-        }
+        Self(Grouped::with_caps(per_group, total))
     }
 
     /// Whether `source` is known.
     pub fn contains(&self, source: &Source) -> bool {
-        self.slots.contains_key(source)
+        self.0.contains(source)
     }
 
     /// How many sources are known.
     #[cfg(test)]
     pub fn len(&self) -> usize {
-        self.slots.len()
+        self.0.len()
     }
 
     /// Record that a fetch of `source` found keys at `now`, making room
     /// first if it is new and its group or the table is full.
     pub fn confirm(&mut self, source: &Source, now: i64) {
-        self.seq += 1;
-        let order = (now, self.seq);
-        if let Some(slot) = self.slots.get_mut(source) {
-            // Re-confirmed: moves to the back of its group's order. The
-            // group's size and rank do not change.
-            if let Some(group) = self.groups.get_mut(&slot.group) {
-                group.entries.remove(&slot.order);
-                group.entries.insert(order, source.clone());
-            }
-            slot.order = order;
-            return;
-        }
-        let name: Arc<str> = target_group(source).into();
-        let size = self.groups.get(&name).map_or(0, |g| g.entries.len());
-        if size >= self.per_group {
-            self.evict_oldest(&name);
-        } else if self.slots.len() >= self.total
-            && let Some((_, _, largest)) = self.ranks.last().cloned()
-        {
-            self.evict_oldest(&largest);
-        }
-        self.unrank(&name);
-        let group = self.groups.entry(name.clone()).or_insert_with(|| Group {
-            entries: BTreeMap::new(),
-            grown: 0,
-        });
-        group.entries.insert(order, source.clone());
-        group.grown = self.seq;
-        self.rerank(&name);
-        self.slots
-            .insert(source.clone(), Slot { group: name, order });
+        self.0.insert(source, (), None, now);
     }
 
     /// Forget `source` (a fetch found no keys for it).
     pub fn forget(&mut self, source: &Source) {
-        let Some(slot) = self.slots.remove(source) else {
-            return;
-        };
-        self.unrank(&slot.group);
-        if let Some(group) = self.groups.get_mut(&slot.group) {
-            group.entries.remove(&slot.order);
-        }
-        self.rerank(&slot.group);
-    }
-
-    /// Forget the source of group `name` confirmed longest ago.
-    fn evict_oldest(&mut self, name: &Arc<str>) {
-        self.unrank(name);
-        if let Some(group) = self.groups.get_mut(name)
-            && let Some((_, source)) = group.entries.pop_first()
-        {
-            self.slots.remove(&source);
-        }
-        self.rerank(name);
-    }
-
-    /// Take group `name` out of the ranking, before it changes size.
-    fn unrank(&mut self, name: &Arc<str>) {
-        if let Some(group) = self.groups.get(name) {
-            self.ranks
-                .remove(&(group.entries.len(), group.grown, name.clone()));
-        }
-    }
-
-    /// Put group `name` back in the ranking after a change, or drop it if
-    /// it is now empty.
-    fn rerank(&mut self, name: &Arc<str>) {
-        match self.groups.get(name) {
-            Some(group) if !group.entries.is_empty() => {
-                self.ranks
-                    .insert((group.entries.len(), group.grown, name.clone()));
-            }
-            _ => {
-                self.groups.remove(name);
-            }
-        }
+        self.0.remove(source);
     }
 }
 
@@ -183,22 +67,8 @@ mod tests {
         Source::User(Actor::parse_canonical(id).unwrap())
     }
 
-    /// The tables agree with each other: every slot is in its group at its
-    /// order, every group is ranked by its true size, none is empty.
     fn assert_consistent(k: &KnownSources) {
-        let in_groups: usize = k.groups.values().map(|g| g.entries.len()).sum();
-        assert_eq!(in_groups, k.slots.len());
-        assert_eq!(k.ranks.len(), k.groups.len());
-        for (name, group) in &k.groups {
-            assert!(!group.entries.is_empty());
-            assert!(
-                k.ranks
-                    .contains(&(group.entries.len(), group.grown, name.clone()))
-            );
-        }
-        for (source, slot) in &k.slots {
-            assert_eq!(k.groups[&slot.group].entries.get(&slot.order), Some(source));
-        }
+        k.0.assert_consistent();
     }
 
     #[test]
@@ -214,7 +84,7 @@ mod tests {
         assert!(!k.contains(&alice));
         k.forget(&alice);
         assert_eq!(k.len(), 0);
-        assert!(k.groups.is_empty() && k.ranks.is_empty());
+        assert_consistent(&k);
     }
 
     #[test]
@@ -261,7 +131,7 @@ mod tests {
     }
 
     fn size(k: &KnownSources, name: &str) -> usize {
-        k.groups.get(name).map_or(0, |g| g.entries.len())
+        k.0.group_len(name)
     }
 
     #[test]

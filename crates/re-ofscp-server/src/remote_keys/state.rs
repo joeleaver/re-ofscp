@@ -1,6 +1,10 @@
 //! The resolver's bounded tables: cached documents, fetches in flight,
 //! when each source was last re-fetched on a miss, and which sources are
 //! known (their last completed fetch found keys).
+//!
+//! The cached documents and the known sources are bounded per target group
+//! as well as overall ([`Grouped`]), so that a provider serving keys for
+//! any handle cannot push other domains' entries out (docs/decisions/0006).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -10,10 +14,16 @@ use tokio::sync::watch;
 
 use super::document::KeySet;
 use super::fetch::{Fetched, Source};
-use super::known::KnownSources;
+use super::grouped::Grouped;
+use super::known::{KnownSources, MAX_KNOWN_PER_GROUP};
 
 /// Most entries in each table.
 pub const MAX_ENTRIES: usize = 10_000;
+/// Most cached documents of one target group: as many as it may have known
+/// sources.
+pub const MAX_CACHED_PER_GROUP: usize = MAX_KNOWN_PER_GROUP;
+/// Most cached documents in all.
+pub const MAX_CACHED: usize = MAX_ENTRIES;
 /// At most one failure-driven re-fetch per source this often (§4.6 allows
 /// "one per minute").
 pub const REFETCH_INTERVAL_SECS: i64 = 60;
@@ -28,18 +38,11 @@ pub struct Flight {
     pub refetch: bool,
 }
 
-/// A cached document.
-struct Entry {
-    keys: Arc<KeySet>,
-    /// Usable while `now < expires` (unix seconds).
-    expires: i64,
-    stored: i64,
-}
-
 /// The tables, kept under one lock.
-#[derive(Default)]
 pub struct Tables {
-    cache: HashMap<Source, Entry>,
+    /// Cached documents, each usable while `now < expires` (unix seconds),
+    /// bounded per target group and overall.
+    cache: Grouped<Arc<KeySet>>,
     /// Fetches in flight, so concurrent lookups share one.
     pub flights: HashMap<Source, Flight>,
     /// When each source was last re-fetched for a `fresh` lookup.
@@ -50,13 +53,30 @@ pub struct Tables {
     known: KnownSources,
 }
 
+impl Default for Tables {
+    fn default() -> Self {
+        Self::with_cache_caps(MAX_CACHED_PER_GROUP, MAX_CACHED)
+    }
+}
+
 impl Tables {
+    /// Tables whose cache holds at most `per_group` documents of one target
+    /// group and `total` in all.
+    pub fn with_cache_caps(per_group: usize, total: usize) -> Self {
+        Self {
+            cache: Grouped::with_caps(per_group, total),
+            flights: HashMap::new(),
+            refetched: HashMap::new(),
+            known: KnownSources::default(),
+        }
+    }
+
     /// `source`'s keys, if its cache entry has not expired at `now`.
     pub fn live(&self, source: &Source, now: i64) -> Option<&Arc<KeySet>> {
-        self.cache
-            .get(source)
-            .filter(|e| now < e.expires)
-            .map(|e| &e.keys)
+        match self.cache.get(source) {
+            Some((keys, Some(expires))) if now < expires => Some(keys),
+            _ => None,
+        }
     }
 
     /// The key `key_id` of `source` from an entry still unexpired at `now`.
@@ -71,21 +91,15 @@ impl Tables {
 
     /// Record a completed fetch. Cacheable until `expires`, or (for
     /// `None`) not at all, which also drops what was cached before: it is
-    /// superseded.
+    /// superseded. Making room drops an expired entry or the oldest of a
+    /// group at or over its share ([`Grouped`]); it never touches a fetch
+    /// in flight, which lookups keep joining whatever the cache holds.
     pub fn store(&mut self, source: &Source, keys: Arc<KeySet>, expires: Option<i64>, now: i64) {
         let Some(expires) = expires.filter(|&t| t > now) else {
             self.cache.remove(source);
             return;
         };
-        make_room(&mut self.cache, source, |e| e.expires <= now, |e| e.stored);
-        self.cache.insert(
-            source.clone(),
-            Entry {
-                keys,
-                expires,
-                stored: now,
-            },
-        );
+        self.cache.insert(source, keys, Some(expires), now);
     }
 
     /// Seconds until `source` may be re-fetched for a `fresh` lookup, or
@@ -198,31 +212,31 @@ mod tests {
     }
 
     #[test]
-    fn tables_are_bounded_dropping_expired_then_oldest() {
-        let mut t = Tables::default();
-        for i in 0..MAX_ENTRIES {
-            // Entry 0 expires first; entry 1 is the oldest of the rest.
-            let (stored, expires) = if i == 0 { (5, 50) } else { (i as i64, 100_000) };
-            t.store(&source(i), Arc::new(KeySet::new()), Some(expires), stored);
+    fn the_cache_is_bounded_dropping_expired_then_the_largest_groups_oldest() {
+        let mut t = Tables::with_cache_caps(3, 4);
+        let keys = || Arc::new(KeySet::new());
+        let sub = Source::Provider(Authority::parse_canonical("a.p1.example").unwrap());
+        // p0 expires at 50; p1.example holds two entries. The table is full.
+        t.store(&source(0), keys(), Some(50), 0);
+        t.store(&source(1), keys(), Some(1000), 1);
+        t.store(&sub, keys(), Some(1000), 2);
+        t.store(&source(2), keys(), Some(1000), 3);
+        // An expired entry goes first, whatever its group.
+        t.store(&source(3), keys(), Some(1000), 60);
+        assert!(t.cache.get(&source(0)).is_none(), "expired entry dropped");
+        assert!(t.live(&source(1), 60).is_some());
+        // Then the oldest entry of the largest group.
+        t.store(&source(4), keys(), Some(1000), 61);
+        assert!(t.cache.get(&source(1)).is_none(), "p1.example was cut back");
+        for s in [&sub, &source(2), &source(3), &source(4)] {
+            assert!(t.live(s, 62).is_some(), "{s:?}");
         }
-        t.store(
-            &source(MAX_ENTRIES),
-            Arc::new(KeySet::new()),
-            Some(100_000),
-            60,
-        );
-        assert_eq!(t.cache.len(), MAX_ENTRIES);
-        assert!(!t.cache.contains_key(&source(0)), "expired entry dropped");
-        assert!(t.cache.contains_key(&source(1)));
-        t.store(
-            &source(MAX_ENTRIES + 1),
-            Arc::new(KeySet::new()),
-            Some(100_000),
-            60,
-        );
-        assert!(!t.cache.contains_key(&source(1)), "then the oldest");
-        assert_eq!(t.cache.len(), MAX_ENTRIES);
+        t.cache.assert_consistent();
+    }
 
+    #[test]
+    fn the_refetch_table_is_bounded_dropping_expired_then_oldest() {
+        let mut t = Tables::default();
         // Re-fetch times: entry 0 is the oldest, none has lapsed yet.
         for i in 0..MAX_ENTRIES {
             t.note_refetch(&source(i), if i == 0 { 990 } else { 1000 });

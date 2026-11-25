@@ -210,6 +210,25 @@ Replaces `NoRemoteKeys` behind `ProviderKeys`' `remote` slot.
       refusal. A forgotten source is first-time until a fetch finds its
       keys again. All operations are O(log n) (per-group ordered maps and
       a ranking of groups by size).
+    - *Cached documents are bounded the same way,* and for the same
+      reason: with one global table evicting its oldest entry, a provider
+      serving keys for any handle could have us cache 10 000 of its own
+      documents and push out every peer's, after which each of the peer's
+      users' next ordinary lookup costs an expiry fetch from the peer's
+      known bucket, and is refused once that bucket is empty: the
+      starvation the budgets exist to prevent. The cache holds at most
+      **500** documents per target group and **10 000** in all. A group at
+      its cap gives up its own expired document if it has one, else its
+      own stored longest ago; a full cache gives up an expired document of
+      any group if there is one, else the oldest of the largest group (on
+      a tie, the one that most recently gained a document). The arithmetic
+      is that of the known sources above: a peer keeps its cached
+      documents unless an attacker fills 20 or more other registrable
+      domains, each through its own client and first-time budgets. Both
+      tables share one implementation (`remote_keys/grouped.rs`).
+      Eviction only removes a document; it never extends another's life
+      (#20), and it never touches the fetches in flight, so lookups keep
+      joining a fetch under way whatever the cache holds.
   - *Per client:* a token bucket per client address (the same key as the
     login rate limits: the `CLIENT_IP_HEADER` entry our proxy appends, else
     the TCP peer; IPv6 by /64), burst 10, **10 per minute**. The signature
@@ -273,11 +292,13 @@ Replaces `NoRemoteKeys` behind `ProviderKeys`' `remote` slot.
   only discovered by a lookup, which does take tokens. A name that fails to
   resolve at all (NXDOMAIN, SERVFAIL, timeout) is a network error, so a fetch
   failure (`503`), not a refusal.
-- **Bounds:** at most 10 000 cached sources, 10 000 per-source re-fetch
-  times and 10 000 fetches in flight; past that, expired entries go first,
-  then the oldest (in flight: `503`, `Retry-After: 1`). Known sources: at
-  most 500 per target group and 10 000 in all, evicted as described under
-  "Per target". Each set of token buckets (the existing `RateLimiter`:
+- **Bounds:** at most 10 000 per-source re-fetch times and 10 000
+  fetches in flight; past that, expired re-fetch times go first, then the
+  oldest (in flight: `503`, `Retry-After: 1`). Cached documents and known
+  sources: at most 500 per target group and 10 000 in all, evicted as
+  described under "Per target" (expired documents first, within the full
+  group or, for a full cache, anywhere; then the oldest of the full group
+  or of the largest group). Each set of token buckets (the existing `RateLimiter`:
   known and first-time user-key targets, known and first-time discovery
   targets, clients) holds at most 10 000 keys; when full it drops idle buckets and
   otherwise refuses new keys (fail closed: `503`, `Retry-After: 1`), rather
