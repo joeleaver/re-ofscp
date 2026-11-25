@@ -4,6 +4,7 @@
 pub mod accounts;
 pub mod admin;
 pub mod harness;
+pub mod remote_peer;
 pub mod rhypedb;
 
 use std::path::PathBuf;

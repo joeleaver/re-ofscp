@@ -40,6 +40,10 @@ sha1 = { workspace = true }
 chacha20poly1305 = { workspace = true }
 subtle = { workspace = true }
 data-encoding = { workspace = true }
+reqwest = { workspace = true }
+rustls = { workspace = true }
+webpki-roots = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
 rhypedb-schema = { workspace = true }
@@ -48,3 +52,8 @@ time = { workspace = true, features = ["macros"] }
 serde_json = { workspace = true }
 jsonschema = { version = "0.60", default-features = false }
 tempfile = "3"
+# A local https "remote provider" for the outbound and remote-key tests.
+rcgen = "0.14"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }

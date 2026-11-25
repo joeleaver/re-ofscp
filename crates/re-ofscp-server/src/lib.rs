@@ -8,6 +8,7 @@ pub mod admin;
 pub mod client;
 pub mod config;
 pub mod db;
+pub mod outbound;
 pub mod problem;
 pub mod ratelimit;
 pub mod replay;
