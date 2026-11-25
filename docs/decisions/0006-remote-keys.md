@@ -312,26 +312,25 @@ Replaces `NoRemoteKeys` behind `ProviderKeys`' `remote` slot.
     re-fetch on a miss), and cache hits and joined fetches are free.
   - A fetch is charged to the target's, the client's and (for IPv6) the
     client's /48 bucket together, or to none, and only when it is about to
-    start: cache hits and
-    lookups that join a fetch already under way cost nothing, and every
-    other refusal (unknown suffix, re-fetch interval, in-flight table full,
-    target busy) is decided before any bucket is touched. In particular a
-    target already at its in-flight cap answers `503` (`Retry-After: 5`, or
-    a matching unexpired cached key) without spending a token or starting
-    the 60 s re-fetch interval, which would otherwise make the next lookup
-    wait a minute for a fetch that never happened.
+    start: cache hits and lookups that join a fetch already under way cost
+    nothing, and every other refusal (unknown suffix, re-fetch interval,
+    in-flight table full, target busy) is decided before any bucket is
+    touched. In particular a target already at its in-flight cap answers
+    `503` (`Retry-After: 5`, or a matching unexpired cached key) without
+    spending a token or starting the 60 s re-fetch interval, which would
+    otherwise make the next lookup wait a minute for a fetch that never
+    happened.
   - When a limit stops a fetch: an unexpired cached key with that `key_id`
     is still used; otherwise `503` with `Retry-After` until the fetch would
     be allowed.
-  - *Trade-off:* the per-client bound is per source address, and the
-    client rate (10 a minute) is a third of a target bucket's refill, so
-    a handful of addresses (four IPv4 addresses, or one IPv6 /48, are
-    enough) can keep a peer's first-time buckets empty: new users of that
-    peer, and key rotations
-    of its existing users (see above), get `503`s until the spam stops or
-    the rotated user's cached document expires. They cannot touch its
-    known buckets, which only expiry-driven fetches use. Cached keys keep
-    working meanwhile.
+  - *Trade-off:* the per-client bound is per source address, and the client
+    rate (10 a minute) is a third of a target bucket's refill, so a handful
+    of addresses (four IPv4 addresses, or one IPv6 /48, are enough) can keep
+    a peer's first-time buckets empty: new users of that peer, and key
+    rotations of its existing users (see above), get `503`s until the spam
+    stops or the rotated user's cached document expires. They cannot touch
+    its known buckets, which only expiry-driven fetches use. Cached keys
+    keep working meanwhile.
   - *What reaches a peer (§8):* the target buckets cap every fetch to one
     registrable domain at 4 × (burst 20 + 30 a minute) = a burst of
     **80** and **120 a minute** (2 a second) at most, all four buckets
@@ -364,29 +363,26 @@ Replaces `NoRemoteKeys` behind `ProviderKeys`' `remote` slot.
   resolve at all (NXDOMAIN, SERVFAIL, timeout) is a network error, so a fetch
   failure (`503`), not a refusal.
 - **Bounds:** at most 10 000 fetches in flight (past that, `503`,
-  `Retry-After: 1`). At most 10 000 per-source re-fetch times, each
-  expiring when its 60 s interval ends and grouped by target group like
-  the cache: past that, an expired one goes first, then the oldest of the
-  largest group (every operation O(log n)). Under a load of many groups'
-  re-fetches, an unexpired re-fetch time can be evicted, and its source
-  can then be re-fetched sooner than once per 60 s. Each such re-fetch is
-  a `fresh` one, so is still charged to the target's first-time bucket
-  (and the client's): the load on a peer stays within the first-time
-  buckets' bound (above, "What reaches a peer"), whatever the table
-  holds. Cached documents and known
-  sources: at most 10 000 each, any number per group while there is room;
-  cached negatives: at most 100 per target group and 2 000 in all; all
-  evicted as described under "Per target": for negatives, a group at its
-  cap gives up its own expired entry, else its own oldest, and only its
-  own entries are considered; otherwise a full table gives up an expired
-  entry of any group first, then the oldest of the largest group, or of
-  the inserting group if none is larger. Each set of token buckets (the
-  existing `RateLimiter`:
-  known and first-time user-key targets, known and first-time discovery
-  targets, clients, client /48s) holds at most 10 000 keys; when full it
-  drops idle buckets and
-  otherwise refuses new keys (fail closed: `503`, `Retry-After: 1`), rather
-  than forget one that is being limited.
+  `Retry-After: 1`). At most 10 000 per-source re-fetch times, each expiring
+  when its 60 s interval ends and grouped by target group like the cache:
+  past that, an expired one goes first, then the oldest of the largest group
+  (every operation O(log n)). Under a load of many groups' re-fetches, an
+  unexpired re-fetch time can be evicted, and its source can then be
+  re-fetched sooner than once per 60 s. Each such re-fetch is a `fresh` one,
+  so is still charged to the target's first-time bucket (and the client's):
+  the load on a peer stays within the first-time buckets' bound (above,
+  "What reaches a peer"), whatever the table holds. Cached documents and
+  known sources: at most 10 000 each, any number per group while there is
+  room; cached negatives: at most 100 per target group and 2 000 in all; all
+  evicted as described under "Per target": for negatives, a group at its cap
+  gives up its own expired entry, else its own oldest, and only its own
+  entries are considered; otherwise a full table gives up an expired entry
+  of any group first, then the oldest of the largest group, or of the
+  inserting group if none is larger. Each set of token buckets (the existing
+  `RateLimiter`: known and first-time user-key targets, known and first-time
+  discovery targets, clients, client /48s) holds at most 10 000 keys; when
+  full it drops idle buckets and otherwise refuses new keys (fail closed:
+  `503`, `Retry-After: 1`), rather than forget one that is being limited.
 
 ### Verifier and `KeyResolver`
 
