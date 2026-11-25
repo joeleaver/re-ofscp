@@ -52,8 +52,9 @@ our provider signing keys.
   while every other `/api/` path keeps CORS (a superset of the templates).
   A provider's own non-standard endpoints, even under `/api/`, are outside
   them. A provider SHOULD NOT open an endpoint that uses ambient
-  credentials cross-origin, and MUST NOT put a non-standard endpoint at a
-  path the spec defines (`/api/admin/…` takes none).
+  credentials cross-origin, and SHOULD keep its non-standard endpoints
+  under a prefix that matches no standard endpoint, since a request that
+  matches one is in scope whatever it does (`/api/admin/…` matches none).
 - **Media and uploads (future):** when attachments land, attachment `url`s
   and pre-signed `uploadUrl`s need `Access-Control-Allow-Origin: *`
   (never `Allow-Credentials`) wherever they are hosted, and an `uploadUrl`
