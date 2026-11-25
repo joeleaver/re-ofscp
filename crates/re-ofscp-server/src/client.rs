@@ -40,13 +40,19 @@ impl<S: Send + Sync> FromRequestParts<S> for Peer {
 /// /64, the usual unit one subscriber controls, so a client cannot mint
 /// fresh rate-limit keys by cycling through its own prefix.
 pub fn client_key(config: &Config, headers: &HeaderMap, peer: &Peer) -> String {
-    let Some(name) = config.client_ip_header.as_ref() else {
+    client_key_by(config.client_ip_header.as_deref(), headers, peer)
+}
+
+/// [`client_key`], given the configured `CLIENT_IP_HEADER` (if any) rather
+/// than the whole configuration.
+pub fn client_key_by(client_ip_header: Option<&str>, headers: &HeaderMap, peer: &Peer) -> String {
+    let Some(name) = client_ip_header else {
         return peer
             .0
             .map_or_else(|| "unknown".to_owned(), |a| rate_key(a.ip()));
     };
     let last = headers
-        .get(name.as_str())
+        .get(name)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.rsplit(',').next())
         .map(str::trim)

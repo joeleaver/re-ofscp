@@ -12,7 +12,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use super::canonical::{self, CanonicalRequest};
-use super::keys::{KeyError, KeyResolver};
+use super::keys::{KeyError, KeyResolver, Requester};
 use crate::problem::Problem;
 use crate::replay::{
     LedgerError, NonceLedger, NonceUse, ReplayError, ReplayStore, SignerKind, StoredNonce, Surface,
@@ -268,14 +268,16 @@ impl Verifier {
         self.clock.now().unix_timestamp()
     }
 
-    /// Run §4.5 steps 1–7 and record the nonce.
+    /// Run §4.5 steps 1–7 and record the nonce. Remote key fetches are
+    /// charged to `requester`.
     pub async fn verify(
         &self,
         req: RequestParts<'_>,
         body: &[u8],
+        requester: &Requester,
     ) -> Result<Verified, VerifyError> {
         let pre = self.precheck(req)?;
-        self.complete(pre, req, body).await
+        self.complete(pre, req, body, requester).await
     }
 
     /// §4.5 steps 1–4, which need no body.
@@ -328,12 +330,14 @@ impl Verifier {
     }
 
     /// §4.5 steps 5–7, then record the nonce. `req` must be the request
-    /// `pre` came from.
+    /// `pre` came from; remote key fetches are charged to `requester`, the
+    /// client that sent it.
     pub async fn complete(
         &self,
         pre: Precheck,
         req: RequestParts<'_>,
         body: &[u8],
+        requester: &Requester,
     ) -> Result<Verified, VerifyError> {
         // Step 5: body digest.
         if canonical::content_digest(body) != pre.digest {
@@ -356,10 +360,10 @@ impl Verifier {
             content_digest: &pre.digest,
         }
         .render();
-        match self.try_key(&pre, &canonical, false).await {
+        match self.try_key(&pre, &canonical, false, requester).await {
             Ok(()) => {}
             Err(failure) if failure.retry => {
-                self.try_key(&pre, &canonical, true)
+                self.try_key(&pre, &canonical, true, requester)
                     .await
                     .map_err(|f| f.error)?;
             }
@@ -406,8 +410,13 @@ impl Verifier {
         pre: &Precheck,
         canonical: &str,
         fresh: bool,
+        requester: &Requester,
     ) -> Result<(), KeyFailure> {
-        let resolved = match self.keys.resolve(&pre.signer, &pre.key_id, fresh).await {
+        let resolved = match self
+            .keys
+            .resolve(&pre.signer, &pre.key_id, fresh, requester)
+            .await
+        {
             Ok(resolved) => resolved,
             Err(KeyError::Unresolvable(e)) => {
                 tracing::info!(error = %e, key_id = pre.key_id, "signer's keys are unresolvable");

@@ -25,8 +25,8 @@ used** (#20): an expired entry never stands in for anything.
 |---|---|
 | `200` with a valid list | use it; an empty list or no matching `key_id` → `401` |
 | `404` (user keys only; for discovery a `404` is a failure, §8.1) | no key matches → `401` |
-| anything else (network error including a name that does not resolve, timeout, `3xx`, `5xx`, `429`, other `4xx`, invalid body) | fetch failure: a matching cached key is used; otherwise `503 service_unavailable`, `Retry-After: 5` |
-| re-fetch suppressed by a rate limit | a matching cached key is used; otherwise `503` with `Retry-After` = time until the fetch is allowed |
+| anything else (network error including a name that does not resolve, timeout, `3xx`, `5xx`, `429`, other `4xx`, invalid body, too many requests to that target in flight) | fetch failure: a matching cached key is used; otherwise `503 service_unavailable`, `Retry-After: 5` (or longer after a failed re-fetch, below) |
+| fetch suppressed by a rate limit or budget | a matching cached key is used; otherwise `503` with `Retry-After` = time until the fetch is allowed |
 | our outbound rules refuse the fetch | a matching cached key is used; otherwise `401` |
 
 ## Decision
@@ -64,7 +64,20 @@ One client for every request to a host someone else chose. Later features
 - **Bounded:** 10 s total timeout, 5 s connect timeout, response bodies capped
   at 64 KiB (read incrementally; over the cap is a failure, never a
   truncation). No proxy from the environment. At most 64 outbound requests in
-  flight process-wide.
+  flight process-wide, and at most 4 per target, grouped by registrable
+  domain (below). A request over the per-target cap fails at once
+  (`OutboundError::Busy`) rather than queueing, so a few hosts that stall
+  every response until the timeout cannot hold all 64 slots and starve
+  requests to everyone else.
+- **Target groups.** Wherever the outbound rules count per target, a target
+  is its host's **registrable domain** (eTLD+1 by the Public Suffix List, the
+  `psl` crate, as the replay store's per-domain quotas already do), port
+  dropped. So `victim.example:1` … `victim.example:65535` and
+  `{n}.victim.example` behind wildcard DNS are one target. A host with no
+  registrable domain (an IP literal, `localhost`, a bare public suffix) is
+  its own group.
+- **Ports.** Authorities may carry a port (§2.2), so fetches to non-443
+  ports stay allowed; the port only never earns a separate limit.
 - **TLS:** rustls with the bundled Mozilla roots (`webpki-roots`), so the
   trust store does not depend on what the jkbase runtime image ships.
 - **Operator exception:** `OUTBOUND_ALLOW_HOSTS` (comma-separated
@@ -83,19 +96,24 @@ Replaces `NoRemoteKeys` behind `ProviderKeys`' `remote` slot.
   `https://{domain}/.well-known/ofscp/users/{handle}/keys`; a remote
   provider's from `https://{authority}/.well-known/ofscp-provider`. Identity
   is the full `(handle, domain)` (security requirement 1).
-- **Validation (lost-conn/ofscp#20).** A keys response must parse (`actor`,
-  `keys` and an RFC 3339 `cache_until` present), and its `actor`, after
+- **Validation (lost-conn/ofscp#20).** §4.6: a keys response is valid only
+  if it matches the schema, so documents are validated strictly by
+  `user-keys-response.json` and `provider-discovery.json`. A keys response
+  must parse (`actor`, `keys` and an RFC 3339 `cache_until` present), and
+  its `actor`, after
   `Actor::canonicalize`, must equal the actor we asked for. A discovery
   document's `provider.domain`, after `Authority::canonicalize`, must equal
   the authority we fetched, `:port` included when it is not 443; its
   `publicKeys` must be present and non-empty (the schema's `minItems: 1`).
   A value that does not canonicalize is invalid. (Only the domain part of an
   actor is converted; a handle is never lowercased, §2.2.1, so
-  `Alice@remote.example` is invalid.) Every entry needs a non-empty `key_id`;
-  Ed25519 entries need a valid 32-byte base64 key; entries with another
-  `algorithm` are ignored (forward compatibility); a `key_id` that appears
-  twice makes the whole document invalid. Anything else is an invalid body,
-  so a fetch failure.
+  `Alice@remote.example` is invalid.) Every entry needs a non-empty `key_id`,
+  `algorithm` exactly `"Ed25519"` (the schemas' only value: any other
+  algorithm makes the document invalid) and a valid 32-byte base64
+  `public_key`. User-key entries also need `created_at` (RFC 3339);
+  discovery entries may omit it, but when present it must be RFC 3339. A
+  `key_id` that appears twice makes the whole document invalid. Anything
+  else is an invalid body, so a fetch failure.
 - **Caching.** User keys are cached until `min(cache_until, now + 1 h)` (the
   1 h cap bounds revocation latency, §4.7.1); a `cache_until` at or before
   now means the answer is not cached at all. Discovery is cached per
@@ -116,14 +134,38 @@ Replaces `NoRemoteKeys` behind `ProviderKeys`' `remote` slot.
   - *Per source:* at most one `fresh` re-fetch per actor (or provider) per
     60 s. Expiry-driven fetches are not held to this; only failure re-fetches
     are, as #19 describes.
-  - *Per remote domain:* a token bucket over **every** fetch to that host
-    (burst 20, 30 per minute), so a stream of requests naming random handles
-    or key ids at one domain cannot make us hammer it.
+  - *Per target:* a token bucket over **every** fetch to that target
+    (registrable domain, see "Target groups"; burst 20, 30 per minute), so
+    a stream of requests naming random handles, key ids, ports or
+    subdomains at one domain cannot make us hammer it. User-key fetches and
+    provider-discovery fetches have **separate** buckets, so spam naming
+    random handles at a domain cannot stop us from verifying that domain's
+    provider.
+  - *Per client:* a token bucket per client address (the same key as the
+    login rate limits: the `CLIENT_IP_HEADER` entry our proxy appends, else
+    the TCP peer; IPv6 by /64), burst 10, 30 per minute. The signature
+    layer passes the client to `KeyResolver::resolve` as a `Requester`, so
+    one anonymous client cannot spend a peer's whole per-target budget and
+    lock that peer's real users out with `503`s.
+  - A fetch is charged to the target's and the client's bucket together,
+    or to neither, and only when it is about to start: cache hits and
+    lookups that join a fetch already under way cost nothing, and every
+    other refusal (re-fetch interval, in-flight table full) is decided
+    before any bucket is touched.
   - When a limit stops a fetch: an unexpired cached key with that `key_id`
     is still used; otherwise `503` with `Retry-After` until the fetch would
     be allowed.
+  - *Trade-off:* the per-client bound is per source address, so a botnet
+    with many addresses can still spend a peer's per-target budget and
+    cause `503`s for that peer's users until it refills. Cached keys keep
+    working meanwhile, and the target bucket still caps what reaches the
+    peer, which is the property §8 requires.
 - **Fetch failure:** an unexpired cached key with that `key_id` is still
-  used; otherwise `503` with `Retry-After: 5`. Expiry is re-checked when the
+  used; otherwise `503` with `Retry-After: 5`. When the failed fetch was a
+  `fresh` re-fetch, it started the 60 s re-fetch interval, and a retry
+  before that ends would only be refused by it: the answer is then
+  `Retry-After` = max(5, time until the next re-fetch is allowed). Expiry
+  is re-checked when the
   fallback is used, not when the lookup began: an entry can expire between
   the verifier's cached answer and its fresh call, or while the fetch is in
   flight (#20). Forumall falls back to stale cache; that is a known Forumall
@@ -136,20 +178,25 @@ Replaces `NoRemoteKeys` behind `ProviderKeys`' `remote` slot.
   needed, DNS is resolved again and the rules re-applied. An IP-literal host
   is refused before any rate limit is consulted, so it costs no token and
   never turns into a `503`; a *name* that resolves to a refused address is
-  only discovered by a lookup, which does take a token. A name that fails to
+  only discovered by a lookup, which does take tokens. A name that fails to
   resolve at all (NXDOMAIN, SERVFAIL, timeout) is a network error, so a fetch
   failure (`503`), not a refusal.
 - **Bounds:** at most 10 000 cached sources, 10 000 per-source re-fetch
   times and 10 000 fetches in flight; past that, expired entries go first,
-  then the oldest (in flight: `503`, `Retry-After: 1`). The per-domain token
-  buckets (the existing `RateLimiter`) hold at most 10 000 hosts; when full
-  they drop idle buckets and otherwise refuse new hosts (fail closed: `503`,
-  `Retry-After: 1`), rather than forget a host that is being limited.
+  then the oldest (in flight: `503`, `Retry-After: 1`). Each set of token
+  buckets (the existing `RateLimiter`: user-key targets, discovery targets,
+  clients) holds at most 10 000 keys; when full it drops idle buckets and
+  otherwise refuses new keys (fail closed: `503`, `Retry-After: 1`), rather
+  than forget one that is being limited.
 
 ### Verifier and `KeyResolver`
 
 `KeyResolver::resolve` returns whether its answer came from cache, so the
-verifier knows when a re-fetch is required. `KeyError` becomes
+verifier knows when a re-fetch is required. It also takes the `Requester`
+(the client's rate-limit key) that remote fetches are charged to; the
+signature layer (`SignatureLayer`) derives it from the request the way the
+login rate limits do. Resolvers that never fetch (`StaticKeys`, the local
+account store) ignore it. `KeyError` becomes
 `Unresolvable` (`401`) and `Unavailable { retry_after }` (`503` with
 `Retry-After`); the local account store's failures stay `503`.
 

@@ -11,7 +11,7 @@ use common::remote_peer::{DISCOVERY_PATH, RemotePeer, Reply, discovery_doc, keys
 use ed25519_dalek::VerifyingKey;
 use re_ofscp_server::outbound::OutboundClient;
 use re_ofscp_server::remote_keys::RemoteKeys;
-use re_ofscp_server::signing::{KeyError, KeyResolver, Resolved, Signer};
+use re_ofscp_server::signing::{KeyError, KeyResolver, Requester, Resolved, Signer};
 use re_ofscp_server::timefmt::rfc3339;
 use re_ofscp_types::Actor;
 use serde_json::json;
@@ -74,8 +74,29 @@ impl Setup {
         key_id: &str,
         fresh: bool,
     ) -> Result<Resolved, KeyError> {
-        self.keys.resolve(signer, key_id, fresh).await
+        self.resolve_as(&client(), signer, key_id, fresh).await
     }
+
+    /// Resolve on behalf of `requester`.
+    async fn resolve_as(
+        &self,
+        requester: &Requester,
+        signer: &Signer,
+        key_id: &str,
+        fresh: bool,
+    ) -> Result<Resolved, KeyError> {
+        self.keys.resolve(signer, key_id, fresh, requester).await
+    }
+}
+
+/// The client most tests make their lookups for.
+fn client() -> Requester {
+    Requester::new("203.0.113.7")
+}
+
+/// The `n`th of many distinct clients.
+fn nth_client(n: u32) -> Requester {
+    Requester::new(format!("198.51.100.{n}"))
 }
 
 fn unavailable(r: Result<Resolved, KeyError>) -> u64 {
@@ -172,11 +193,11 @@ async fn every_other_answer_is_a_fetch_failure() {
         ("duplicate key_id", Reply::json(200, &duplicate)),
     ] {
         s.peer.set(&keys_path("alice"), reply);
-        // Fresh each time, past the re-fetch limit, so nothing is cached
-        // between rows (failures are never cached anyway).
+        // Failures are never cached, so each lookup fetches. (Not `fresh`:
+        // a failed re-fetch answers with the re-fetch interval instead.)
         s.advance(61);
         assert_eq!(
-            unavailable(s.resolve(&s.actor("alice"), "dk_1", true).await),
+            unavailable(s.resolve(&s.actor("alice"), "dk_1", false).await),
             5,
             "{what}"
         );
@@ -227,7 +248,7 @@ async fn discovery_failures() {
         s.peer.set(DISCOVERY_PATH, reply);
         s.advance(61);
         assert_eq!(
-            unavailable(s.resolve(&provider, "pk_1", true).await),
+            unavailable(s.resolve(&provider, "pk_1", false).await),
             5,
             "{what}"
         );
@@ -338,9 +359,10 @@ async fn a_cached_key_stands_in_for_a_failed_fetch_only_while_unexpired() {
     s.peer.set(&keys_path("alice"), Reply::new(500, ""));
     // Unexpired: the cached key is used when the re-fetch fails.
     assert_eq!(s.resolve(&alice, "dk_1", true).await, cached(Some(k)));
-    // ... but not for a key id it does not hold.
+    // ... but not for a key id it does not hold. That failed re-fetch
+    // started the re-fetch interval, so the client is told to wait it out.
     s.advance(60);
-    assert_eq!(unavailable(s.resolve(&alice, "dk_2", true).await), 5);
+    assert_eq!(unavailable(s.resolve(&alice, "dk_2", true).await), 60);
 }
 
 #[tokio::test]
@@ -357,7 +379,7 @@ async fn an_entry_that_expires_between_lookups_is_no_fallback() {
     // re-fetch fails: no stale fallback.
     s.peer.set(&keys_path("alice"), Reply::new(500, ""));
     s.advance(30);
-    assert_eq!(unavailable(s.resolve(&alice, "dk_1", true).await), 5);
+    assert_eq!(unavailable(s.resolve(&alice, "dk_1", true).await), 60);
     // Expired and throttled: no fallback either.
     assert_eq!(unavailable(s.resolve(&alice, "dk_1", true).await), 60);
 }
@@ -378,21 +400,28 @@ async fn the_clock_moving_during_a_fetch_is_respected() {
     let keys = s.keys.clone();
     let lookup = tokio::spawn({
         let alice = alice.clone();
-        async move { keys.resolve(&alice, "dk_1", true).await }
+        async move { keys.resolve(&alice, "dk_1", true, &client()).await }
     });
     tokio::time::sleep(Duration::from_millis(100)).await;
     s.advance(31);
-    assert_eq!(unavailable(lookup.await.unwrap()), 5);
+    // The failed re-fetch began 31 s ago: the next one is allowed in 29 s.
+    assert_eq!(unavailable(lookup.await.unwrap()), 29);
 }
 
 #[tokio::test]
 async fn fetches_to_one_host_share_a_token_bucket() {
     let s = Setup::new().await;
-    // Twenty distinct actors (nothing served: 404s) use up the burst.
+    // Twenty distinct actors (nothing served: 404s), each looked up for a
+    // different client, use up the target's burst.
     for i in 0..20 {
         assert_eq!(
-            s.resolve(&s.actor(&format!("user{i:02}")), "dk_1", false)
-                .await,
+            s.resolve_as(
+                &nth_client(i),
+                &s.actor(&format!("user{i:02}")),
+                "dk_1",
+                false
+            )
+            .await,
             fetched(None)
         );
     }
@@ -432,7 +461,7 @@ async fn concurrent_lookups_share_one_fetch() {
     let lookups: Vec<_> = (0..16)
         .map(|i| {
             let (keys, alice) = (s.keys.clone(), alice.clone());
-            tokio::spawn(async move { keys.resolve(&alice, "dk_1", i % 2 == 0).await })
+            tokio::spawn(async move { keys.resolve(&alice, "dk_1", i % 2 == 0, &client()).await })
         })
         .collect();
     for lookup in lookups {
@@ -457,7 +486,7 @@ async fn a_dropped_lookup_does_not_cancel_the_shared_fetch() {
     let alice = s.actor("alice");
     let first = tokio::spawn({
         let (keys, alice) = (s.keys.clone(), alice.clone());
-        async move { keys.resolve(&alice, "dk_1", false).await }
+        async move { keys.resolve(&alice, "dk_1", false, &client()).await }
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
     first.abort();
@@ -490,4 +519,141 @@ async fn an_outbound_refusal_is_401() {
         }
     }
     assert_eq!(s.peer.total_hits(), 0);
+}
+
+/// Twenty user-key fetches (404s) at the peer, each for its own client:
+/// the user-keys bucket of the peer's domain is then empty.
+async fn drain_user_keys_bucket(s: &Setup) {
+    for i in 0..20 {
+        let actor = s.actor(&format!("drain{i:02}"));
+        assert_eq!(
+            s.resolve_as(&nth_client(i), &actor, "dk_1", false).await,
+            fetched(None)
+        );
+    }
+}
+
+#[tokio::test]
+async fn another_port_of_the_host_shares_its_bucket() {
+    let s = Setup::new().await;
+    drain_user_keys_bucket(&s).await;
+    // `localhost:{other port}` is the same target: refused by the empty
+    // bucket before anything is fetched (otherwise our outbound rules would
+    // refuse its loopback address: 401).
+    let other_port = s.peer.port.wrapping_add(1).max(1);
+    let elsewhere =
+        Signer::Actor(Actor::parse_canonical(&format!("xxx@localhost:{other_port}")).unwrap());
+    assert_eq!(
+        unavailable(
+            s.resolve_as(&nth_client(99), &elsewhere, "dk_1", false)
+                .await
+        ),
+        2
+    );
+    assert_eq!(s.peer.total_hits(), 20);
+}
+
+#[tokio::test]
+async fn discovery_works_while_the_user_keys_bucket_is_empty() {
+    let s = Setup::new().await;
+    drain_user_keys_bucket(&s).await;
+    assert_eq!(
+        unavailable(
+            s.resolve_as(&nth_client(99), &s.actor("bob"), "dk_1", false)
+                .await
+        ),
+        2
+    );
+    let k = new_key().verifying_key();
+    let authority = s.peer.authority().to_string();
+    s.peer.set(
+        DISCOVERY_PATH,
+        Reply::json(200, &discovery_doc(&authority, &[("pk_1", k)])),
+    );
+    assert_eq!(
+        s.resolve_as(&nth_client(99), &s.provider(), "pk_1", false)
+            .await,
+        fetched(Some(k))
+    );
+}
+
+#[tokio::test]
+async fn a_client_is_charged_only_for_fetches_it_causes() {
+    let s = Setup::new().await;
+    let k = new_key().verifying_key();
+    s.serve_keys("alice", &[("dk_1", k)], 600);
+    let alice = s.actor("alice");
+    let me = client();
+    assert_eq!(
+        s.resolve_as(&me, &alice, "dk_1", false).await,
+        fetched(Some(k))
+    );
+    // Cache hits are free.
+    for _ in 0..20 {
+        assert_eq!(
+            s.resolve_as(&me, &alice, "dk_1", false).await,
+            cached(Some(k))
+        );
+    }
+    // Nine more fetches spend the burst of ten ...
+    for i in 0..9 {
+        let actor = s.actor(&format!("user{i}"));
+        assert_eq!(
+            s.resolve_as(&me, &actor, "dk_1", false).await,
+            fetched(None)
+        );
+    }
+    // ... after which this client's next fetch is refused, but its cache
+    // hits still work, and so do other clients' fetches.
+    assert_eq!(
+        unavailable(s.resolve_as(&me, &s.actor("user9"), "dk_1", false).await),
+        2
+    );
+    assert_eq!(
+        s.resolve_as(&me, &alice, "dk_1", false).await,
+        cached(Some(k))
+    );
+    // A re-fetch would be charged too: the unexpired cached key stands in.
+    assert_eq!(
+        s.resolve_as(&me, &alice, "dk_1", true).await,
+        cached(Some(k))
+    );
+    assert_eq!(
+        s.resolve_as(&nth_client(1), &s.actor("user9"), "dk_1", false)
+            .await,
+        fetched(None)
+    );
+    assert_eq!(s.peer.total_hits(), 11);
+}
+
+#[tokio::test]
+async fn joining_a_fetch_under_way_is_free() {
+    let s = Setup::new().await;
+    let broke = nth_client(1);
+    for i in 0..10 {
+        let actor = s.actor(&format!("user{i}"));
+        assert_eq!(
+            s.resolve_as(&broke, &actor, "dk_1", false).await,
+            fetched(None)
+        );
+    }
+    let k = new_key().verifying_key();
+    let doc = keys_doc(&s.actor_id("slow"), &[("dk_1", k)], &rfc3339(s.now() + 600));
+    s.peer.set(
+        &keys_path("slow"),
+        Reply::json(200, &doc).delayed(Duration::from_millis(300)),
+    );
+    let slow = s.actor("slow");
+    let first = tokio::spawn({
+        let (keys, slow) = (s.keys.clone(), slow.clone());
+        async move { keys.resolve(&slow, "dk_1", false, &nth_client(2)).await }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Out of budget, but it only waits for the fetch another client started.
+    assert_eq!(
+        s.resolve_as(&broke, &slow, "dk_1", false).await,
+        fetched(Some(k))
+    );
+    assert_eq!(first.await.unwrap(), fetched(Some(k)));
+    assert_eq!(s.hits("slow"), 1);
 }

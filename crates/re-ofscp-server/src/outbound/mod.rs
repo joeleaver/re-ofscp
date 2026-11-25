@@ -8,13 +8,15 @@
 //!   `2130706433` into IPv4), and a name is checked by the resolver
 //!   ([`dns::VettingResolver`]) the client connects through.
 //! * No redirects (a `3xx` is a failure), no proxy, bounded time and body,
-//!   and a process-wide cap on requests in flight.
+//!   a process-wide cap on requests in flight, and a per-target one
+//!   ([`inflight`]) so that a few stalling hosts cannot take every slot.
 //! * TLS through rustls with the bundled Mozilla roots.
 //!
 //! Hosts in `OUTBOUND_ALLOW_HOSTS` skip only the address rule.
 
 pub mod addr;
 pub mod dns;
+pub mod inflight;
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -26,6 +28,8 @@ use tokio::sync::Semaphore;
 use url::{Host, Url};
 
 use self::dns::{RefusedAddress, VettingResolver};
+use self::inflight::PerTarget;
+use crate::registrable::registrable_group;
 
 /// Limits and trust settings for an [`OutboundClient`].
 #[derive(Debug, Clone)]
@@ -45,11 +49,15 @@ pub struct OutboundConfig {
     pub max_body: usize,
     /// Most requests in flight at once, process-wide.
     pub max_in_flight: usize,
+    /// Most requests in flight at once to one target, grouped by
+    /// registrable domain (ports and subdomains share it). Past it a
+    /// request fails at once with [`OutboundError::Busy`].
+    pub max_in_flight_per_target: usize,
 }
 
 impl OutboundConfig {
     /// The defaults of docs/decisions/0006 (10 s, 5 s connect, 64 KiB, 64
-    /// in flight), allowing `allow_hosts` to be internal.
+    /// in flight, 4 per target), allowing `allow_hosts` to be internal.
     pub fn new(allow_hosts: Vec<Authority>) -> Self {
         Self {
             allow_hosts,
@@ -58,6 +66,7 @@ impl OutboundConfig {
             connect_timeout: Duration::from_secs(5),
             max_body: 64 * 1024,
             max_in_flight: 64,
+            max_in_flight_per_target: 4,
         }
     }
 }
@@ -73,6 +82,10 @@ pub enum OutboundError {
     /// The peer answered with a redirect, which is never followed.
     #[error("peer answered with redirect {0}")]
     Redirect(u16),
+    /// Too many requests to this target are already in flight. Not
+    /// queued: a target that stalls must not make requests to it pile up.
+    #[error("too many requests in flight to {0}")]
+    Busy(String),
     /// The response body exceeded the cap.
     #[error("response body larger than {0} bytes")]
     TooLarge(usize),
@@ -109,6 +122,7 @@ pub struct OutboundClient {
     allowed: reqwest::Client,
     allow_hosts: HashSet<Authority>,
     slots: Arc<Semaphore>,
+    per_target: PerTarget,
     timeout: Duration,
     max_body: usize,
 }
@@ -143,6 +157,7 @@ impl OutboundClient {
             allowed: build(false)?,
             allow_hosts: config.allow_hosts.iter().cloned().collect(),
             slots: Arc::new(Semaphore::new(config.max_in_flight.max(1))),
+            per_target: PerTarget::new(config.max_in_flight_per_target),
             timeout: config.timeout,
             max_body: config.max_body,
         })
@@ -186,6 +201,10 @@ impl OutboundClient {
         path: &str,
     ) -> Result<OutboundResponse, OutboundError> {
         let url = self.target(authority, path)?;
+        let group = registrable_group(authority.as_str());
+        let Some(_target_slot) = self.per_target.try_acquire(group.clone()) else {
+            return Err(OutboundError::Busy(group));
+        };
         let client = if self.allow_hosts.contains(authority) {
             &self.allowed
         } else {

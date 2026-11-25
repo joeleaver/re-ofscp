@@ -16,8 +16,15 @@ pub const MAX_ENTRIES: usize = 10_000;
 /// "one per minute").
 pub const REFETCH_INTERVAL_SECS: i64 = 60;
 
-/// A fetch in flight: its answer appears once it completes.
-pub type Flight = watch::Receiver<Option<Fetched>>;
+/// A fetch in flight.
+#[derive(Debug, Clone)]
+pub struct Flight {
+    /// Its answer, once it completes.
+    pub answer: watch::Receiver<Option<Fetched>>,
+    /// Whether it is a `fresh` re-fetch, which started the source's
+    /// re-fetch interval.
+    pub refetch: bool,
+}
 
 /// A cached document.
 struct Entry {

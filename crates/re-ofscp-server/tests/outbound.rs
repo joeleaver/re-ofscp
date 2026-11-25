@@ -162,3 +162,49 @@ async fn untrusted_certificates_fail() {
     let err = client.get(&peer.authority(), "/doc").await.unwrap_err();
     assert!(matches!(err, OutboundError::Network(_)), "{err:?}");
 }
+
+#[tokio::test]
+async fn requests_over_the_per_target_cap_fail_at_once() {
+    let peer = RemotePeer::start().await;
+    peer.set(
+        "/slow",
+        Reply::json(200, &json!({})).delayed(Duration::from_millis(600)),
+    );
+    peer.set("/fast", Reply::json(200, &json!({})));
+    let client = std::sync::Arc::new(peer.allowed_client());
+    // Four stalled requests fill the cap for `localhost`.
+    let stalled: Vec<_> = (0..4)
+        .map(|_| {
+            let (client, host) = (client.clone(), peer.authority());
+            tokio::spawn(async move { client.get(&host, "/slow").await })
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    // The fifth fails without waiting, and so does another port of the
+    // same host: it is the same target.
+    let other_port = authority(&format!("localhost:{}", peer.port.wrapping_add(1).max(1)));
+    for host in [peer.authority(), other_port] {
+        let started = std::time::Instant::now();
+        let err = client.get(&host, "/fast").await.unwrap_err();
+        assert_eq!(err, OutboundError::Busy("localhost".to_owned()), "{host}");
+        assert!(started.elapsed() < Duration::from_millis(100), "{host}");
+    }
+    // Another target is unaffected.
+    assert_eq!(
+        client
+            .get(&peer.ip_authority(), "/fast")
+            .await
+            .unwrap()
+            .status,
+        200
+    );
+    for request in stalled {
+        assert_eq!(request.await.unwrap().unwrap().status, 200);
+    }
+    // The slots are released once the stalled requests end.
+    assert_eq!(
+        client.get(&peer.authority(), "/fast").await.unwrap().status,
+        200
+    );
+    assert_eq!(peer.hits("/fast"), 2);
+}

@@ -65,6 +65,26 @@ pub enum KeyError {
     },
 }
 
+/// Whom a lookup is made for: the rate-limit key of the client whose
+/// request is being verified (`client::client_key`: its address, or its
+/// IPv6 /64). A resolver that fetches remotely charges the fetches it makes
+/// to this client, so one client cannot spend every peer's fetch budget
+/// (docs/decisions/0006). Resolvers that never fetch ignore it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Requester(String);
+
+impl Requester {
+    /// The client with rate-limit key `key`.
+    pub fn new(key: impl Into<String>) -> Self {
+        Self(key.into())
+    }
+
+    /// The rate-limit key.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// Boxed future returned by [`KeyResolver::resolve`].
 pub type KeyFuture<'a> = Pin<Box<dyn Future<Output = Result<Resolved, KeyError>> + Send + 'a>>;
 
@@ -76,10 +96,16 @@ pub type KeyFuture<'a> = Pin<Box<dyn Future<Output = Result<Resolved, KeyError>>
 /// §8.1). That happens on failed signatures, forgeries included, so an
 /// implementation that fetches remotely **must** rate-limit fresh lookups
 /// (§8 "Outbound requests"); otherwise a stream of forged requests becomes
-/// a stream of outbound fetches.
+/// a stream of outbound fetches. It also charges fetches to `requester`.
 pub trait KeyResolver: Send + Sync {
-    /// Resolve `key_id` for `signer`.
-    fn resolve<'a>(&'a self, signer: &'a Signer, key_id: &'a str, fresh: bool) -> KeyFuture<'a>;
+    /// Resolve `key_id` for `signer`, on behalf of `requester`.
+    fn resolve<'a>(
+        &'a self,
+        signer: &'a Signer,
+        key_id: &'a str,
+        fresh: bool,
+        requester: &'a Requester,
+    ) -> KeyFuture<'a>;
 }
 
 /// A fixed set of keys, for tests and for statically configured peers. Its
@@ -99,7 +125,13 @@ impl StaticKeys {
 }
 
 impl KeyResolver for StaticKeys {
-    fn resolve<'a>(&'a self, signer: &'a Signer, key_id: &'a str, _fresh: bool) -> KeyFuture<'a> {
+    fn resolve<'a>(
+        &'a self,
+        signer: &'a Signer,
+        key_id: &'a str,
+        _fresh: bool,
+        _requester: &'a Requester,
+    ) -> KeyFuture<'a> {
         let found = self
             .keys
             .iter()

@@ -11,6 +11,7 @@ pub mod db;
 pub mod outbound;
 pub mod problem;
 pub mod ratelimit;
+pub mod registrable;
 pub mod remote_keys;
 pub mod replay;
 pub mod signing;
@@ -251,7 +252,10 @@ pub fn router(state: AppState) -> Router {
         .fallback(|| async { Problem::not_found() })
         .method_not_allowed_fallback(|| async { Problem::method_not_allowed() })
         .layer(middleware::from_fn_with_state(
-            state.verifier.clone(),
+            signing::SignatureLayer::new(
+                state.verifier.clone(),
+                state.config.client_ip_header.clone(),
+            ),
             signing::authenticate,
         ))
         // Added after the signature layer, so it does not wrap them: admin

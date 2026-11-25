@@ -36,8 +36,17 @@ fn invalid(msg: impl Into<String>) -> Invalid {
 struct RawKey {
     key_id: String,
     algorithm: String,
+    public_key: String,
     #[serde(default)]
-    public_key: Option<String>,
+    created_at: Option<String>,
+}
+
+/// Whether entries must carry `created_at`: the user keys schema requires
+/// it, the discovery schema does not (both require RFC 3339 when present).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CreatedAt {
+    Required,
+    Optional,
 }
 
 #[derive(Deserialize)]
@@ -77,7 +86,7 @@ pub fn user_keys(body: &[u8], requested: &Actor) -> Result<(KeySet, i64), Invali
     let cache_until = OffsetDateTime::parse(&raw.cache_until, &Rfc3339)
         .map_err(|_| invalid("cache_until is not RFC 3339"))?
         .unix_timestamp();
-    Ok((key_set(raw.keys)?, cache_until))
+    Ok((key_set(raw.keys, CreatedAt::Required)?, cache_until))
 }
 
 /// A valid discovery document fetched from `requested`: its provider
@@ -98,13 +107,17 @@ pub fn discovery(body: &[u8], requested: &Authority) -> Result<KeySet, Invalid> 
     if raw.provider.public_keys.is_empty() {
         return Err(invalid("provider.publicKeys is empty"));
     }
-    key_set(raw.provider.public_keys)
+    key_set(raw.provider.public_keys, CreatedAt::Optional)
 }
 
-/// The Ed25519 keys of `entries`. Entries with another algorithm are
-/// skipped (forward compatibility); a repeated `key_id` makes the whole
-/// document invalid, since we could not tell which key it means.
-fn key_set(entries: Vec<RawKey>) -> Result<KeySet, Invalid> {
+/// The keys of `entries`, validated as the schemas require (§4.6: a
+/// response is valid only if it matches the schema): every entry has a
+/// non-empty `key_id`, `algorithm` `"Ed25519"` (the schemas' only value: any
+/// other is invalid, not skipped), a 32-byte base64 key and, when present
+/// or `created_at` is required, an RFC 3339 `created_at`. A repeated
+/// `key_id` makes the whole document invalid too, since we could not tell
+/// which key it means.
+fn key_set(entries: Vec<RawKey>, created_at: CreatedAt) -> Result<KeySet, Invalid> {
     let mut seen = std::collections::HashSet::new();
     let mut keys = KeySet::new();
     for entry in entries {
@@ -115,18 +128,29 @@ fn key_set(entries: Vec<RawKey>) -> Result<KeySet, Invalid> {
             return Err(invalid(format!("key_id {:?} appears twice", entry.key_id)));
         }
         if entry.algorithm != ED25519 {
-            continue;
+            return Err(invalid(format!(
+                "key {:?} has algorithm {:?}, not {ED25519}",
+                entry.key_id, entry.algorithm
+            )));
         }
-        let key = entry
-            .public_key
-            .as_deref()
-            .and_then(decode_public_key)
-            .ok_or_else(|| {
-                invalid(format!(
-                    "key {:?} is not a 32-byte base64 Ed25519 key",
+        match (&entry.created_at, created_at) {
+            (Some(at), _) if OffsetDateTime::parse(at, &Rfc3339).is_err() => {
+                return Err(invalid(format!(
+                    "key {:?} created_at is not RFC 3339",
                     entry.key_id
-                ))
-            })?;
+                )));
+            }
+            (None, CreatedAt::Required) => {
+                return Err(invalid(format!("key {:?} has no created_at", entry.key_id)));
+            }
+            _ => {}
+        }
+        let key = decode_public_key(&entry.public_key).ok_or_else(|| {
+            invalid(format!(
+                "key {:?} is not a 32-byte base64 Ed25519 key",
+                entry.key_id
+            ))
+        })?;
         keys.insert(entry.key_id, key);
     }
     Ok(keys)
@@ -233,6 +257,10 @@ mod tests {
             json!([{ "key_id": 7, "algorithm": "Ed25519", "public_key": KEY }]),
             json!([entry("dk_1"), entry("dk_1")]),
             json!([entry("dk_1"), { "key_id": "dk_1", "algorithm": "X448", "public_key": "?" }]),
+            // `created_at` is required here, and must be RFC 3339.
+            json!([{ "key_id": "dk_1", "algorithm": "Ed25519", "public_key": KEY }]),
+            json!([{ "key_id": "dk_1", "algorithm": "Ed25519", "public_key": KEY, "created_at": "yesterday" }]),
+            json!([{ "key_id": "dk_1", "algorithm": "Ed25519", "public_key": KEY, "created_at": null }]),
             json!({}),
         ];
         for keys in bad {
@@ -251,10 +279,39 @@ mod tests {
     }
 
     #[test]
-    fn other_algorithms_are_skipped() {
-        let keys = json!([entry("dk_1"), { "key_id": "dk_2", "algorithm": "ML-DSA-65", "public_key": "AAAA" }]);
-        let (set, _) = user_keys(&keys_doc("alice@remote.example", keys), &alice()).unwrap();
-        assert_eq!(set.keys().collect::<Vec<_>>(), vec!["dk_1"]);
+    fn any_other_algorithm_invalidates_the_document() {
+        // The schemas allow only "Ed25519": a document with anything else
+        // does not match them, so it is invalid as a whole (§4.6).
+        for algorithm in ["ML-DSA-65", "ed25519", "Ed448", ""] {
+            let other = json!({ "key_id": "dk_2", "algorithm": algorithm, "public_key": KEY, "created_at": "2026-01-01T00:00:00Z" });
+            let keys = json!([entry("dk_1"), other]);
+            assert!(
+                user_keys(&keys_doc("alice@remote.example", keys), &alice()).is_err(),
+                "{algorithm}"
+            );
+            let remote = Authority::parse_canonical("remote.example").unwrap();
+            let doc = discovery_doc("remote.example", json!([entry("pk_1"), other]));
+            assert!(discovery(&doc, &remote).is_err(), "{algorithm}");
+        }
+    }
+
+    #[test]
+    fn discovery_created_at_is_optional_but_must_be_rfc_3339() {
+        let remote = Authority::parse_canonical("remote.example").unwrap();
+        let without = json!([{ "key_id": "pk_1", "algorithm": "Ed25519", "public_key": KEY }]);
+        let keys = discovery(&discovery_doc("remote.example", without), &remote).unwrap();
+        assert!(keys.contains_key("pk_1"));
+        assert!(
+            discovery(
+                &discovery_doc("remote.example", json!([entry("pk_1")])),
+                &remote
+            )
+            .is_ok()
+        );
+        let bad = json!([{ "key_id": "pk_1", "algorithm": "Ed25519", "public_key": KEY, "created_at": "2026-01-01" }]);
+        assert!(discovery(&discovery_doc("remote.example", bad), &remote).is_err());
+        let missing_key = json!([{ "key_id": "pk_1", "algorithm": "Ed25519" }]);
+        assert!(discovery(&discovery_doc("remote.example", missing_key), &remote).is_err());
     }
 
     fn discovery_doc(domain: &str, keys: serde_json::Value) -> Vec<u8> {

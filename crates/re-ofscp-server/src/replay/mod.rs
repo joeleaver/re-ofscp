@@ -50,6 +50,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 pub use ledger::{LedgerError, NoLedger, NonceLedger, StoredNonce};
 use quota::Counter;
 
+use crate::registrable::registrable_group;
+
 /// Who produced a signature. Part of the replay key (§4.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum SignerKind {
@@ -283,20 +285,6 @@ fn probe(u: &NonceUse<'_>) -> Entry {
         signer: Arc::from(""),
         remote_group: None,
     }
-}
-
-/// The quota group of a remote authority: its registrable domain (eTLD+1 by
-/// the Public Suffix List), port ignored. IP literals, and hosts without a
-/// registrable domain (`localhost`, a bare public suffix), group by host.
-pub fn registrable_group(authority: &str) -> String {
-    let host = authority
-        .rsplit_once(':')
-        .map_or(authority, |(host, _port)| host);
-    // The PSL would read `10.0.0.1` as a name under the suffix `1`.
-    if host.parse::<std::net::Ipv4Addr>().is_ok() {
-        return host.to_owned();
-    }
-    psl::domain_str(host).unwrap_or(host).to_owned()
 }
 
 /// How far behind the replay store's clock a reading may fall before it is

@@ -25,11 +25,12 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use re_ofscp_types::{Actor, Authority};
 
-pub use keys::{KeyError, KeyFuture, KeyResolver, Resolved, StaticKeys};
+pub use keys::{KeyError, KeyFuture, KeyResolver, Requester, Resolved, StaticKeys};
 pub use verify::{
     Clock, Precheck, RequestParts, Signer, SystemClock, Verified, Verifier, VerifyError,
 };
 
+use crate::client::{Peer, client_key_by};
 use crate::problem::Problem;
 
 /// Largest request body the signature layer will buffer (it must hash the
@@ -42,15 +43,36 @@ pub const MAX_SIGNED_BODY: usize = 1024 * 1024;
 /// against a fresh clock reading (see `Verifier::complete`).
 pub const SIGNED_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// The state of the [`authenticate`] layer.
+#[derive(Clone)]
+pub struct SignatureLayer {
+    verifier: Arc<Verifier>,
+    /// `CLIENT_IP_HEADER`: how to tell clients apart, so the remote key
+    /// fetches a request causes are charged to the client that sent it.
+    client_ip_header: Option<String>,
+}
+
+impl SignatureLayer {
+    /// Verify with `verifier`, identifying clients as `client::client_key`
+    /// does with `client_ip_header`.
+    pub fn new(verifier: Arc<Verifier>, client_ip_header: Option<String>) -> Self {
+        Self {
+            verifier,
+            client_ip_header,
+        }
+    }
+}
+
 /// Middleware: verify signed requests, pass unsigned ones through.
 ///
 /// Steps 1–4 (headers, host, timestamp, replay) run before the body is read,
 /// so a request that fails them costs no buffering.
 pub async fn authenticate(
-    State(verifier): State<Arc<Verifier>>,
+    State(layer): State<SignatureLayer>,
     req: Request,
     next: Next,
 ) -> Response {
+    let verifier = &layer.verifier;
     if !verify::headers::ALL
         .iter()
         .any(|h| req.headers().contains_key(*h))
@@ -58,6 +80,11 @@ pub async fn authenticate(
         return next.run(req).await;
     }
     let (parts, body) = req.into_parts();
+    let requester = Requester::new(client_key_by(
+        layer.client_ip_header.as_deref(),
+        &parts.headers,
+        &Peer::from_parts(&parts),
+    ));
     let request = RequestParts {
         method: &parts.method,
         uri: &parts.uri,
@@ -91,7 +118,7 @@ pub async fn authenticate(
             };
         }
     };
-    match verifier.complete(pre, request, &bytes).await {
+    match verifier.complete(pre, request, &bytes, &requester).await {
         Ok(verified) => {
             let mut req = Request::from_parts(parts, Body::from(bytes));
             req.extensions_mut().insert(verified);

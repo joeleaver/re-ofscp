@@ -10,7 +10,9 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use common::harness::*;
 use ed25519_dalek::VerifyingKey;
-use re_ofscp_server::signing::{KeyError, KeyFuture, KeyResolver, Resolved, Signer, StaticKeys};
+use re_ofscp_server::signing::{
+    KeyError, KeyFuture, KeyResolver, Requester, Resolved, Signer, StaticKeys,
+};
 
 #[tokio::test]
 async fn spec_vector_request_authenticates_as_alice() {
@@ -177,7 +179,13 @@ impl RotatedKeys {
 }
 
 impl KeyResolver for RotatedKeys {
-    fn resolve<'a>(&'a self, _signer: &'a Signer, _key_id: &'a str, fresh: bool) -> KeyFuture<'a> {
+    fn resolve<'a>(
+        &'a self,
+        _signer: &'a Signer,
+        _key_id: &'a str,
+        fresh: bool,
+        _requester: &'a Requester,
+    ) -> KeyFuture<'a> {
         let answer = if fresh {
             self.fresh_calls.fetch_add(1, Ordering::SeqCst);
             Resolved::authoritative(Some(self.current))
@@ -227,7 +235,13 @@ async fn an_answer_fetched_for_this_request_is_final() {
 struct FailingKeys(KeyError);
 
 impl KeyResolver for FailingKeys {
-    fn resolve<'a>(&'a self, _signer: &'a Signer, _key_id: &'a str, _fresh: bool) -> KeyFuture<'a> {
+    fn resolve<'a>(
+        &'a self,
+        _signer: &'a Signer,
+        _key_id: &'a str,
+        _fresh: bool,
+        _requester: &'a Requester,
+    ) -> KeyFuture<'a> {
         let e = self.0.clone();
         Box::pin(async move { Err(e) })
     }
@@ -283,4 +297,47 @@ async fn production_router_rejects_signed_requests_it_cannot_verify() {
     let (status, json, _, _) = send(&app, req).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(json["detail"], "unknown or revoked key");
+}
+
+/// Records whom each lookup was made for, then answers like `StaticKeys`.
+struct RecordingKeys {
+    seen: std::sync::Mutex<Vec<String>>,
+}
+
+impl KeyResolver for RecordingKeys {
+    fn resolve<'a>(
+        &'a self,
+        _signer: &'a Signer,
+        _key_id: &'a str,
+        _fresh: bool,
+        requester: &'a Requester,
+    ) -> KeyFuture<'a> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push(requester.as_str().to_owned());
+        Box::pin(async move { Ok(Resolved::authoritative(Some(key().verifying_key()))) })
+    }
+}
+
+#[tokio::test]
+async fn key_lookups_are_made_for_the_requesting_client() {
+    // Remote key fetches are charged to the client that sent the request:
+    // behind a trusted proxy, the last entry of its header.
+    let keys = Arc::new(RecordingKeys {
+        seen: std::sync::Mutex::new(Vec::new()),
+    });
+    let h = harness_full(
+        keys.clone(),
+        SIGNED_AT,
+        limits(1000),
+        Some("x-forwarded-for"),
+    );
+    let mut r = Req::vector();
+    r.extra_header = Some(("x-forwarded-for", "192.0.2.1, 203.0.113.9".into()));
+    assert_eq!(send(&h.app, r.build()).await.0, StatusCode::OK);
+    // Without connect info or a proxy header the client is unknown.
+    let h = harness_with(keys.clone(), SIGNED_AT, limits(1000));
+    assert_eq!(send(&h.app, Req::vector().build()).await.0, StatusCode::OK);
+    assert_eq!(*keys.seen.lock().unwrap(), ["203.0.113.9", "unknown"]);
 }

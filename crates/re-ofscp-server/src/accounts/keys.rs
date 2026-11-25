@@ -21,7 +21,7 @@ use re_ofscp_types::Authority;
 
 use super::store::AccountStore;
 use crate::signing::canonical::decode_public_key;
-use crate::signing::{KeyError, KeyFuture, KeyResolver, Resolved, Signer};
+use crate::signing::{KeyError, KeyFuture, KeyResolver, Requester, Resolved, Signer};
 
 /// How long a resolved local key is cached.
 const CACHE_TTL: Duration = Duration::from_secs(60);
@@ -143,7 +143,13 @@ impl ProviderKeys {
 }
 
 impl KeyResolver for ProviderKeys {
-    fn resolve<'a>(&'a self, signer: &'a Signer, key_id: &'a str, fresh: bool) -> KeyFuture<'a> {
+    fn resolve<'a>(
+        &'a self,
+        signer: &'a Signer,
+        key_id: &'a str,
+        fresh: bool,
+        requester: &'a Requester,
+    ) -> KeyFuture<'a> {
         Box::pin(async move {
             match signer {
                 Signer::Actor(actor) if actor.is_local_to(&self.local) => {
@@ -152,7 +158,7 @@ impl KeyResolver for ProviderKeys {
                 Signer::Provider(authority) if *authority == self.local => {
                     Ok(Resolved::authoritative(None))
                 }
-                _ => self.remote.resolve(signer, key_id, fresh).await,
+                _ => self.remote.resolve(signer, key_id, fresh, requester).await,
             }
         })
     }

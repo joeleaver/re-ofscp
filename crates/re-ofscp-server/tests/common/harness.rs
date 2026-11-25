@@ -16,7 +16,7 @@ use re_ofscp_server::problem::{self, ProblemBase};
 use re_ofscp_server::replay::{NoLedger, ReplayLimits, ReplayStore};
 use re_ofscp_server::signing::canonical::{CanonicalRequest, content_digest, sign};
 use re_ofscp_server::signing::{
-    Authenticated, Clock, KeyResolver, Signer, StaticKeys, Verifier, authenticate,
+    Authenticated, Clock, KeyResolver, SignatureLayer, Signer, StaticKeys, Verifier, authenticate,
 };
 use re_ofscp_types::{Actor, Authority};
 use time::OffsetDateTime;
@@ -99,6 +99,17 @@ pub fn harness_with(
     now: OffsetDateTime,
     limits: ReplayLimits,
 ) -> Harness {
+    harness_full(keys, now, limits, None)
+}
+
+/// A harness behind a trusted proxy that names the client in
+/// `client_ip_header` (`CLIENT_IP_HEADER`).
+pub fn harness_full(
+    keys: Arc<dyn KeyResolver>,
+    now: OffsetDateTime,
+    limits: ReplayLimits,
+    client_ip_header: Option<&str>,
+) -> Harness {
     // The store began 301 s before SIGNED_AT, so its warm-up covers
     // timestamps up to SIGNED_AT - 1.
     let replay = Arc::new(ReplayStore::new(
@@ -125,7 +136,10 @@ pub fn harness_with(
                 }
             }),
         )
-        .layer(middleware::from_fn_with_state(verifier, authenticate))
+        .layer(middleware::from_fn_with_state(
+            SignatureLayer::new(verifier, client_ip_header.map(str::to_owned)),
+            authenticate,
+        ))
         .layer(middleware::map_response_with_state(
             ProblemBase::new(&provider_a()),
             problem::render,
