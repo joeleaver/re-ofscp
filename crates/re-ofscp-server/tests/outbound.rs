@@ -208,3 +208,31 @@ async fn requests_over_the_per_target_cap_fail_at_once() {
     );
     assert_eq!(peer.hits("/fast"), 2);
 }
+
+#[test]
+fn free_subdomains_of_a_private_suffix_share_one_per_target_cap() {
+    // Reserving touches no network: the cap is taken before anything is
+    // resolved or sent.
+    let config = re_ofscp_server::outbound::OutboundConfig::new(Vec::new());
+    let cap = config.max_in_flight_per_target;
+    let client = OutboundClient::new(&config).unwrap();
+    let held: Vec<_> = (0..cap)
+        .map(|i| {
+            client
+                .reserve(&authority(&format!("s{i}.workers.dev")), "/doc")
+                .unwrap()
+        })
+        .collect();
+    let err = client
+        .reserve(&authority("fresh.workers.dev:8443"), "/doc")
+        .unwrap_err();
+    assert_eq!(err, OutboundError::Busy("workers.dev".to_owned()));
+    // Another ICANN domain's free subdomains are another target.
+    assert!(client.reserve(&authority("s0.vercel.app"), "/doc").is_ok());
+    drop(held);
+    assert!(
+        client
+            .reserve(&authority("fresh.workers.dev"), "/doc")
+            .is_ok()
+    );
+}

@@ -6,18 +6,26 @@
 //! cached documents, the cached negatives, the known sources and the
 //! re-fetch times are each kept in one.
 //!
-//! Making room for a new entry:
+//! Making room for a new entry, the first rule that applies:
 //!
-//! * with a per-group cap, a group at its cap gives up **its own** entry:
-//!   an expired one if it has any, else the one stored longest ago;
-//! * a full table gives up an expired entry of any group if there is one
-//!   (an expired entry is never used, so dropping it costs nobody
-//!   anything); else the inserting group gives up its own entry (expired
-//!   first, else its oldest) if no other group is larger than it, and
-//!   otherwise the **largest** group (on a tie, the one that most recently
-//!   gained an entry) gives up its oldest. A group is therefore only ever
-//!   cut back while no other group is bigger, and never to make room for a
-//!   group that would then be bigger than it.
+//! 1. with a per-group cap, a group at its cap gives up **its own** entry:
+//!    an expired one of its own if it has any, else its own one stored
+//!    longest ago. Only that group's entries are considered on this path,
+//!    even when other groups hold expired entries;
+//! 2. otherwise, a full table gives up the soonest-expired entry of any
+//!    group if one has expired (an expired entry is never used, so
+//!    dropping it costs nobody anything);
+//! 3. otherwise (no entry of any group has expired) the inserting group
+//!    gives up its own oldest entry if no other group is larger than it,
+//!    and else the **largest** group (on a tie, the one that most
+//!    recently gained an entry) gives up its oldest. A group is therefore
+//!    only ever cut back while no other group is bigger, and never to make
+//!    room for a group that would then be bigger than it.
+//!
+//! Groups are target groups: registrable domains by the ICANN section of
+//! the Public Suffix List (`crate::registrable`), so the free names under
+//! a private-section suffix (`*.workers.dev`) are all one group and cannot
+//! form a crowd of small groups that cuts back a large peer.
 //!
 //! Eviction only ever removes an entry; it never changes another entry's
 //! expiry (lost-conn/ofscp#20). Every operation is O(log n).

@@ -20,10 +20,12 @@
 //!   separate pools, each bounded; a full pool gets `503` for that side only,
 //!   so remote traffic can never lock out local users or vice versa;
 //! * each signer may hold at most `per_signer` live nonces (`429` past it);
-//! * remote signers are also grouped by *registrable domain* (Public Suffix
-//!   List, port ignored), each group holding at most `per_remote_domain`
-//!   (`429` past it), so `a.evil.example`, `b.evil.example:8443`, … share one
-//!   quota. Filling the remote pool takes many separately registered domains.
+//! * remote signers are also grouped by *registrable domain* (the ICANN
+//!   section of the Public Suffix List, port ignored), each group holding
+//!   at most `per_remote_domain` (`429` past it), so `a.evil.example`,
+//!   `b.evil.example:8443`, … share one quota, and so do all the free
+//!   names under a private-section suffix (`*.workers.dev`). Filling the
+//!   remote pool takes many separately registered domains.
 //!
 //! Local-pool exhaustion needs many local accounts; account creation is rate
 //! limited where accounts are created.

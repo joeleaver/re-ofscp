@@ -301,7 +301,7 @@ async fn production_router_rejects_signed_requests_it_cannot_verify() {
 
 /// Records whom each lookup was made for, then answers like `StaticKeys`.
 struct RecordingKeys {
-    seen: std::sync::Mutex<Vec<String>>,
+    seen: std::sync::Mutex<Vec<Requester>>,
 }
 
 impl KeyResolver for RecordingKeys {
@@ -312,10 +312,7 @@ impl KeyResolver for RecordingKeys {
         _fresh: bool,
         requester: &'a Requester,
     ) -> KeyFuture<'a> {
-        self.seen
-            .lock()
-            .unwrap()
-            .push(requester.as_str().to_owned());
+        self.seen.lock().unwrap().push(requester.clone());
         Box::pin(async move { Ok(Resolved::authoritative(Some(key().verifying_key()))) })
     }
 }
@@ -339,5 +336,22 @@ async fn key_lookups_are_made_for_the_requesting_client() {
     // Without connect info or a proxy header the client is unknown.
     let h = harness_with(keys.clone(), SIGNED_AT, limits(1000));
     assert_eq!(send(&h.app, Req::vector().build()).await.0, StatusCode::OK);
-    assert_eq!(*keys.seen.lock().unwrap(), ["203.0.113.9", "unknown"]);
+    // An IPv6 client is charged by its /64, within its /48.
+    let h = harness_full(
+        keys.clone(),
+        SIGNED_AT,
+        limits(1000),
+        Some("x-forwarded-for"),
+    );
+    let mut r = Req::vector();
+    r.extra_header = Some(("x-forwarded-for", "2001:db8:7:8::1".into()));
+    assert_eq!(send(&h.app, r.build()).await.0, StatusCode::OK);
+    assert_eq!(
+        *keys.seen.lock().unwrap(),
+        [
+            Requester::new("203.0.113.9"),
+            Requester::new("unknown"),
+            Requester::within("2001:db8:7:8::/64", Some("2001:db8:7::/48".to_owned())),
+        ]
+    );
 }

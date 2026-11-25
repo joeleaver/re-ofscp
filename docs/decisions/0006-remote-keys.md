@@ -1,7 +1,8 @@
 # 0006: Remote key resolution and outbound requests
 
 - **Status:** accepted
-- **Date:** 2026-11-25
+- **Date:** 2026-11-25; revised 2026-11-25 (target groups by the PSL's
+  ICANN section only; a per-/48 client tier)
 
 ## Context
 
@@ -73,12 +74,34 @@ One client for every request to a host someone else chose. Later features
   intervals) takes the slot first with `OutboundClient::reserve` and sends
   with `get_reserved`, so a busy target is refused before anything is paid.
 - **Target groups.** Wherever the outbound rules count per target, a target
-  is its host's **registrable domain** (eTLD+1 by the Public Suffix List, the
-  `psl` crate, as the replay store's per-domain quotas already do), port
-  dropped. So `victim.example:1` … `victim.example:65535` and
+  is its host's **registrable domain**: eTLD+1 by the **ICANN section** of
+  the Public Suffix List (the `psl` crate; `crate::registrable`), port
+  dropped. The replay store's per-domain quotas use the same grouping
+  (0001). So `victim.example:1` … `victim.example:65535` and
   `{n}.victim.example` behind wildcard DNS are one target. A host with no
   registrable domain (an IP literal, `localhost`, a bare public suffix) is
-  its own group.
+  its own group; under a TLD the PSL does not list, the PSL's default `*`
+  rule makes the TLD the suffix (such hosts are refused unless an operator
+  allows them, below).
+  - *Private-section suffixes are ignored.* The PSL's private section
+    lists suffixes such as `workers.dev`, `vercel.app`, `github.io` or
+    `duckdns.org`, under which anyone can create names for free, by the
+    thousand and from a script. Read as public suffixes, each such name
+    would be a target group of its own, and every table and budget kept
+    per group would be open to a crowd of free groups: the eviction rule
+    below cuts back the *largest* group, so 2 000 small attacker groups
+    under `workers.dev` would each be smaller than a real peer's, and the
+    peer, as the largest, would give way on every insert, losing its
+    cached documents and known sources (then, through its first-time
+    bucket, its users' verification). So all of `*.workers.dev` is the one
+    group `workers.dev`, and a new group costs a separately registered
+    ICANN domain.
+  - *Cost:* independent providers hosted under one shared private suffix
+    share one group: one per-target budget, one in-flight cap of 4, one
+    replay quota, and one share of each table. A provider that wants its
+    own needs its own registered domain, which any real deployment has
+    anyway. Recorded in 0001 for the replay quota, pending Joe's
+    confirmation.
 - **Ports.** Authorities may carry a port (§2.2), so fetches to non-443
   ports stay allowed; the port only never earns a separate limit.
 - **TLS:** rustls with the bundled Mozilla roots (`webpki-roots`), so the
@@ -145,11 +168,16 @@ Replaces `NoRemoteKeys` behind `ProviderKeys`' `remote` slot.
   would each get a fresh per-target budget and fill the budgets' 10 000-key
   tables. Like an outbound refusal it answers `401`, costs no token, and is
   subject to #20 (an unexpired cached key is still used; in practice none
-  is ever cached for such a host). IP literals have no suffix and are
-  judged by the address rule instead; operator-allowed host names are
-  exempt (above). The replay store groups by the same
-  `registrable_group`, unchanged: a signer under an unknown suffix can no
-  longer get a key verified, so it never reaches the replay store.
+  is ever cached for such a host). "Known" means known to the PSL's
+  **ICANN section**: a name under a private-section suffix is known
+  exactly when that suffix sits under a known ICANN suffix
+  (`x.workers.dev` is, under `dev`), and then groups under its ICANN
+  registrable domain like any other name (see "Target groups"). A private
+  rule under an unlisted TLD does not make its names known. IP literals
+  have no suffix and are judged by the address rule instead;
+  operator-allowed host names are exempt (above). The replay store groups
+  by the same `registrable_group`: a signer under an unknown suffix can
+  no longer get a key verified, so it never reaches the replay store.
 - **Rate limits.**
   - *Per source:* at most one `fresh` re-fetch per actor (or provider) per
     60 s. Expiry-driven fetches are not held to this; only failure re-fetches
@@ -203,17 +231,35 @@ Replaces `NoRemoteKeys` behind `ProviderKeys`' `remote` slot.
       therefore grow only until it is the largest group, then cycles its
       own entries; it never pushes out a smaller domain's known sources.
       With *k* groups filled by an attacker, a peer keeps its known
-      sources up to 10 000 / (*k* + 1), and each of those groups' sources
-      had to be fetched from the attacker's own client and first-time
-      budgets. A forgotten source is first-time until a fetch finds its
-      keys again, which degrades only to the first-time bucket, never to
-      a refusal. (An earlier revision also capped each group at 500; a
+      sources up to 10 000 / (*k* + 1).
+      A forgotten source is first-time until a fetch finds its keys
+      again, which degrades only to the first-time bucket, never to a
+      refusal. (An earlier revision also capped each group at 500; a
       peer with more active users than that evicted its own users even
       while the table was mostly empty, so the per-group cap was
       dropped.) All operations are O(log n) (per-group ordered maps and a
       ranking of groups by size).
+      - *What a group costs.* Each group is a separately registered ICANN
+        domain (target groups ignore the PSL's private section, see
+        "Target groups"; before that, a group was a free subdomain of
+        `workers.dev` and the like, and *k* could be in the thousands at
+        no cost). It also takes a provider there serving keys for any
+        handle, and one first-time fetch per source it gets in: 10 000
+        fetches to fill the table, charged to the attacker's own targets'
+        first-time buckets (30 a minute per group, so many groups fill in
+        parallel) and to its clients' buckets (10 a minute per IPv4
+        address or IPv6 /64, and 50 a minute per IPv6 /48, below). Ten
+        registered domains (about 900 fetches each, at 30 a minute) and
+        about 35 IPv4 addresses (or 7 IPv6 /48s) could thus bring a peer
+        down to about 900 known sources in about half an hour, and keep
+        it there by re-confirming their own; more domains fill faster.
+        That is the bound we accept: it degrades the peer's evicted users
+        to the first-time bucket, never to a refusal by itself, and it
+        costs real registrations that can be blocked by name once seen.
     - *Cached documents with keys are bounded the same way,* and for the
-      same reason: with one global table evicting its oldest entry, a
+      same reason (and with the same cost per group, except that cached
+      documents expire within an hour, so an attacker must keep re-fetching
+      to hold its share): with one global table evicting its oldest entry, a
       provider serving keys for any handle could have us cache 10 000 of
       its own documents and push out every peer's, after which each of
       the peer's users' next ordinary lookup costs an expiry fetch from
@@ -247,7 +293,14 @@ Replaces `NoRemoteKeys` behind `ProviderKeys`' `remote` slot.
       whatever the cache holds.
   - *Per client:* a token bucket per client address (the same key as the
     login rate limits: the `CLIENT_IP_HEADER` entry our proxy appends, else
-    the TCP peer; IPv6 by /64), burst 10, **10 per minute**. The signature
+    the TCP peer; IPv6 by /64), burst 10, **10 per minute**. An IPv6 client
+    is also charged to a bucket for its **/48**, burst 50, **50 per
+    minute** (five clients' worth): a /48 is the usual assignment to one
+    site, and holds 65 536 /64s, each a fresh client key, so without it
+    one subscriber could spend any number of client budgets. IPv4 clients
+    (and IPv4-mapped IPv6) have no network bucket: an IPv4 address is
+    already scarce. The `Requester` carries both keys
+    (`client::client_keys_by`). The signature
     layer passes the client to `KeyResolver::resolve` as a `Requester`.
     The rate is a third of a target bucket's refill, so one client can
     never keep any of a peer's buckets empty: at most it borrows ten of a
@@ -257,26 +310,27 @@ Replaces `NoRemoteKeys` behind `ProviderKeys`' `remote` slot.
     indefinitely.) Ten fetches a minute is still far above what an honest
     client causes: a request needs at most two fetches (one normal, one
     re-fetch on a miss), and cache hits and joined fetches are free.
-  - A fetch is charged to the target's and the client's bucket together,
-    or to neither, and only when it is about to start: cache hits and
-    lookups that join a fetch already under way cost nothing, and every
-    other refusal (unknown suffix, re-fetch interval, in-flight table full,
-    target busy) is decided before any bucket is touched. In particular a
-    target already at its in-flight cap answers `503` (`Retry-After: 5`, or
-    a matching unexpired cached key) without spending a token or starting
-    the 60 s re-fetch interval, which would otherwise make the next lookup
-    wait a minute for a fetch that never happened.
+  - A fetch is charged to the target's, the client's and (for IPv6) the
+    client's /48 bucket together, or to none, and only when it is about to
+    start: cache hits and lookups that join a fetch already under way cost
+    nothing, and every other refusal (unknown suffix, re-fetch interval,
+    in-flight table full, target busy) is decided before any bucket is
+    touched. In particular a target already at its in-flight cap answers
+    `503` (`Retry-After: 5`, or a matching unexpired cached key) without
+    spending a token or starting the 60 s re-fetch interval, which would
+    otherwise make the next lookup wait a minute for a fetch that never
+    happened.
   - When a limit stops a fetch: an unexpired cached key with that `key_id`
     is still used; otherwise `503` with `Retry-After` until the fetch would
     be allowed.
-  - *Trade-off:* the per-client bound is per source address, and the
-    client rate (10 a minute) is a third of a target bucket's refill, so
-    a handful of addresses (four are enough) can keep a peer's
-    first-time buckets empty: new users of that peer, and key rotations
-    of its existing users (see above), get `503`s until the spam stops or
-    the rotated user's cached document expires. They cannot touch its
-    known buckets, which only expiry-driven fetches use. Cached keys keep
-    working meanwhile.
+  - *Trade-off:* the per-client bound is per source address, and the client
+    rate (10 a minute) is a third of a target bucket's refill, so a handful
+    of addresses (four IPv4 addresses, or one IPv6 /48, are enough) can keep
+    a peer's first-time buckets empty: new users of that peer, and key
+    rotations of its existing users (see above), get `503`s until the spam
+    stops or the rotated user's cached document expires. They cannot touch
+    its known buckets, which only expiry-driven fetches use. Cached keys
+    keep working meanwhile.
   - *What reaches a peer (§8):* the target buckets cap every fetch to one
     registrable domain at 4 × (burst 20 + 30 a minute) = a burst of
     **80** and **120 a minute** (2 a second) at most, all four buckets
@@ -309,25 +363,33 @@ Replaces `NoRemoteKeys` behind `ProviderKeys`' `remote` slot.
   resolve at all (NXDOMAIN, SERVFAIL, timeout) is a network error, so a fetch
   failure (`503`), not a refusal.
 - **Bounds:** at most 10 000 fetches in flight (past that, `503`,
-  `Retry-After: 1`). At most 10 000 per-source re-fetch times, each
-  expiring when its 60 s interval ends and grouped by target group like
-  the cache: past that, an expired one goes first, then the oldest of the
-  largest group (every operation O(log n)). Cached documents and known
-  sources: at most 10 000 each, any number per group while there is room;
-  cached negatives: at most 100 per target group and 2 000 in all; all
-  evicted as described under "Per target" (an expired entry anywhere
-  first, then, for negatives, the full group's own oldest; then the oldest
-  of the largest group, or of the inserting group if none is larger). Each set of token buckets (the existing `RateLimiter`:
-  known and first-time user-key targets, known and first-time discovery
-  targets, clients) holds at most 10 000 keys; when full it drops idle buckets and
-  otherwise refuses new keys (fail closed: `503`, `Retry-After: 1`), rather
-  than forget one that is being limited.
+  `Retry-After: 1`). At most 10 000 per-source re-fetch times, each expiring
+  when its 60 s interval ends and grouped by target group like the cache:
+  past that, an expired one goes first, then the oldest of the largest group
+  (every operation O(log n)). Under a load of many groups' re-fetches, an
+  unexpired re-fetch time can be evicted, and its source can then be
+  re-fetched sooner than once per 60 s. Each such re-fetch is a `fresh` one,
+  so is still charged to the target's first-time bucket (and the client's):
+  the load on a peer stays within the first-time buckets' bound (above,
+  "What reaches a peer"), whatever the table holds. Cached documents and
+  known sources: at most 10 000 each, any number per group while there is
+  room; cached negatives: at most 100 per target group and 2 000 in all; all
+  evicted as described under "Per target": for negatives, a group at its cap
+  gives up its own expired entry, else its own oldest, and only its own
+  entries are considered; otherwise a full table gives up an expired entry
+  of any group first, then the oldest of the largest group, or of the
+  inserting group if none is larger. Each set of token buckets (the existing
+  `RateLimiter`: known and first-time user-key targets, known and first-time
+  discovery targets, clients, client /48s) holds at most 10 000 keys; when
+  full it drops idle buckets and otherwise refuses new keys (fail closed:
+  `503`, `Retry-After: 1`), rather than forget one that is being limited.
 
 ### Verifier and `KeyResolver`
 
 `KeyResolver::resolve` returns whether its answer came from cache, so the
 verifier knows when a re-fetch is required. It also takes the `Requester`
-(the client's rate-limit key) that remote fetches are charged to; the
+(the client's rate-limit key and, for IPv6, its /48) that remote fetches
+are charged to; the
 signature layer (`SignatureLayer`) derives it from the request the way the
 login rate limits do. Resolvers that never fetch (`StaticKeys`, the local
 account store) ignore it. `KeyError` becomes

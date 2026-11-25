@@ -1,7 +1,8 @@
 # 0001: Replay store: expiry, quotas and warm-up after a restart
 
 - **Status:** accepted
-- **Date:** 2026-11-23
+- **Date:** 2026-11-23; revised 2026-11-25 (private-section suffixes no
+  longer form separate groups, pending Joe's confirmation)
 - **Spec:** §4.5 "Replay store (Normative)" and "Restarts", §7.1,
   §8 "Replay prevention". The restart and retention rules arrived in
   [lost-conn/ofscp#17](https://github.com/lost-conn/ofscp/pull/17) (merged).
@@ -39,21 +40,37 @@ surface:
   can never lock out local users, or vice versa. Nothing is evicted early.
 - **Quotas:** each signer may hold `REPLAY_PER_SIGNER` live nonces (default
   6 000, about 10 signed requests/s sustained). Remote signers are also
-  grouped by **registrable domain**, using the Public Suffix List with the
-  port ignored and IP literals grouped by address. Each group may hold
+  grouped by **registrable domain**, using the **ICANN section** of the
+  Public Suffix List with the port ignored and IP literals grouped by
+  address. Each group may hold
   `REPLAY_PER_REMOTE_DOMAIN` (default 25 000). Over a quota, that signer or
   group gets `429 too_many_requests`, and `Retry-After` points to the latest
   of the earliest expiries among the quotas that refused.
   - Without registrable-domain grouping, one provider could use
     `a.evil.example`, `b.evil.example:8443` and so on as unlimited separate
     domains.
-  - **Private suffixes count as separate domains.** The PSL includes its
-    private section, so `alice.github.io` and `bob.duckdns.org` are each
-    their own group. We keep that on purpose: independent OFSCP providers
-    hosted under a shared suffix shouldn't share one quota. The cost is
-    that free subdomains under such suffixes are cheap to obtain. About ten
-    of them (each serving valid keys and signing validly) could fill the
-    remote pool. Even then, the pools keep local users unaffected.
+  - **Private-section suffixes do not make separate domains (revised
+    2026-11-25, to be confirmed by Joe).** The PSL's private section lists
+    suffixes such as `github.io`, `duckdns.org`, `workers.dev` and
+    `vercel.app`, under which anyone gets names for free. An earlier
+    revision read them as public suffixes, so `alice.github.io` and
+    `bob.github.io` were separate groups, and about ten free names (each
+    serving valid keys and signing validly) could fill the remote pool.
+    We now ignore the private section, so all of `*.github.io` is the one
+    group `github.io`, and filling the pool takes about ten separately
+    registered ICANN domains. The same grouping is used by the remote key
+    resolver's budgets and tables and by the outbound per-target cap
+    (0006, "Target groups"), so one rule holds everywhere.
+    - *Cost:* independent OFSCP providers hosted under one shared suffix
+      (two providers at `a.github.io` and `b.github.io`, or on
+      `*.workers.dev`) now share one quota of 25 000 live nonces: at least
+      about 40 signed requests a second sustained across all of them (about
+      80 with accurate clocks, more if theirs run behind: a nonce is kept
+      until its timestamp plus the skew window). If one of them is abusive,
+      the others get `429`s with it. A provider that needs its own quota
+      needs its own registered domain, which any real deployment has anyway
+      (`DOMAIN` must be its stable public host).
+    - Even with the quota filled, the pools keep local users unaffected.
   - Filling the local pool takes about 40 local accounts at full rate. The
     defence there is rate-limited account creation, which is a requirement
     for the accounts PR.

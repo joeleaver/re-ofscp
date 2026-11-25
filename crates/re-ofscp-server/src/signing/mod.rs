@@ -30,7 +30,7 @@ pub use verify::{
     Clock, Precheck, RequestParts, Signer, SystemClock, Verified, Verifier, VerifyError,
 };
 
-use crate::client::{Peer, client_key_by};
+use crate::client::{Peer, client_keys_by};
 use crate::problem::Problem;
 
 /// Largest request body the signature layer will buffer (it must hash the
@@ -80,11 +80,12 @@ pub async fn authenticate(
         return next.run(req).await;
     }
     let (parts, body) = req.into_parts();
-    let requester = Requester::new(client_key_by(
+    let client = client_keys_by(
         layer.client_ip_header.as_deref(),
         &parts.headers,
         &Peer::from_parts(&parts),
-    ));
+    );
+    let requester = Requester::within(client.key, client.network);
     let request = RequestParts {
         method: &parts.method,
         uri: &parts.uri,
