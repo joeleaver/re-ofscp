@@ -175,3 +175,25 @@ async fn a_provider_on_a_refused_address_is_401() {
     assert_eq!(retry, None);
     assert_eq!(peer.total_hits(), 0);
 }
+
+#[tokio::test]
+async fn a_provider_signature_naming_this_provider_is_401_without_a_fetch() {
+    // This provider publishes no signing keys yet, so a signature claiming
+    // to be from it cannot verify, and it must not fetch its own discovery
+    // document to find that out.
+    let peer = RemotePeer::start().await;
+    let app = app(&peer);
+    let req = signed_as(
+        &new_key(),
+        ("x-ofscp-provider", "providera.com"),
+        "psk_1",
+        "GET",
+        "/api/health",
+        "",
+        TIMESTAMP,
+    );
+    let (status, json, _, retry) = send(&app, req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(json["errorCode"], "unauthorized");
+    assert_eq!(retry, None);
+}

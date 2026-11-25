@@ -1,8 +1,11 @@
 //! Resolving signing keys (spec §4.5 step 6, §4.6).
 //!
 //! [`ProviderKeys`] answers for actors of this provider from the account
-//! store, and hands everything else (remote actors, provider signatures) to
-//! a remote resolver (`crate::remote_keys`, docs/decisions/0006).
+//! store, and hands remote actors and remote providers to a remote resolver
+//! (`crate::remote_keys`, docs/decisions/0006). A provider signature naming
+//! this provider itself is never fetched (that would only fetch our own
+//! discovery document): this provider publishes no signing keys yet (§8.1),
+//! so no such signature can verify.
 //!
 //! Local keys are cached briefly (positive results only). Revoking a key or
 //! disabling an account invalidates the cache at once, in this process; a
@@ -145,6 +148,9 @@ impl KeyResolver for ProviderKeys {
             match signer {
                 Signer::Actor(actor) if actor.is_local_to(&self.local) => {
                     self.resolve_local(actor.handle(), key_id, fresh).await
+                }
+                Signer::Provider(authority) if *authority == self.local => {
+                    Ok(Resolved::authoritative(None))
                 }
                 _ => self.remote.resolve(signer, key_id, fresh).await,
             }
