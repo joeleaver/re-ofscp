@@ -328,6 +328,47 @@ fn subdomains_and_ports_of_one_domain_share_a_quota() {
 }
 
 #[test]
+fn private_section_subdomains_share_their_icann_domains_quota() {
+    // `*.workers.dev` names are free, so they are one group, `workers.dev`
+    // (docs/decisions/0001), not one group each.
+    let s = warm_with(ReplayLimits {
+        per_remote_domain: 2,
+        ..limits(100)
+    });
+    rec(
+        &s,
+        SignedRequest,
+        &remote("u@s1.workers.dev", "s1.workers.dev", "1"),
+        T,
+    )
+    .unwrap();
+    rec(
+        &s,
+        SignedRequest,
+        &remote("u@s2.workers.dev", "s2.workers.dev", "2"),
+        T,
+    )
+    .unwrap();
+    let third = remote("u@s3.workers.dev:8443", "s3.workers.dev:8443", "3");
+    assert!(matches!(
+        rec(&s, SignedRequest, &third, T),
+        Err(ReplayError::RateLimited { .. })
+    ));
+    assert!(matches!(
+        s.check(SignedRequest, &third, T),
+        Err(ReplayError::RateLimited { .. })
+    ));
+    // Another ICANN domain's free subdomains have their own quota.
+    rec(
+        &s,
+        SignedRequest,
+        &remote("u@s1.vercel.app", "s1.vercel.app", "4"),
+        T,
+    )
+    .unwrap();
+}
+
+#[test]
 fn a_full_remote_pool_does_not_touch_local_users() {
     let s = warm_with(ReplayLimits {
         local_total: 10,

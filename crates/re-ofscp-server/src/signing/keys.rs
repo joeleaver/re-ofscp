@@ -67,21 +67,42 @@ pub enum KeyError {
 
 /// Whom a lookup is made for: the rate-limit key of the client whose
 /// request is being verified (`client::client_key`: its address, or its
-/// IPv6 /64). A resolver that fetches remotely charges the fetches it makes
-/// to this client, so one client cannot spend every peer's fetch budget
+/// IPv6 /64) and, for an IPv6 client, the /48 it sits in. A resolver that
+/// fetches remotely charges the fetches it makes to this client (and its
+/// network), so one client cannot spend every peer's fetch budget
 /// (docs/decisions/0006). Resolvers that never fetch ignore it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Requester(String);
+pub struct Requester {
+    key: String,
+    network: Option<String>,
+}
 
 impl Requester {
-    /// The client with rate-limit key `key`.
+    /// The client with rate-limit key `key`, in no wider network.
     pub fn new(key: impl Into<String>) -> Self {
-        Self(key.into())
+        Self {
+            key: key.into(),
+            network: None,
+        }
+    }
+
+    /// The client with rate-limit key `key`, within the network `network`
+    /// (`client::ClientKeys::network`), if any.
+    pub fn within(key: impl Into<String>, network: Option<String>) -> Self {
+        Self {
+            key: key.into(),
+            network,
+        }
     }
 
     /// The rate-limit key.
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.key
+    }
+
+    /// The rate-limit key of the client's network (its IPv6 /48), if any.
+    pub fn network(&self) -> Option<&str> {
+        self.network.as_deref()
     }
 }
 

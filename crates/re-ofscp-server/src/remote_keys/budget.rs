@@ -1,6 +1,6 @@
 //! The fetch budgets of the remote key resolver (docs/decisions/0006).
 //!
-//! Every fetch it makes is charged to two token buckets at once, or to
+//! Every fetch it makes is charged to several token buckets at once, or to
 //! none:
 //!
 //! * **the target**, by registrable domain (port and subdomains ignored, so
@@ -17,15 +17,19 @@
 //!   cache lifetime per source, however often it is named;
 //! * **the client** whose request caused it, at a rate well below each
 //!   target bucket's, so one anonymous client cannot keep any of a peer's
-//!   buckets empty and lock that peer's real users out.
+//!   buckets empty and lock that peer's real users out;
+//! * for an IPv6 client, also **its network** (the /48 its /64 sits in),
+//!   so a subscriber holding a /48, and so 65 536 /64s each a client of
+//!   its own, still gets only a bounded share.
 //!
-//! Only a fetch that is actually about to start is charged: cache hits,
-//! lookups that join a fetch already under way, and lookups refused for any
-//! other reason cost nothing.
+//! All of these are charged together, or none is. Only a fetch that is
+//! actually about to start is charged: cache hits, lookups that join a
+//! fetch already under way, and lookups refused for any other reason cost
+//! nothing.
 
 use super::fetch::Source;
 use super::state::MAX_ENTRIES;
-use crate::ratelimit::{Limited, RateLimiter};
+use crate::ratelimit::RateLimiter;
 use crate::registrable::registrable_group;
 use crate::signing::Requester;
 
@@ -40,6 +44,11 @@ pub const CLIENT_BURST: u32 = 10;
 /// ... refilled at this rate: a third of a target bucket's, so a single
 /// client can never keep one empty.
 pub const CLIENT_PER_MINUTE: u32 = 10;
+/// Fetches charged to one IPv6 /48, all its /64s together: at most this
+/// many at once (five clients' worth) ...
+pub const NETWORK_BURST: u32 = 5 * CLIENT_BURST;
+/// ... refilled at this rate (five clients' worth).
+pub const NETWORK_PER_MINUTE: u32 = 5 * CLIENT_PER_MINUTE;
 
 /// Which of a target's buckets a fetch is charged to; each standing has
 /// its own.
@@ -58,8 +67,32 @@ pub enum Standing {
 pub struct OverBudget {
     /// Seconds until every budget involved has a token again.
     pub retry_after: u64,
-    /// Which budget ran out (for the log).
+    /// Which budgets ran out (for the log).
     pub why: &'static str,
+}
+
+/// The kinds of bucket a fetch is charged to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Target,
+    Client,
+    Network,
+}
+
+/// The log message for a refusal by the buckets of the kinds in `spent`
+/// (each at most once, in [`Kind`] order).
+fn spent_why(spent: &[Kind]) -> &'static str {
+    use Kind::{Client, Network, Target};
+    match spent {
+        [Target] => "key fetch budget spent (target)",
+        [Client] => "key fetch budget spent (client)",
+        [Network] => "key fetch budget spent (client network)",
+        [Target, Client] => "key fetch budget spent (target and client)",
+        [Target, Network] => "key fetch budget spent (target and client network)",
+        [Client, Network] => "key fetch budget spent (client and client network)",
+        // All three (an empty list is never passed).
+        _ => "key fetch budget spent (target, client and client network)",
+    }
 }
 
 /// The resolver's token buckets.
@@ -70,6 +103,7 @@ pub struct Budgets {
     provider_known: RateLimiter,
     provider_first_time: RateLimiter,
     clients: RateLimiter,
+    networks: RateLimiter,
 }
 
 impl Default for Budgets {
@@ -81,16 +115,17 @@ impl Default for Budgets {
             provider_known: target(),
             provider_first_time: target(),
             clients: RateLimiter::new(CLIENT_BURST, CLIENT_PER_MINUTE, MAX_ENTRIES),
+            networks: RateLimiter::new(NETWORK_BURST, NETWORK_PER_MINUTE, MAX_ENTRIES),
         }
     }
 }
 
 impl Budgets {
     /// Charge a fetch of `source` (of `standing`) for `requester` at `now`:
-    /// one token from the target's bucket and one from the client's, or
-    /// none at all when either is empty. Callers serialize calls (the
-    /// resolver holds its tables' lock), so nothing can take the tokens
-    /// between the check and the charge.
+    /// one token from the target's bucket, the client's and (for an IPv6
+    /// client) its network's, or none at all when any is empty. Callers
+    /// serialize calls (the resolver holds its tables' lock), so nothing
+    /// can take the tokens between the check and the charge.
     pub fn charge(
         &self,
         source: &Source,
@@ -99,32 +134,47 @@ impl Budgets {
         now: i64,
     ) -> Result<(), OverBudget> {
         let target = target_group(source);
-        let targets = self.targets(source, standing);
-        let target_check = targets.peek(&target, now);
-        let client_check = self.clients.peek(requester.as_str(), now);
-        let over = |l: Limited, why| OverBudget {
-            retry_after: l.retry_after,
-            why,
-        };
-        match (target_check, client_check) {
-            (Ok(()), Ok(())) => {}
-            (Err(t), Err(c)) => {
-                return Err(over(
-                    Limited {
-                        retry_after: t.retry_after.max(c.retry_after),
-                    },
-                    "key fetch budget spent (target and client)",
-                ));
+        let buckets = self.buckets(source, standing, &target, requester);
+        let mut spent = Vec::new();
+        let mut retry_after = 0;
+        for (kind, limiter, key) in buckets.iter().flatten() {
+            if let Err(l) = limiter.peek(key, now) {
+                spent.push(*kind);
+                retry_after = retry_after.max(l.retry_after);
             }
-            (Err(t), Ok(())) => return Err(over(t, "key fetch budget spent (target)")),
-            (Ok(()), Err(c)) => return Err(over(c, "key fetch budget spent (client)")),
         }
-        targets
-            .check(&target, now)
-            .map_err(|l| over(l, "key fetch budget spent (target)"))?;
-        self.clients
-            .check(requester.as_str(), now)
-            .map_err(|l| over(l, "key fetch budget spent (client)"))
+        if !spent.is_empty() {
+            return Err(OverBudget {
+                retry_after,
+                why: spent_why(&spent),
+            });
+        }
+        for (kind, limiter, key) in buckets.iter().flatten() {
+            limiter.check(key, now).map_err(|l| OverBudget {
+                retry_after: l.retry_after,
+                why: spent_why(&[*kind]),
+            })?;
+        }
+        Ok(())
+    }
+
+    /// The buckets a fetch of `source` (of `standing`, in target group
+    /// `target`) for `requester` is charged to, with their keys, in
+    /// [`Kind`] order.
+    fn buckets<'a>(
+        &'a self,
+        source: &Source,
+        standing: Standing,
+        target: &'a str,
+        requester: &'a Requester,
+    ) -> [Option<(Kind, &'a RateLimiter, &'a str)>; 3] {
+        [
+            Some((Kind::Target, self.targets(source, standing), target)),
+            Some((Kind::Client, &self.clients, requester.as_str())),
+            requester
+                .network()
+                .map(|network| (Kind::Network, &self.networks, network)),
+        ]
     }
 
     fn targets(&self, source: &Source, standing: Standing) -> &RateLimiter {
@@ -146,10 +196,11 @@ impl Budgets {
         requester: &Requester,
         now: i64,
     ) -> bool {
-        self.targets(source, standing)
-            .peek(&target_group(source), now)
-            .is_ok()
-            && self.clients.peek(requester.as_str(), now).is_ok()
+        let target = target_group(source);
+        self.buckets(source, standing, &target, requester)
+            .iter()
+            .flatten()
+            .all(|(_, limiter, key)| limiter.peek(key, now).is_ok())
     }
 }
 
@@ -191,6 +242,95 @@ mod tests {
             assert_eq!(target_group(&other), group, "{other:?}");
         }
         assert_ne!(target_group(&user("xxx@other.example")), group);
+    }
+
+    #[test]
+    fn private_section_subdomains_share_their_icann_target() {
+        let b = Budgets::default();
+        assert_eq!(target_group(&user("xxx@s1.workers.dev")), "workers.dev");
+        for i in 0..DOMAIN_BURST {
+            let client = Requester::new(format!("client{i}"));
+            let source = user(&format!("user{i}@s{i}.workers.dev"));
+            b.charge(&source, FirstTime, &client, T).unwrap();
+        }
+        let next = Requester::new("another");
+        let refused = b
+            .charge(&user("zzz@fresh.workers.dev"), FirstTime, &next, T)
+            .unwrap_err();
+        assert_eq!(refused.why, "key fetch budget spent (target)");
+    }
+
+    #[test]
+    fn one_48_cycling_through_64s_is_refused_and_other_48s_are_not() {
+        let b = Budgets::default();
+        let in_48 = |net: u16, sub: u16| {
+            Requester::within(
+                format!("2001:db8:{net:x}:{sub:x}::/64"),
+                Some(format!("2001:db8:{net:x}::/48")),
+            )
+        };
+        // Each /64 spends one token (well inside its own burst of 10); the
+        // /48 together has five clients' worth.
+        for i in 0..NETWORK_BURST {
+            let target = user(&format!("uuu@t{i}.example"));
+            b.charge(&target, FirstTime, &in_48(1, i as u16), T)
+                .unwrap();
+        }
+        let fresh = user("uuu@fresh.example");
+        let next = in_48(1, 0xffff);
+        let refused = b.charge(&fresh, FirstTime, &next, T).unwrap_err();
+        assert_eq!(refused.why, "key fetch budget spent (client network)");
+        // 50 per minute: one token every 1.2 s.
+        assert_eq!(refused.retry_after, 2);
+        assert!(!b.would_allow(&fresh, FirstTime, &next, T + 1));
+        assert!(b.would_allow(&fresh, FirstTime, &next, T + 2));
+        // The refusal charged nothing: the target and the /64 are full.
+        for i in 0..DOMAIN_BURST {
+            let other = Requester::new(format!("other{i}"));
+            b.charge(&fresh, FirstTime, &other, T).unwrap();
+        }
+        let elsewhere = user("uuu@elsewhere.example");
+        assert!(b.would_allow(
+            &elsewhere,
+            FirstTime,
+            &Requester::new("2001:db8:1:ffff::/64"),
+            T
+        ));
+        // Other /48s, and IPv4 clients, are unaffected.
+        for net in [2, 3] {
+            for i in 0..CLIENT_BURST {
+                let target = user(&format!("vvv@n{net}-{i}.example"));
+                b.charge(&target, FirstTime, &in_48(net, 1), T).unwrap();
+            }
+        }
+        b.charge(&elsewhere, FirstTime, &Requester::new("203.0.113.7"), T)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_client_over_both_its_own_and_its_network_budget_says_so() {
+        let b = Budgets::default();
+        let client = Requester::within("2001:db8:1:1::/64", Some("2001:db8:1::/48".to_owned()));
+        for i in 0..CLIENT_BURST {
+            b.charge(&user(&format!("uuu@t{i}.example")), FirstTime, &client, T)
+                .unwrap();
+        }
+        for i in CLIENT_BURST..NETWORK_BURST {
+            let sibling = Requester::within(
+                format!("2001:db8:1:{i:x}::/64"),
+                Some("2001:db8:1::/48".to_owned()),
+            );
+            b.charge(&user(&format!("uuu@t{i}.example")), FirstTime, &sibling, T)
+                .unwrap();
+        }
+        let refused = b
+            .charge(&user("uuu@fresh.example"), FirstTime, &client, T)
+            .unwrap_err();
+        assert_eq!(
+            refused.why,
+            "key fetch budget spent (client and client network)"
+        );
+        assert_eq!(refused.retry_after, 6);
     }
 
     #[test]

@@ -222,6 +222,48 @@ mod tests {
     }
 
     #[test]
+    fn a_crowd_of_free_subdomains_cannot_evict_a_large_peer() {
+        // A real peer with 4 000 active users: their documents cached,
+        // each known, each just re-fetched.
+        let mut t = Tables::default();
+        let doc = keys();
+        let peer: Vec<_> = (0..4_000)
+            .map(|i| user(&format!("user{i}@big.example")))
+            .collect();
+        for p in &peer {
+            t.store(p, doc.clone(), Some(100_000), 1);
+            t.note_found(p, true, 1);
+            t.note_refetch(p, 1);
+        }
+        // An attacker takes 2 000 free subdomains of a private-section
+        // suffix, each serving keys for five handles: 10 000 sources, all
+        // more recent than the peer's. Were each subdomain a group of its
+        // own (as with the PSL's private section), every group would be
+        // smaller than the peer's, so the peer, as the largest group,
+        // would give way on every insert past the table's 10 000.
+        for host in 0..2_000 {
+            for handle in 0..5 {
+                let s = user(&format!("hhh{handle}@s{host}.workers.dev"));
+                t.store(&s, doc.clone(), Some(100_000), 2);
+                t.note_found(&s, true, 2);
+                t.note_refetch(&s, 2);
+            }
+        }
+        // They are one group, which grows only to the room left (it would
+        // grow until no larger than the peer's, half the table) and then
+        // cycles its own entries.
+        let rest = MAX_ENTRIES - peer.len();
+        assert_eq!(t.cache.group_len("workers.dev"), rest);
+        assert_eq!(t.known.len(), MAX_ENTRIES);
+        assert_eq!(t.refetched.group_len("workers.dev"), rest);
+        for p in &peer {
+            assert!(t.live(p, 3).is_some(), "{p:?} still cached");
+            assert!(t.is_known(p), "{p:?} still known");
+            assert!(t.refetch_wait(p, 3).is_some(), "{p:?} still timed");
+        }
+    }
+
+    #[test]
     fn the_cache_is_bounded_dropping_expired_then_the_largest_groups_oldest() {
         let mut t = Tables::with_cache_caps(4, 100, 100);
         let sub = Source::Provider(Authority::parse_canonical("a.p1.example").unwrap());
