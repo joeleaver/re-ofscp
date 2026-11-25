@@ -7,9 +7,12 @@ pub mod accounts;
 pub mod admin;
 pub mod client;
 pub mod config;
+pub mod cors;
 pub mod db;
+pub mod discovery;
 pub mod outbound;
 pub mod problem;
+pub mod provider_key;
 pub mod ratelimit;
 pub mod registrable;
 pub mod remote_keys;
@@ -56,6 +59,17 @@ pub struct AppState {
     /// Verifies every signed request, REST and federation alike, against the
     /// one provider-wide replay store.
     pub verifier: Arc<Verifier>,
+    /// The discovery document (§3.1), serialized once.
+    pub discovery: Arc<discovery::Published>,
+}
+
+/// Why [`AppStateBuilder::build`] failed.
+#[derive(Debug, thiserror::Error)]
+pub enum BuildError {
+    #[error("setting up the outbound client: {0}")]
+    Outbound(#[from] outbound::BuildError),
+    #[error("preparing the discovery document: {0}")]
+    Discovery(#[from] discovery::PublishError),
 }
 
 /// Builds an [`AppState`]. Defaults: the wall clock, local keys from the
@@ -113,9 +127,11 @@ impl AppStateBuilder {
 
     /// Build the state. The replay store starts in its restart warm-up;
     /// [`AppState::restore_replay`] ends it once the ledger is reloaded.
-    /// Fails only if the outbound HTTP client cannot be set up.
-    pub fn build(self) -> Result<AppState, outbound::BuildError> {
+    /// Fails if the outbound HTTP client cannot be set up or the discovery
+    /// document cannot be serialized.
+    pub fn build(self) -> Result<AppState, BuildError> {
         let config = self.config;
+        let discovery = Arc::new(discovery::Published::new(&config)?);
         let outbound = match self.outbound {
             Some(client) => client,
             None => Arc::new(OutboundClient::new(&OutboundConfig::new(
@@ -137,6 +153,7 @@ impl AppStateBuilder {
         ));
         let accounts = Arc::new(Accounts::new(
             config.domain.clone(),
+            config.provider_key.published(),
             config.registration,
             db.clone(),
             remote_keys,
@@ -166,6 +183,7 @@ impl AppStateBuilder {
             accounts,
             admins,
             verifier,
+            discovery,
         })
     }
 }
@@ -220,9 +238,12 @@ impl AppState {
 
 /// Build the HTTP router.
 ///
-/// Layer order, outermost first: tracing, problem rendering (so every
-/// [`Problem`], including the signature layer's and extractors' rejections,
-/// gets its body), signature verification (OFSCP routes only), routes.
+/// Layer order, outermost first: tracing, CORS (§3.4: preflights are
+/// answered before anything else, and every response, problems included,
+/// gets the headers; the admin paths are excluded by path), problem
+/// rendering (so every [`Problem`], including the signature layer's and
+/// extractors' rejections, gets its body), signature verification (OFSCP
+/// routes only), routes.
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/health", get(health))
@@ -248,6 +269,7 @@ pub fn router(state: AppState) -> Router {
             "/.well-known/ofscp/users/{handle}/keys",
             get(accounts::routes::user_keys),
         )
+        .route(discovery::PATH, get(discovery::get))
         .route("/problems/{code}", get(problem::describe))
         .fallback(|| async { Problem::not_found() })
         .method_not_allowed_fallback(|| async { Problem::method_not_allowed() })
@@ -266,6 +288,7 @@ pub fn router(state: AppState) -> Router {
             ProblemBase::new(&state.config.domain),
             problem::render,
         ))
+        .layer(middleware::from_fn(cors::layer))
         .layer(
             tower_http::trace::TraceLayer::new_for_http().make_span_with(
                 // The path only: query strings can carry secrets (invite

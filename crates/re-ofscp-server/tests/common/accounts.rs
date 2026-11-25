@@ -51,6 +51,7 @@ fn config(server: &RhypeServer, registration: Option<&'static str>, admin: bool)
     let addr = server.tcp_addr();
     Config::from_lookup(move |k| match k {
         "DOMAIN" => Some("providera.com".into()),
+        "PROVIDER_SIGNING_KEY" => Some(super::PROVIDER_SIGNING_KEY.into()),
         "RHYPEDB_ADDR" => Some(addr.clone()),
         // Tests choose their own source address per request.
         "CLIENT_IP_HEADER" => Some("x-test-ip".into()),

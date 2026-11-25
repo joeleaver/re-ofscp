@@ -278,6 +278,7 @@ async fn key_errors_map_to_401_and_503_with_retry_after() {
 async fn production_router_rejects_signed_requests_it_cannot_verify() {
     let config = re_ofscp_server::Config::from_lookup(|k| match k {
         "DOMAIN" => Some("providera.com".into()),
+        "PROVIDER_SIGNING_KEY" => Some(common::PROVIDER_SIGNING_KEY.into()),
         "RHYPEDB_ADDR" => Some("127.0.0.1:9".into()),
         _ => None,
     })

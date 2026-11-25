@@ -8,6 +8,7 @@ use std::net::SocketAddr;
 use re_ofscp_types::Authority;
 use re_ofscp_types::auth::RegistrationMode;
 
+use crate::provider_key::ProviderKey;
 use crate::replay::ReplayLimits;
 
 /// Server configuration.
@@ -63,6 +64,16 @@ pub struct Config {
     /// docs/decisions/0006). Each entry is matched as a whole authority,
     /// port included.
     pub outbound_allow_hosts: Vec<Authority>,
+    /// The provider signing key (`PROVIDER_SIGNING_KEY`: a 32-byte Ed25519
+    /// seed, base64, e.g. `openssl rand -base64 32`). Required: every
+    /// provider publishes one in discovery (§8.1, docs/decisions/0007).
+    /// Changing it rotates the key and its id.
+    pub provider_key: ProviderKey,
+    /// How to reach the operator, published in discovery as
+    /// `provider.contact` (`PROVIDER_CONTACT`, e.g. `mailto:ops@example.com`
+    /// or an `https:` URL). Default: `mailto:admin@{host}`, the host of
+    /// `DOMAIN` without its port.
+    pub contact: String,
 }
 
 /// A secret configuration value: `Debug` never prints it.
@@ -188,8 +199,32 @@ impl Config {
                 })
                 .collect::<Result<_, _>>()?,
         };
+        let provider_key = match get("PROVIDER_SIGNING_KEY").map(|v| v.trim().to_owned()) {
+            None => return Err(ConfigError::Missing("PROVIDER_SIGNING_KEY")),
+            Some(v) => ProviderKey::from_seed(
+                &decode_key(&v).ok_or(ConfigError::Invalid {
+                    name: "PROVIDER_SIGNING_KEY",
+                    reason:
+                        "must be a 32-byte Ed25519 seed, base64 (e.g. `openssl rand -base64 32`)"
+                            .to_owned(),
+                })?,
+            ),
+        };
+        let contact = match get("PROVIDER_CONTACT").map(|v| v.trim().to_owned()) {
+            None => format!("mailto:admin@{}", host_of(&domain)),
+            Some(v) if is_contact_uri(&v) => v,
+            Some(_) => {
+                return Err(ConfigError::Invalid {
+                    name: "PROVIDER_CONTACT",
+                    reason: "must be a mailto: or https: URI, e.g. mailto:ops@example.com"
+                        .to_owned(),
+                });
+            }
+        };
         Ok(Self {
             domain,
+            provider_key,
+            contact,
             outbound_allow_hosts,
             admin_secret_key,
             admin_setup_token,
@@ -206,9 +241,28 @@ impl Config {
 /// Whether `domain`'s host is `localhost` or a `*.localhost` name, which
 /// resolvers must answer with loopback addresses (RFC 6761 §6.3).
 fn is_loopback_name(domain: &Authority) -> bool {
-    let s = domain.as_str();
-    let host = s.rsplit_once(':').map_or(s, |(host, _)| host);
+    let host = host_of(domain);
     host == "localhost" || host.ends_with(".localhost")
+}
+
+/// A `mailto:` or `https:` URI (scheme in any case, RFC 3986 §3.1) with
+/// something after the scheme and no whitespace or control characters.
+fn is_contact_uri(v: &str) -> bool {
+    let rest = ["mailto:", "https://"].iter().find_map(|scheme| {
+        v.get(..scheme.len())
+            .filter(|p| p.eq_ignore_ascii_case(scheme))
+            .map(|_| &v[scheme.len()..])
+    });
+    rest.is_some_and(|r| !r.is_empty()) && !v.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
+/// `domain` without its `:port` (an IPv6 literal keeps its brackets).
+fn host_of(domain: &Authority) -> &str {
+    let s = domain.as_str();
+    if s.starts_with('[') {
+        return s.find(']').map_or(s, |end| &s[..=end]);
+    }
+    s.rsplit_once(':').map_or(s, |(host, _)| host)
 }
 
 /// A 32-byte key in standard or URL-safe base64, padded or not.
@@ -245,12 +299,92 @@ fn positive(
 mod tests {
     use super::*;
 
+    /// A test seed (bytes 0..32), base64.
+    const SEED: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+
+    /// `pairs`, plus a valid `PROVIDER_SIGNING_KEY` unless `pairs` sets one.
     fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         let pairs: Vec<(String, String)> = pairs
             .iter()
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
             .collect();
-        move |k| pairs.iter().find(|(pk, _)| pk == k).map(|(_, v)| v.clone())
+        move |k| match pairs.iter().find(|(pk, _)| pk == k) {
+            Some((_, v)) => Some(v.clone()),
+            None if k == "PROVIDER_SIGNING_KEY" => Some(SEED.to_owned()),
+            None => None,
+        }
+    }
+
+    #[test]
+    fn provider_signing_key_is_required_and_validated() {
+        let only_domain = |k: &str| (k == "DOMAIN").then(|| "a.example".to_owned());
+        assert!(matches!(
+            Config::from_lookup(only_domain),
+            Err(ConfigError::Missing("PROVIDER_SIGNING_KEY"))
+        ));
+        for bad in ["", "c2hvcnQ=", "not base64!"] {
+            let r = Config::from_lookup(env(&[
+                ("DOMAIN", "a.example"),
+                ("PROVIDER_SIGNING_KEY", bad),
+            ]));
+            assert!(matches!(
+                r,
+                Err(ConfigError::Invalid {
+                    name: "PROVIDER_SIGNING_KEY",
+                    ..
+                })
+            ));
+        }
+        let c = Config::from_lookup(env(&[("DOMAIN", "a.example")])).unwrap();
+        let expected = ProviderKey::from_seed(&std::array::from_fn(|i| i as u8));
+        assert_eq!(c.provider_key.key_id(), expected.key_id());
+        // Debug output names the key id, never the seed.
+        assert!(!format!("{c:?}").contains(SEED));
+    }
+
+    #[test]
+    fn contact_defaults_to_the_domain_host_and_is_validated() {
+        let contact = |domain: &str, v: Option<&str>| {
+            let mut pairs = vec![("DOMAIN", domain)];
+            if let Some(v) = v {
+                pairs.push(("PROVIDER_CONTACT", v));
+            }
+            Config::from_lookup(env(&pairs)).map(|c| c.contact)
+        };
+        assert_eq!(
+            contact("a.example", None).unwrap(),
+            "mailto:admin@a.example"
+        );
+        assert_eq!(
+            contact("a.example:8443", None).unwrap(),
+            "mailto:admin@a.example"
+        );
+        assert_eq!(
+            contact("a.example", Some(" https://a.example/about ")).unwrap(),
+            "https://a.example/about"
+        );
+        assert_eq!(
+            contact("a.example", Some("MAILTO:ops@a.example")).unwrap(),
+            "MAILTO:ops@a.example"
+        );
+        for bad in [
+            "",
+            "  ",
+            "mailto:a@b\nX: y",
+            "foo bar",
+            "ops@example.com",
+            "http://a.example",
+            "mailto:",
+            "https://",
+        ] {
+            assert!(matches!(
+                contact("a.example", Some(bad)),
+                Err(ConfigError::Invalid {
+                    name: "PROVIDER_CONTACT",
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]

@@ -4,8 +4,8 @@
 //! store, and hands remote actors and remote providers to a remote resolver
 //! (`crate::remote_keys`, docs/decisions/0006). A provider signature naming
 //! this provider itself is never fetched (that would only fetch our own
-//! discovery document): this provider publishes no signing keys yet (§8.1),
-//! so no such signature can verify.
+//! discovery document): it is checked against the provider signing keys
+//! this provider publishes (§8.1, docs/decisions/0007), held in memory.
 //!
 //! Local keys are cached briefly (positive results only). Revoking a key or
 //! disabling an account invalidates the cache at once, in this process; a
@@ -55,6 +55,8 @@ struct Cache {
 /// Local keys from the account store; everything else from `remote`.
 pub struct ProviderKeys {
     local: Authority,
+    /// This provider's own published signing keys, by key id (§8.1).
+    own: Vec<(String, VerifyingKey)>,
     store: AccountStore,
     remote: Arc<dyn KeyResolver>,
     cache: Mutex<Cache>,
@@ -69,10 +71,17 @@ impl std::fmt::Debug for ProviderKeys {
 }
 
 impl ProviderKeys {
-    /// Resolve `local`'s actors from `store`, others via `remote`.
-    pub fn new(local: Authority, store: AccountStore, remote: Arc<dyn KeyResolver>) -> Self {
+    /// Resolve `local`'s actors from `store`, `local` itself from `own`
+    /// (its published provider keys, by id), others via `remote`.
+    pub fn new(
+        local: Authority,
+        own: Vec<(String, VerifyingKey)>,
+        store: AccountStore,
+        remote: Arc<dyn KeyResolver>,
+    ) -> Self {
         Self {
             local,
+            own,
             store,
             remote,
             cache: Mutex::new(Cache::default()),
@@ -156,7 +165,12 @@ impl KeyResolver for ProviderKeys {
                     self.resolve_local(actor.handle(), key_id, fresh).await
                 }
                 Signer::Provider(authority) if *authority == self.local => {
-                    Ok(Resolved::authoritative(None))
+                    Ok(Resolved::authoritative(
+                        self.own
+                            .iter()
+                            .find(|(id, _)| id == key_id)
+                            .map(|(_, key)| *key),
+                    ))
                 }
                 _ => self.remote.resolve(signer, key_id, fresh, requester).await,
             }
