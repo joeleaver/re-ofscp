@@ -153,6 +153,21 @@ impl<S: Send + Sync> FromRequestParts<S> for Authenticated {
     }
 }
 
+/// Extractor: the verified signature if the request was signed, `None` if
+/// it carried no signature headers at all. A request whose signature fails
+/// verification never gets this far: the middleware answers it `401`.
+/// For reads that admit anonymous viewers (§6.1 `public`).
+#[derive(Debug, Clone)]
+pub struct MaybeAuthenticated(pub Option<Verified>);
+
+impl<S: Send + Sync> FromRequestParts<S> for MaybeAuthenticated {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(Self(parts.extensions.get::<Verified>().cloned()))
+    }
+}
+
 impl Authenticated {
     /// The signing actor, if a user signed. Provider-signed requests get `403`.
     pub fn actor(&self) -> Result<&Actor, Problem> {

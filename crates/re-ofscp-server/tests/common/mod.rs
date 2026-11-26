@@ -5,6 +5,7 @@ pub mod accounts;
 pub mod admin;
 pub mod harness;
 pub mod key_setup;
+pub mod profiles;
 pub mod remote_peer;
 pub mod rhypedb;
 
