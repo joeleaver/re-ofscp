@@ -21,7 +21,10 @@ use re_ofscp_types::Authority;
 
 use super::store::AccountStore;
 use crate::signing::canonical::decode_public_key;
-use crate::signing::{KeyError, KeyFuture, KeyResolver, Requester, Resolved, Signer};
+use crate::signing::{
+    KeyError, KeyFuture, KeyResolver, Lifetime, ReconfirmFuture, Reconfirmed, Requester, Resolved,
+    Signer, classify,
+};
 
 /// How long a resolved local key is cached.
 const CACHE_TTL: Duration = Duration::from_secs(60);
@@ -170,6 +173,32 @@ impl KeyResolver for ProviderKeys {
                     ))
                 }
                 _ => self.remote.resolve(signer, key_id, fresh, requester).await,
+            }
+        })
+    }
+
+    fn reconfirm<'a>(
+        &'a self,
+        signer: &'a Signer,
+        key_id: &'a str,
+        key: &'a VerifyingKey,
+        held: Lifetime,
+        requester: &'a Requester,
+    ) -> ReconfirmFuture<'a> {
+        Box::pin(async move {
+            let ours = match signer {
+                Signer::Actor(actor) => actor.is_local_to(&self.local),
+                Signer::Provider(authority) => *authority == self.local,
+            };
+            if ours {
+                match self.resolve(signer, key_id, true, requester).await {
+                    Ok(r) => classify(r.key.as_ref(), key, r.lifetime),
+                    Err(e) => Reconfirmed::Unconfirmed(e.to_string()),
+                }
+            } else {
+                self.remote
+                    .reconfirm(signer, key_id, key, held, requester)
+                    .await
             }
         })
     }

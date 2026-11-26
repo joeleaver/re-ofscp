@@ -8,10 +8,30 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use common::accounts::*;
 use common::harness::*;
-use re_ofscp_server::accounts::{CreateError, MAX_DEVICE_KEYS, StoreError};
+use std::sync::{Arc, Mutex};
+
+use re_ofscp_server::accounts::{
+    CreateError, MAX_DEVICE_KEYS, Revocation, RevocationListener, StoreError,
+};
 use re_ofscp_server::signing::{Signer, StaticKeys};
 use re_ofscp_types::Actor;
 use serde_json::{Value, json};
+
+/// Records the revocations announced.
+#[derive(Debug, Default)]
+struct Recorder(Mutex<Vec<Revocation>>);
+
+impl Recorder {
+    fn take(&self) -> Vec<Revocation> {
+        std::mem::take(&mut self.0.lock().unwrap())
+    }
+}
+
+impl RevocationListener for Recorder {
+    fn revoked(&self, r: &Revocation) {
+        self.0.lock().unwrap().push(r.clone());
+    }
+}
 
 #[tokio::test]
 async fn login_register_a_key_sign_list_and_revoke() {
@@ -66,7 +86,8 @@ async fn login_register_a_key_sign_list_and_revoke() {
     assert_eq!(list["keys"][0]["device_name"], "Firefox on Linux");
 
     // Revoke it with a request signed by itself (logout, §4.7.2).
-    let mut revocations = env.state.accounts.revocations();
+    let revocations = Arc::new(Recorder::default());
+    env.state.accounts.on_revocation(revocations.clone());
     let path = format!("/api/auth/device-keys/{key_id}");
     let req = signed(
         &device,
@@ -79,7 +100,7 @@ async fn login_register_a_key_sign_list_and_revoke() {
     );
     let (status, body, _, _) = send(&env.app, req).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
-    let r = revocations.try_recv().unwrap();
+    let r = revocations.take().pop().unwrap();
     assert_eq!(r.handle, "alice");
     assert_eq!(r.key_id.as_deref(), Some(key_id.as_str()));
 

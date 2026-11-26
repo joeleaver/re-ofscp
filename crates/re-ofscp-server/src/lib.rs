@@ -22,6 +22,7 @@ pub mod remote_keys;
 pub mod replay;
 pub mod signing;
 pub mod timefmt;
+pub mod ws;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,12 +41,13 @@ use db::{Db, DbConfig, DbError};
 use federation::FederationPolicy;
 use federation::store::PolicyStore;
 use outbound::{OutboundClient, OutboundConfig};
-use privacy::{Contacts, GroupMemberships, Liveness, NoConnections, Relationships};
+use privacy::{Contacts, GroupMemberships, Liveness, Relationships};
 use profiles::Profiles;
 use remote_keys::RemoteKeys;
 use replay::ReplayStore;
 use replay::ledger::{LedgerError, NonceLedger, RhypeLedger};
 use signing::{Clock, KeyResolver, SystemClock, Verifier};
+use ws::{Hub, Seams, WsConfig};
 
 /// Maximum clock skew accepted on signed requests, in seconds (§4.5 step 3, §8).
 pub const MAX_SKEW_SECS: i64 = 300;
@@ -74,6 +76,8 @@ pub struct AppState {
     pub federation: Arc<PolicyStore>,
     /// Profiles, presence and privacy settings (§5.1, §6).
     pub profiles: Arc<Profiles>,
+    /// The WebSocket layer (§7.1): live connections, fan-out, force-close.
+    pub ws: Arc<Hub>,
 }
 
 /// Why [`AppStateBuilder::build`] failed.
@@ -101,7 +105,9 @@ pub struct AppStateBuilder {
     ledger: Option<Arc<dyn NonceLedger>>,
     clock: Arc<dyn Clock>,
     relationships: Relationships,
-    liveness: Arc<dyn Liveness>,
+    liveness: Option<Arc<dyn Liveness>>,
+    ws_config: WsConfig,
+    ws_seams: Seams,
 }
 
 impl AppStateBuilder {
@@ -153,11 +159,11 @@ impl AppStateBuilder {
         self
     }
 
-    /// Derive online/offline (§7.5) from `liveness` instead of
-    /// [`NoConnections`].
+    /// Derive online/offline (§7.5) from `liveness` instead of this
+    /// provider's own WebSocket connections.
     #[must_use]
     pub fn liveness(mut self, liveness: Arc<dyn Liveness>) -> Self {
-        self.liveness = liveness;
+        self.liveness = Some(liveness);
         self
     }
 
@@ -165,6 +171,21 @@ impl AppStateBuilder {
     #[must_use]
     pub fn clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
+        self
+    }
+
+    /// Run the WebSocket layer with `config` instead of the defaults.
+    #[must_use]
+    pub fn ws_config(mut self, config: WsConfig) -> Self {
+        self.ws_config = config;
+        self
+    }
+
+    /// Plug channel access, timelines and federation policy into the
+    /// WebSocket layer (default: no topics, no timeline, allow all).
+    #[must_use]
+    pub fn ws_seams(mut self, seams: Seams) -> Self {
+        self.ws_seams = seams;
         self
     }
 
@@ -218,12 +239,6 @@ impl AppStateBuilder {
                 setup_token: config.admin_setup_token.as_ref().map(|t| t.0.clone()),
             },
         ));
-        let profiles = Arc::new(Profiles::new(
-            config.domain.clone(),
-            db.clone(),
-            self.relationships,
-            self.liveness,
-        ));
         let keys: Arc<dyn KeyResolver> = self.keys.unwrap_or_else(|| accounts.keys.clone());
         let verifier = Arc::new(Verifier::new(
             config.domain.clone(),
@@ -234,6 +249,21 @@ impl AppStateBuilder {
             policy,
             self.clock,
         ));
+        let ws = Arc::new(Hub::new(
+            self.ws_config,
+            verifier.clone(),
+            config.client_ip_header.clone(),
+            config.domain.clone(),
+            self.ws_seams,
+        ));
+        accounts.on_revocation(ws.clone());
+        let liveness = self.liveness.unwrap_or_else(|| ws.clone());
+        let profiles = Arc::new(Profiles::new(
+            config.domain.clone(),
+            db.clone(),
+            self.relationships,
+            liveness,
+        ));
         Ok(AppState {
             config: Arc::new(config),
             db,
@@ -243,6 +273,7 @@ impl AppStateBuilder {
             discovery,
             federation,
             profiles,
+            ws,
         })
     }
 }
@@ -258,7 +289,9 @@ impl AppState {
             ledger: None,
             clock: Arc::new(SystemClock),
             relationships: Relationships::default(),
-            liveness: Arc::new(NoConnections),
+            liveness: None,
+            ws_config: WsConfig::default(),
+            ws_seams: Seams::default(),
         }
     }
 
@@ -379,6 +412,9 @@ pub fn router(state: AppState) -> Router {
         // requests are authenticated by the admin session, never by OFSCP
         // signatures (docs/decisions/0005).
         .merge(admin::routes::router())
+        // Unsigned upgrade: the handshake inside the socket authenticates
+        // (§7.1).
+        .route(ws::PATH, get(ws::upgrade))
         .layer(middleware::map_response_with_state(
             ProblemBase::new(&state.config.domain),
             problem::render,
