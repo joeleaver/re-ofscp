@@ -15,7 +15,6 @@ use serde::Deserialize;
 use crate::accounts::store::status;
 use crate::db::{Db, DbError, Ql};
 use crate::timefmt::unix;
-use rhypedb_client::Row;
 
 /// The defaults for an account that has never saved privacy settings
 /// (docs/decisions/0009; the same as Forumall's).
@@ -306,7 +305,8 @@ impl ProfileStore {
         }
         let q = q.raw(" })");
         match self
-            .write_one_object::<ProfileRow>(&q)
+            .db
+            .write_one_object_as::<ProfileRow>(&q)
             .await?
             .into_iter()
             .next()
@@ -375,7 +375,7 @@ impl ProfileStore {
             q = q.raw(", metadata: ").str(&metadata_json(metadata));
         }
         let q = q.raw(" })");
-        if let Some(row) = self.write_one_object::<PrivacyRow>(&q).await?.pop() {
+        if let Some(row) = self.db.write_one_object_as::<PrivacyRow>(&q).await?.pop() {
             return row.data.into_privacy().map(Some);
         }
         let new = changes.apply(seen.clone());
@@ -396,7 +396,7 @@ impl ProfileStore {
             .raw(", updated_at: ")
             .unix_seconds(now)
             .raw(" })");
-        match self.write_one_object::<PrivacyRow>(&q).await {
+        match self.db.write_one_object_as::<PrivacyRow>(&q).await {
             Ok(mut rows) => match rows.pop() {
                 Some(row) => row.data.into_privacy().map(Some),
                 None => Err(DbError::Decode("create returned nothing".to_owned())),
@@ -442,7 +442,8 @@ impl ProfileStore {
                 .unix_seconds(now)
                 .raw(" })");
             if let Some(row) = self
-                .write_one_object::<PresenceRow>(&q)
+                .db
+                .write_one_object_as::<PresenceRow>(&q)
                 .await?
                 .into_iter()
                 .next()
@@ -460,7 +461,7 @@ impl ProfileStore {
                 .raw(", updated_at: ")
                 .unix_seconds(now)
                 .raw(" })");
-            match self.write_one_object::<PresenceRow>(&q).await {
+            match self.db.write_one_object_as::<PresenceRow>(&q).await {
                 Ok(mut rows) => match rows.pop() {
                     Some(row) => return row.data.into_presence(),
                     None => return Err(DbError::Decode("create returned nothing".to_owned())),
@@ -473,32 +474,4 @@ impl ProfileStore {
             "presence row neither updatable nor creatable".to_owned(),
         ))
     }
-
-    /// Run a write that touches at most one object (a `create`, or an
-    /// `update` filtered on a `@unique` field), and decode what it returned.
-    ///
-    /// Such a write is one rhypedb transaction, so when it loses a
-    /// write-write conflict nothing of it was applied, and it is run again
-    /// on a fresh snapshot, up to [`WRITE_ATTEMPTS`] times with a short
-    /// growing pause (see [`DbError::Contended`]). Never use this for a
-    /// write that may touch several objects.
-    async fn write_one_object<T: serde::de::DeserializeOwned>(
-        &self,
-        q: &Ql,
-    ) -> Result<Vec<Row<T>>, DbError> {
-        let mut attempt = 1;
-        loop {
-            match self.db.write_many::<T>(q).await {
-                Err(DbError::Contended(_)) if attempt < WRITE_ATTEMPTS => {
-                    tokio::time::sleep(std::time::Duration::from_millis(1 << attempt)).await;
-                    attempt += 1;
-                }
-                other => return other,
-            }
-        }
-    }
 }
-
-/// How often [`ProfileStore::write_one_object`] tries a write in all while
-/// it keeps losing write conflicts.
-const WRITE_ATTEMPTS: u32 = 6;

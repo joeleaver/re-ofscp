@@ -11,6 +11,7 @@
 
 pub mod admin;
 pub mod federation;
+pub mod groups;
 pub mod profile;
 
 pub use ofscp_core::{Actor, Authority, IdentError, dm_id, is_valid_handle};

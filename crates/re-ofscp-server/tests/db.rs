@@ -449,3 +449,19 @@ async fn concurrent_unique_creates_are_conflicts_or_contended() {
         .unwrap();
     assert_eq!(rows.len(), 1);
 }
+
+/// A write to an object that is gone is [`DbError::Vanished`] (a filtered
+/// `update` meets this when the object it matched is deleted before the
+/// write). Pins rhypedb's message for it.
+#[tokio::test]
+async fn writing_a_deleted_object_is_vanished() {
+    let server = RhypeServer::start();
+    let db = db(&server);
+    let q = Ql::new("GroupClaim.get(")
+        .uint(987_654)
+        .raw(").update({ key: \"x\" })");
+    match db.execute(&q).await {
+        Err(DbError::Vanished(_)) => {}
+        other => panic!("{other:?}"),
+    }
+}
