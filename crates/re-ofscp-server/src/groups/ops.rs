@@ -81,17 +81,22 @@ impl Groups {
         Ok(ReadableGroup { group, standing })
     }
 
-    /// The channel, if its group is readable (`403` otherwise, as
-    /// [`Self::read_group`]), it exists, and the caller has effective read
-    /// access to it (§11.3). A channel the caller cannot read is answered
-    /// exactly as one that does not exist: `404` (lost-conn/ofscp#26).
+    /// The channel, if it exists and the caller has effective read access
+    /// to it (§11.3). A channel the caller cannot read, for any §11.3
+    /// reason (its group's tier included), is answered exactly as one that
+    /// does not exist: `404` (lost-conn/ofscp#26). Otherwise a `403` would
+    /// tell an outsider which channel ids are real. Only group-level routes
+    /// answer an unreadable group `403`.
     pub async fn read_channel(
         &self,
         caller: &Caller,
         group_id: &str,
         channel_id: &str,
     ) -> Result<(ReadableGroup, StoredChannel), GroupError> {
-        let g = self.read_group(caller, group_id).await?;
+        let g = match self.read_group(caller, group_id).await {
+            Err(GroupError::Forbidden(_)) => return Err(GroupError::NotFound(NO_CHANNEL)),
+            other => other?,
+        };
         let channel = self
             .store
             .channel(group_id, channel_id)

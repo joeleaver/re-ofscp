@@ -14,9 +14,10 @@
 //! | `GET /api/tiers` | none | anyone |
 //!
 //! Remote actors (§8.2) use every route but group creation exactly as
-//! local ones do, by their full `handle@domain`. A channel the caller
-//! cannot read is `404`, as one that does not exist, wherever its group is
-//! readable (§11.3, lost-conn/ofscp#26); an unreadable group is `403`. Provider signatures read
+//! local ones do, by their full `handle@domain`. On the single-channel
+//! routes a channel the caller cannot read, for any §11.3 reason (an
+//! unreadable group included), is `404`, as one that does not exist
+//! (lost-conn/ofscp#26). Group-level routes answer an unreadable group `403`. Provider signatures read
 //! as anonymous and are refused where a user must act.
 
 use axum::Json;

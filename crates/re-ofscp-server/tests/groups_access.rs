@@ -166,12 +166,12 @@ async fn list_and_get_agree_with_effective_read_access_for_every_caller() {
                 assert_eq!(listed.contains(&cid.as_str()), readable, "list: {what}");
                 let path = format!("/api/groups/{gid}/channels/{cid}");
                 let (s, body) = call(env, by, "GET", &path, None).await;
-                // A hidden channel is `404`, as if absent, wherever its
-                // group is readable (lost-conn/ofscp#26).
-                let want = match (readable, group_readable) {
-                    (true, _) => StatusCode::OK,
-                    (false, true) => StatusCode::NOT_FOUND,
-                    (false, false) => StatusCode::FORBIDDEN,
+                // A hidden channel is `404`, as if absent, whatever hides
+                // it, its group's tier included (lost-conn/ofscp#26).
+                let want = if readable {
+                    StatusCode::OK
+                } else {
+                    StatusCode::NOT_FOUND
                 };
                 assert_eq!(s, want, "GET: {what}: {body}");
             }
@@ -222,8 +222,17 @@ async fn a_remote_actor_is_never_the_local_account_of_the_same_handle() {
     assert_eq!(s, StatusCode::OK, "{g}");
     let c = create_channel(&env, &remote_mia, &gid, json!({"type": "text"})).await;
     let cpath = format!("{path}/channels/{}", id(&c));
-    let (s, _) = call(&env, Some(&mia), "GET", &cpath, None).await;
-    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, real) = call(&env, Some(&mia), "GET", &cpath, None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    // Indistinguishable from a channel id that does not exist.
+    let fake = format!("{path}/channels/chn_doesnotexist");
+    let (s, made_up) = call(&env, Some(&mia), "GET", &fake, None).await;
+    assert_eq!((s, made_up), (StatusCode::NOT_FOUND, real));
+    for method in ["PATCH", "DELETE"] {
+        let b = (method == "PATCH").then(|| json!({"type": "text"}));
+        let (s, p) = call(&env, Some(&remote_alice), method, &cpath, b).await;
+        assert_eq!(s, StatusCode::NOT_FOUND, "{method}: {p}");
+    }
     let store = &env.state.groups.store;
     assert_eq!(
         store
@@ -336,7 +345,7 @@ async fn access_changes_are_announced_and_take_effect_at_once() {
         }
     );
     let (s, _) = call(&env, None, "GET", &cpath, None).await;
-    assert_eq!(s, StatusCode::FORBIDDEN);
+    assert_eq!(s, StatusCode::NOT_FOUND);
     let (s, _) = call(&env, Some(&mia), "GET", &cpath, None).await;
     assert_eq!(s, StatusCode::OK);
 
@@ -359,10 +368,10 @@ async fn access_changes_are_announced_and_take_effect_at_once() {
     assert_eq!(s, StatusCode::OK);
     groups.remove_member(&gid, &mia.id()).await.unwrap();
     assert_eq!(next(&mut rx).await, member);
-    for path in [&gpath, &cpath] {
-        let (s, _) = call(&env, Some(&mia), "GET", path, None).await;
-        assert_eq!(s, StatusCode::FORBIDDEN, "{path}");
-    }
+    let (s, _) = call(&env, Some(&mia), "GET", &gpath, None).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, _) = call(&env, Some(&mia), "GET", &cpath, None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
 
     // Deleting the channel is a change too.
     let (s, _) = call(&env, Some(&alice), "DELETE", &cpath, None).await;

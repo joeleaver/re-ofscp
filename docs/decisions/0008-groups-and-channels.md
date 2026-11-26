@@ -70,8 +70,8 @@ receiver that lags must re-check everything it holds.
 | Case | Answer |
 | --- | --- |
 | No such group (or a malformed id) | `404` |
-| Group the caller cannot read (`private`/`group`, not a member; unsigned included) | `403` |
-| Channel the caller cannot read, in a group it can read | `404`, the same body as a missing channel |
+| Group-level route (`GET`/`PATCH`/`DELETE` the group, list or create channels), group the caller cannot read (`private`/`group`, not a member; unsigned included) | `403` |
+| Single-channel route (`GET`/`PATCH`/`DELETE`), channel the caller cannot read for any §11.3 reason, its group's tier included | `404`, the same body as a missing channel |
 | Channel `PATCH`/`DELETE`: can read the channel but lacks `manage` | `403` |
 | Channel `PATCH`/`DELETE`: a `manage` holder whom `view` leaves out | `404` (can't read it) |
 | Group `PATCH`, channel create: lacks `manage` | `403` |
@@ -79,8 +79,12 @@ receiver that lags must re-check everything it holds.
 | Unsigned mutation | `401` |
 | Unsigned `GET` | anonymous viewer, never `401` |
 
-The channel answers follow lost-conn/ofscp#26, which is still open; the
-code cites it where the behaviour depends on it. A channel listing omits
+The channel answers follow lost-conn/ofscp#26 (Joe's decision, via the
+oracle), which is still open; the code cites it where the behaviour
+depends on it. A `403` on a channel route would let an outsider tell real
+channel ids from made-up ones. Later channel surfaces (history, replies,
+subscribe, follows, read markers) get the same `404` by going through
+`read_channel`. A channel listing omits
 the channels the caller cannot read.
 
 ### Identity and signers
