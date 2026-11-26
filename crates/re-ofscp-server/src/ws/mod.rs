@@ -21,6 +21,7 @@ pub mod lease;
 pub mod protocol;
 pub mod registry;
 pub mod seams;
+pub mod wire;
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;

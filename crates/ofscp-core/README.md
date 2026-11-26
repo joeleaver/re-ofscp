@@ -12,9 +12,6 @@ the parts every implementation must get byte-for-byte right, written once.
 - `signing`: the §4.4.2 canonical request string, the content digest, the
   §7.1 WebSocket `authenticate` string, the signing header names, and
   Ed25519 sign/verify.
-- `ws`: the §7.1 WebSocket wire format: the message envelope, close
-  codes, the §7.3 `error` event, and the handshake and subscription
-  message data.
 
 The crate does no I/O, starts no async runtime and never reads a clock (time
 is passed in). It builds for `wasm32-unknown-unknown`. Its tests reproduce

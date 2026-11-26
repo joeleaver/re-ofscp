@@ -17,7 +17,8 @@ The code is in `crates/re-ofscp-server/src/ws/`, with the signature half of
 the handshake in `signing/ws.rs` and remote-key re-confirmation in
 `remote_keys/reconfirm.rs`. The pure wire format (the envelope, close
 codes, the `error` data and the handshake and subscription message data)
-is `ofscp_core::ws`, shared with clients (decision 0011).
+is isolated in `ws/wire.rs`, to be replaced by the `ofscp_core::ws` types
+being ported from Postrinch's client (decision 0011) once they land.
 
 ## Decisions
 

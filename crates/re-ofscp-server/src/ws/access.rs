@@ -24,8 +24,8 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use super::wire::Unsubscribed;
 use futures_util::StreamExt as _;
-use ofscp_core::ws::Unsubscribed;
 use re_ofscp_types::Actor;
 
 use super::Hub;

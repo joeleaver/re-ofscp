@@ -24,8 +24,7 @@ cannot depend on without pulling in axum, tokio and rhypedb.
 
 - A new workspace crate, `crates/ofscp-core` (package `ofscp-core`),
   holds everything that is pure OFSCP protocol: the `actor`, `auth`,
-  `discovery`, `dm` and `signing` modules, and the §7.1 WebSocket wire
-  format, `ws` (added with the WebSocket transport, decision 0010).
+  `discovery`, `dm` and `signing` modules.
 - **What belongs in it:** code whose behaviour the spec fixes, that any
   provider or client needs, and that runs without I/O. **What does not:**
   anything needing this server's state or policy: the replay store, the
@@ -35,7 +34,7 @@ cannot depend on without pulling in axum, tokio and rhypedb.
 - **Constraints**, enforced by CI: no tokio, no I/O, no clock reads (time
   is passed in), no `unwrap`/`expect`/panics outside tests, and it builds
   for `wasm32-unknown-unknown`. The dependencies are few and pinned in the
-  workspace: serde, serde_json, sha2, base64, ed25519-dalek and thiserror. It
+  workspace: serde, sha2, base64, ed25519-dalek and thiserror. It
   re-exports `SigningKey` and `VerifyingKey` so consumers use the same
   ed25519-dalek it was built against.
 - **Errors are typed.** `IdentError` (actor and authority parsing) and

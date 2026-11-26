@@ -16,7 +16,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use ofscp_core::ws::{Subscribe, Subscribed, Unsubscribe, Unsubscribed};
+use super::wire::{Subscribe, Subscribed, Unsubscribe, Unsubscribed};
 use re_ofscp_types::Actor;
 use serde_json::json;
 use tokio::sync::mpsc;

@@ -2,23 +2,20 @@
 //! the `error` event of §7.3, and the data of the handshake and
 //! subscription messages.
 //!
-//! Everything here is pure: frames are parsed from and serialized to text,
-//! and the caller supplies event ids and timestamps. A provider and a
-//! client use the same types, so both sides agree on the shapes byte for
-//! byte. The canonical string a client signs for `authenticate` is
-//! [`ws_canonical_string`], re-exported from [`crate::signing`].
+//! Pure protocol, kept in this one module on purpose: it is to be replaced
+//! by the `ofscp_core::ws` types (ported from Postrinch's client) once they
+//! land, and nothing else in the server builds frames by hand. The rest of
+//! the server reaches it through [`super::protocol`].
 //!
-//! Where the spec leaves a choice, this module follows what the OFSCP
-//! oracle confirmed for re-ofscp (its `docs/decisions/0010-websocket.md`):
-//! `ts` is optional on client commands, and the close codes other than
-//! 4001/4003 are the RFC 6455 ones.
+//! Where the spec leaves a choice this follows what the OFSCP oracle
+//! confirmed (docs/decisions/0010-websocket.md): `ts` is optional on client
+//! commands, and the close codes other than 4001/4003 are the RFC 6455
+//! ones.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-
-pub use crate::signing::{WS_AUTH_SEPARATOR, ws_canonical_string};
 
 /// Close codes.
 pub mod close {
@@ -286,9 +283,9 @@ impl AuthChallenge {
     }
 }
 
-/// `authenticate` data (`ws/authenticate.json`). `signature` signs
-/// [`ws_canonical_string`] of the provider's authority, the challenge
-/// nonce and `timestamp`.
+/// `authenticate` data (`ws/authenticate.json`). `signature` signs the
+/// §7.1 WS-auth canonical string (`ofscp_core::signing::ws_canonical_string`)
+/// of the provider's authority, the challenge nonce and `timestamp`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Authenticate {

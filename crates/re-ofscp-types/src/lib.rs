@@ -14,7 +14,7 @@ pub mod federation;
 pub mod profile;
 
 pub use ofscp_core::{Actor, Authority, IdentError, dm_id, is_valid_handle};
-pub use ofscp_core::{actor, auth, discovery, dm, ws};
+pub use ofscp_core::{actor, auth, discovery, dm};
 
 use serde::{Deserialize, Serialize};
 

@@ -1,13 +1,13 @@
 //! The server half of the WebSocket wire format. The format itself (the
 //! envelope, the close codes, the §7.3 `error` data and the message data)
-//! is pure protocol and lives in [`ofscp_core::ws`], shared with clients;
-//! this module adds what needs the server: event ids, the clock, and how a
-//! connection is closed (docs/decisions/0010-websocket.md).
+//! is pure protocol, in [`super::wire`]; this module adds what needs the
+//! server: event ids, the clock, and how a connection is closed
+//! (docs/decisions/0010-websocket.md).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use ofscp_core::ws::Event;
-pub use ofscp_core::ws::{
+use super::wire::Event;
+pub use super::wire::{
     ACCESS_REVOKED, Command, MAX_ID_LEN, STANDARD_COMMANDS, WsError, close, parse_command,
 };
 use serde_json::Value;

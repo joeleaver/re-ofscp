@@ -17,12 +17,12 @@
 
 use std::sync::Arc;
 
+use super::wire::{AuthChallenge, Authenticate, Authenticated};
 use axum::extract::ws::{Message, WebSocket};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use futures_util::StreamExt as _;
 use futures_util::stream::SplitStream;
-use ofscp_core::ws::{AuthChallenge, Authenticate, Authenticated};
 
 use super::Hub;
 use super::conn::read_error_close;
