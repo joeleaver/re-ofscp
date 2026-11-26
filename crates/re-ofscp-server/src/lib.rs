@@ -49,7 +49,7 @@ use remote_keys::RemoteKeys;
 use replay::ReplayStore;
 use replay::ledger::{LedgerError, NonceLedger, RhypeLedger};
 use signing::{Clock, KeyResolver, SystemClock, Verifier};
-use ws::{Hub, Seams, WsConfig};
+use ws::{GroupTopics, Hub, NoTimeline, Seams, WsConfig};
 
 /// Maximum clock skew accepted on signed requests, in seconds (§4.5 step 3, §8).
 pub const MAX_SKEW_SECS: i64 = 300;
@@ -112,7 +112,7 @@ pub struct AppStateBuilder {
     group_memberships: Option<Arc<dyn GroupMemberships>>,
     liveness: Option<Arc<dyn Liveness>>,
     ws_config: WsConfig,
-    ws_seams: Seams,
+    ws_seams: Option<Seams>,
 }
 
 impl AppStateBuilder {
@@ -186,11 +186,12 @@ impl AppStateBuilder {
         self
     }
 
-    /// Plug channel access, timelines and federation policy into the
-    /// WebSocket layer (default: no topics, no timeline, allow all).
+    /// Plug channel access and timelines into the WebSocket layer instead
+    /// of the provider's own (channel access from its groups, no
+    /// timeline) (tests).
     #[must_use]
     pub fn ws_seams(mut self, seams: Seams) -> Self {
-        self.ws_seams = seams;
+        self.ws_seams = Some(seams);
         self
     }
 
@@ -269,7 +270,10 @@ impl AppStateBuilder {
             verifier.clone(),
             config.client_ip_header.clone(),
             config.domain.clone(),
-            self.ws_seams,
+            self.ws_seams.unwrap_or_else(|| Seams {
+                topics: Arc::new(GroupTopics::new(groups.clone())),
+                timeline: Arc::new(NoTimeline),
+            }),
         ));
         accounts.on_revocation(ws.clone());
         let liveness = self.liveness.unwrap_or_else(|| ws.clone());
@@ -308,7 +312,7 @@ impl AppState {
             group_memberships: None,
             liveness: None,
             ws_config: WsConfig::default(),
-            ws_seams: Seams::default(),
+            ws_seams: None,
         }
     }
 

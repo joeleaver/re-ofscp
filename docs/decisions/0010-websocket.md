@@ -163,15 +163,45 @@ Disabling an account closes all of its connections with `4003`.
 ### Subscriptions and losing access
 
 - Access goes through the `TopicAuthorizer` seam, which answers *effective
-  read access* (security requirement 5). The default, `NoTopics`, answers
-  unreadable for everything until the groups module implements it.
+  read access* (security requirement 5). A topic is a channel id. The
+  provider runs `ws::channels::GroupTopics` over the groups module
+  (decision 0014):
+  - `Groups::channel_group(channel)` finds the channel's group. `None`
+    (no such active channel, or its group is being deleted) is
+    unreadable.
+  - `Groups::read_channel(Caller::Actor(actor), group, channel)` then
+    applies the one access rule: the stricter of the group's tier and
+    the channel's, narrowed by the channel's `view`. The actor is the
+    full `(handle, domain)`, so a remote member is never its local
+    namesake (security requirement 1).
+  - `NotFound` and `Forbidden` are unreadable, and so is a row deleted
+    under the read (`DbError::Vanished`). Any other error is a
+    `SeamError`: the subscribe answers `service_unavailable`, and a
+    re-check retries and then fails closed (below).
+
+  `NoTopics` (nothing readable) is kept for tests without a database;
+  `AppStateBuilder::ws_seams` swaps the seams for tests.
 - `subscribe` acks `subscribed {channels}` with the readable topics.
   Unreadable ones get one `error not_found`, with `details.channels` and
   the command's `correlationId` (§11.3: indistinguishable from missing).
   An authorizer error gets `service_unavailable` the same way.
 - `unsubscribe` acks every requested channel, with no `reason`.
 - **Re-checks.** The subsystem that changed access calls
-  `Hub::access_changed(Topics | Actor | All)`. A sweep every 5 minutes
+  `Hub::access_changed(Topics | Actor | All)`. For groups,
+  `ws::follow_groups` (spawned by `main`) turns each
+  `Groups::subscribe_changes` event into one:
+  - `Channel` → `Topics([channel])`;
+  - `Member` → `Actor(actor)`;
+  - `Group` → `Topics` of every channel row of the group, read then
+    (`GroupStore::channel_ids`, unlimited; bounded by the channel limit).
+    If that read fails, `All`.
+  - A lagged receiver lost changes it cannot name, so `All`.
+
+  Deleting a group purges the channel rows that `Group` would be listed
+  from, so `delete_group` also announces `Channel` for each of its
+  channels, read after the group is marked deleting and before the purge.
+  If that read fails it leaves the purge to the sweeper, so the `Group`
+  listing still finds them. A sweep every 5 minutes
   re-checks everything as a backstop. While re-checked, a subscription is
   *held*: events published meanwhile are queued, and they are:
   - delivered if access holds;
@@ -216,8 +246,13 @@ before the HTTP server finishes its graceful shutdown.
 
 ## Follow-ups
 
-- A `TopicAuthorizer` over the groups module's effective read access, and
-  `access_changed` calls at its mutation points (joeleaver/re-ofscp#18).
+- Done: the `TopicAuthorizer` over the groups module, and its access
+  changes fed into the re-checks (see "Subscriptions and losing access";
+  decision 0014).
+- Membership changes re-check every subscription of the actor
+  (`AccessChange::Actor`), not only those in the group. That is correct,
+  only wider than needed; narrow it if an actor's subscription count
+  makes it matter.
 - A `Timeline` over the message log, once messaging lands.
 - Messaging, typing, presence (with `presence.update` on connect and
   disconnect) and DM commands, each replacing a

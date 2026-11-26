@@ -84,6 +84,11 @@ pub async fn env_with(opts: EnvOptions) -> Env {
         b = b.liveness(l);
     }
     let state = b.build().unwrap();
+    // As `main` does: group access changes reach live subscriptions.
+    tokio::spawn(re_ofscp_server::ws::follow_groups(
+        state.ws.clone(),
+        state.groups.clone(),
+    ));
     state.restore_replay().await.unwrap();
     state.load_federation().await.unwrap();
     clock.set(SIGNED_AT);

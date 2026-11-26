@@ -269,11 +269,31 @@ impl Groups {
         if !self.store.mark_deleting(group_id).await? {
             return Err(GroupError::NotFound(NO_GROUP));
         }
+        // Live readers (WebSocket subscriptions) find a group's channels
+        // through its channel rows, which the purge removes: name every
+        // channel now, while the rows are still there. They are read after
+        // `mark_deleting`, so none that was readable is missed (none
+        // becomes readable afterwards). If they cannot be read, the purge
+        // is left to the sweeper, so whoever receives the `Group` change
+        // can still find them.
+        let channels = self.store.channel_ids(group_id).await;
+        if let Ok(ids) = &channels {
+            for channel_id in ids {
+                self.channel_changed(group_id, channel_id);
+            }
+        }
         self.changed(AccessChange::Group {
             group_id: group_id.to_owned(),
         });
-        if let Err(e) = self.store.purge_group(group_id).await {
-            tracing::warn!(error = %e, group_id, "purging a deleted group failed; the sweeper will finish it");
+        match channels {
+            Ok(_) => {
+                if let Err(e) = self.store.purge_group(group_id).await {
+                    tracing::warn!(error = %e, group_id, "purging a deleted group failed; the sweeper will finish it");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, group_id, "listing a deleted group's channels failed; the sweeper will purge it");
+            }
         }
         Ok(())
     }

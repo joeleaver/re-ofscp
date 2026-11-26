@@ -93,6 +93,11 @@ struct GroupIdRow {
     group_id: String,
 }
 
+#[derive(Deserialize)]
+struct ChannelIdRow {
+    channel_id: String,
+}
+
 /// A fresh local id: `prefix` + 128 random bits, base64url (§2.2).
 fn new_id(prefix: &'static str) -> Result<String, DbError> {
     let mut bytes = [0u8; 16];
@@ -479,6 +484,26 @@ impl GroupStore {
             Some(row) => row.data.decode().map(Some),
             None => Ok(None),
         }
+    }
+
+    /// The ids of every channel row of `group_id`, whatever its status:
+    /// whose live readers must re-check access when the group changes.
+    ///
+    /// Read whole, with no `.limit`, for the reason given at
+    /// [`Self::channel_count`]: a limited scan could come back short and
+    /// leave a channel's readers unchecked. The group's channel limit
+    /// bounds the read.
+    pub async fn channel_ids(&self, group_id: &str) -> Result<Vec<String>, DbError> {
+        let q = Ql::new("Channel.filter(.group_id == ")
+            .str(group_id)
+            .raw(")");
+        Ok(self
+            .db
+            .fetch::<ChannelIdRow>(&q)
+            .await?
+            .into_iter()
+            .map(|r| r.data.channel_id)
+            .collect())
     }
 
     /// The group of active channel `channel_id`, if there is one. Channel

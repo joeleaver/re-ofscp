@@ -60,7 +60,9 @@ for them.
 `Groups` broadcasts an `AccessChange` (group, channel, or one actor's
 membership) after every change that can alter access: a group or channel
 update or deletion, and adding, re-roling or removing a member. A live
-surface (the WebSocket core) subscribes, re-runs `can_read_channel` for
+surface (the WebSocket core, through `ws::follow_groups` and
+`ws::channels::GroupTopics`; decision 0010) subscribes, re-runs
+`can_read_channel` for
 what it holds, and ends a subscription with
 `unsubscribed {reason:"access_revoked"}` when the answer turns false. A
 receiver that lags must re-check everything it holds.
@@ -182,8 +184,12 @@ must be correct without it. The rule, per guard:
 ### Deletion without transactions
 
 - Deleting a group is two steps. First its `status` becomes `deleting`,
-  which hides it from every read at once. Then its channels, memberships
-  and row are purged, and an `AccessChange::Group` is announced.
+  which hides it from every read at once. Then an `AccessChange::Channel`
+  is announced for each of its channel rows, and an `AccessChange::Group`
+  for the group, before its channels, memberships and row are purged:
+  once purged, a receiver could no longer find which channels the group
+  had (decision 0010). If the channel rows cannot be read, the purge is
+  left to the sweeper.
 - A sweeper task (`Groups::sweep_forever`, every 300 s, stopped at
   shutdown) finishes any purge a crash interrupted.
 - **No row outlives its group.** A channel or membership is written with
