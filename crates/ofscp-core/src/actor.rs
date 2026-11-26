@@ -38,6 +38,12 @@ pub enum IdentError {
     /// The value is well-formed but not in canonical form.
     #[error("identifier is not in canonical form")]
     NotCanonical,
+    /// A local id does not match `^[A-Za-z0-9_-]{1,128}$` (§2.2).
+    #[error("local id must match ^[A-Za-z0-9_-]{{1,128}}$")]
+    LocalId,
+    /// An object URI is not an absolute `https://` URL on a valid authority.
+    #[error("object URI must be an absolute https:// URL")]
+    ObjectUri,
 }
 
 /// Whether `handle` matches `^[a-z0-9_-]{3,32}$` (§2.2.1).
@@ -182,19 +188,67 @@ impl fmt::Display for Actor {
     }
 }
 
+impl Serialize for Authority {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.0)
+    }
+}
+
+/// Deserialising is strict: a non-canonical spelling is refused, as §2.2
+/// requires wherever the spec demands canonical form. A receiver that may
+/// convert instead opts in with [`lenient::authority`].
+impl<'de> Deserialize<'de> for Authority {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Self::parse_canonical(&s).map_err(serde::de::Error::custom)
+    }
+}
+
 impl Serialize for Actor {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         s.collect_str(self)
     }
 }
 
-/// Deserialising converts to canonical form (§2.2 allows either rejecting or
-/// converting body fields). Fields the spec says MUST be canonical should be
-/// checked with [`Actor::parse_canonical`] instead.
+/// Deserialising is strict: a non-canonical spelling is refused. Fields the
+/// spec says MUST be canonical (for example a DM's `with`, §7.4) need exactly
+/// this, so it is the default. Where §2.2 lets a receiver convert instead,
+/// opt in per field with [`lenient::actor`].
 impl<'de> Deserialize<'de> for Actor {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = String::deserialize(d)?;
-        Self::canonicalize(&s).map_err(serde::de::Error::custom)
+        Self::parse_canonical(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Opt-in lenient deserializers, which convert a recognisable spelling to
+/// canonical form instead of refusing it (§2.2). Use them per field, only
+/// where the spec allows conversion:
+///
+/// ```
+/// #[derive(serde::Deserialize)]
+/// struct Received {
+///     #[serde(deserialize_with = "ofscp_core::actor::lenient::actor")]
+///     author: ofscp_core::Actor,
+/// }
+/// let r: Received = serde_json::from_str(r#"{"author":"alice@A.example."}"#).unwrap();
+/// assert_eq!(r.author.to_string(), "alice@a.example");
+/// ```
+pub mod lenient {
+    use serde::{Deserialize, Deserializer};
+
+    use super::{Actor, Authority};
+
+    /// Deserialize an [`Actor`] through [`Actor::canonicalize`].
+    pub fn actor<'de, D: Deserializer<'de>>(d: D) -> Result<Actor, D::Error> {
+        let s = String::deserialize(d)?;
+        Actor::canonicalize(&s).map_err(serde::de::Error::custom)
+    }
+
+    /// Deserialize an [`Authority`] through [`Authority::canonicalize`].
+    pub fn authority<'de, D: Deserializer<'de>>(d: D) -> Result<Authority, D::Error> {
+        let s = String::deserialize(d)?;
+        Authority::canonicalize(&s).map_err(serde::de::Error::custom)
     }
 }
 
@@ -302,9 +356,32 @@ mod tests {
         );
     }
 
+    /// The serde default is strict: a non-canonical spelling is refused,
+    /// never silently rewritten.
     #[test]
-    fn serde_round_trip_canonicalizes() {
-        let a: Actor = serde_json::from_str("\"bob@B.Example.\"").unwrap();
+    fn serde_is_strict_by_default() {
+        let a: Actor = serde_json::from_str("\"bob@b.example\"").unwrap();
         assert_eq!(serde_json::to_string(&a).unwrap(), "\"bob@b.example\"");
+        for bad in ["\"bob@B.Example.\"", "\"bob@b.example:443\""] {
+            assert!(serde_json::from_str::<Actor>(bad).is_err(), "{bad}");
+        }
+        assert!(serde_json::from_str::<Authority>("\"B.example\"").is_err());
+        assert!(serde_json::from_str::<Authority>("\"b.example:8443\"").is_ok());
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Lenient {
+        #[serde(deserialize_with = "lenient::actor")]
+        actor: Actor,
+        #[serde(deserialize_with = "lenient::authority")]
+        authority: Authority,
+    }
+
+    #[test]
+    fn lenient_is_opt_in_and_canonicalizes() {
+        let json = r#"{"actor":"bob@B.Example.","authority":"A.example:443"}"#;
+        let v: Lenient = serde_json::from_str(json).unwrap();
+        assert_eq!(v.actor.to_string(), "bob@b.example");
+        assert_eq!(v.authority.as_str(), "a.example");
     }
 }

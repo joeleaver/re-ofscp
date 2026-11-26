@@ -33,4 +33,4 @@ pub struct Health {
 }
 
 /// The OFSCP protocol version implemented.
-pub const OFSCP_VERSION: &str = "0.1.0";
+pub const OFSCP_VERSION: &str = ofscp_core::PROTOCOL_VERSION;

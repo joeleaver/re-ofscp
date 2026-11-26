@@ -14,7 +14,8 @@ use ofscp_core::signing::{
     CanonicalRequest, content_digest, decode_public_key, encode_public_key, sign, verify,
     ws_canonical_string,
 };
-use ofscp_core::{Actor, dm_id};
+use ofscp_core::signing::{DeviceKey, Request, Signer, headers};
+use ofscp_core::{Actor, Authority, DmId, dm_id};
 
 fn spec_dir() -> PathBuf {
     std::env::var_os("OFSCP_SPEC_DIR").map_or_else(
@@ -81,7 +82,8 @@ fn request_signing_vector() {
         nonce: s("/headers/X-OFSCP-Nonce"),
         content_digest: s("/headers/X-OFSCP-Content-Digest"),
     }
-    .render();
+    .render()
+    .unwrap();
     assert_eq!(canonical, s("/canonical_string"));
     let lines: Vec<&str> = v["canonical_string_lines"]
         .as_array()
@@ -116,7 +118,8 @@ fn ws_authenticate_vector() {
         s("/challenge/authority"),
         s("/challenge/challengeNonce"),
         s("/challenge/timestamp"),
-    );
+    )
+    .unwrap();
     assert_eq!(canonical, s("/canonical_string"));
     assert_eq!(sign(&key, &canonical), s("/expected/signature"));
 
@@ -165,6 +168,74 @@ fn dm_id_example() {
     let (first, second) = participants.split_once(r"\n").unwrap();
     let a = Actor::parse_canonical(first).unwrap();
     let b = Actor::parse_canonical(second).unwrap();
-    assert_eq!(dm_id(&a, &b), want);
-    assert_eq!(dm_id(&b, &a), want, "argument order is irrelevant");
+    assert_eq!(dm_id(&a, &b).as_str(), want);
+    assert_eq!(dm_id(&b, &a).as_str(), want, "argument order is irrelevant");
+    assert_eq!(DmId::parse(want).unwrap(), dm_id(&a, &b));
+}
+
+/// The client [`Signer`] reproduces `tests/signing-vector.json` from the
+/// seed: every header and the signature, byte for byte.
+#[test]
+fn signer_reproduces_request_vector() {
+    let v = spec_json("signing-vector.json");
+    let s = |p: &str| v.pointer(p).and_then(|x| x.as_str()).unwrap();
+    let key = DeviceKey::from_seed(&vector_key(&v).to_bytes());
+    assert_eq!(key.public_key_base64(), s("/key/public_key_base64"));
+    let actor = Actor::parse_canonical(s("/headers/X-OFSCP-Actor")).unwrap();
+    let authority = Authority::parse_canonical(s("/request/authority")).unwrap();
+    let signer = Signer {
+        actor: &actor,
+        key_id: s("/headers/X-OFSCP-Key-ID"),
+        key: &key,
+    };
+    let request = Request {
+        authority: &authority,
+        method: s("/request/method"),
+        path: s("/request/path"),
+        query: Some(s("/request/query")),
+        body: s("/request/body").as_bytes(),
+    };
+    let signed = signer
+        .sign_request(
+            &request,
+            s("/headers/X-OFSCP-Timestamp"),
+            s("/headers/X-OFSCP-Nonce"),
+        )
+        .unwrap();
+    assert_eq!(signed.signature, s("/expected/signature"));
+    let want = [
+        (headers::ACTOR, "/headers/X-OFSCP-Actor"),
+        (headers::KEY_ID, "/headers/X-OFSCP-Key-ID"),
+        (headers::TIMESTAMP, "/headers/X-OFSCP-Timestamp"),
+        (headers::NONCE, "/headers/X-OFSCP-Nonce"),
+        (headers::CONTENT_DIGEST, "/headers/X-OFSCP-Content-Digest"),
+        (headers::SIGNATURE, "/expected/signature"),
+    ];
+    for ((name, value), (want_name, pointer)) in signed.pairs().into_iter().zip(want) {
+        assert_eq!(name, want_name);
+        assert_eq!(value, s(pointer), "{name}");
+    }
+}
+
+/// The client [`Signer`] reproduces `tests/ws-signing-vector.json`.
+#[test]
+fn signer_reproduces_ws_vector() {
+    let v = spec_json("ws-signing-vector.json");
+    let s = |p: &str| v.pointer(p).and_then(|x| x.as_str()).unwrap();
+    let key = DeviceKey::from_seed(&vector_key(&v).to_bytes());
+    let actor = Actor::parse_canonical("alice@providera.com").unwrap();
+    let signer = Signer {
+        actor: &actor,
+        key_id: "dk_1",
+        key: &key,
+    };
+    let authority = Authority::parse_canonical(s("/challenge/authority")).unwrap();
+    let signature = signer
+        .sign_ws_authenticate(
+            &authority,
+            s("/challenge/challengeNonce"),
+            s("/challenge/timestamp"),
+        )
+        .unwrap();
+    assert_eq!(signature, s("/expected/signature"));
 }
