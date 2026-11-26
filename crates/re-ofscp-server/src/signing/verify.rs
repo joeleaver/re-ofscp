@@ -22,34 +22,8 @@ use crate::replay::{
     LedgerError, NonceLedger, NonceUse, ReplayError, ReplayStore, SignerKind, StoredNonce, Surface,
 };
 
-/// Header names (§4.4.1, §8.1). Lowercase, as `http` stores them.
-pub mod headers {
-    /// User-signed requests: the signing actor.
-    pub const ACTOR: &str = "x-ofscp-actor";
-    /// Provider-signed requests: the signing provider's authority.
-    pub const PROVIDER: &str = "x-ofscp-provider";
-    /// The signing key's id.
-    pub const KEY_ID: &str = "x-ofscp-key-id";
-    /// RFC 3339 moment of signing.
-    pub const TIMESTAMP: &str = "x-ofscp-timestamp";
-    /// Per-request nonce.
-    pub const NONCE: &str = "x-ofscp-nonce";
-    /// `base64(SHA-256(body))`.
-    pub const CONTENT_DIGEST: &str = "x-ofscp-content-digest";
-    /// `base64(Ed25519 signature)`.
-    pub const SIGNATURE: &str = "x-ofscp-signature";
-
-    /// Every header that marks a request as an attempt to sign.
-    pub const ALL: [&str; 7] = [
-        ACTOR,
-        PROVIDER,
-        KEY_ID,
-        TIMESTAMP,
-        NONCE,
-        CONTENT_DIGEST,
-        SIGNATURE,
-    ];
-}
+/// Header names (§4.4.1, §8.1), defined by the protocol core.
+pub use ofscp_core::signing::headers;
 
 /// Upper bound on key-id and nonce length, so one request cannot pin
 /// unbounded memory in the replay store.

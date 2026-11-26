@@ -24,30 +24,21 @@ use std::fmt;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Why an identifier was refused.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum IdentError {
     /// The handle does not match `^[a-z0-9_-]{3,32}$` (§2.2.1).
+    #[error("handle must match ^[a-z0-9_-]{{3,32}}$")]
     Handle,
     /// The value has no `@` separating handle and domain.
+    #[error("actor must have the form handle@domain")]
     MissingAt,
     /// The authority is malformed (bad label, bad port, non-ASCII, …).
+    #[error("malformed provider authority")]
     Authority,
     /// The value is well-formed but not in canonical form.
+    #[error("identifier is not in canonical form")]
     NotCanonical,
 }
-
-impl fmt::Display for IdentError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Handle => "handle must match ^[a-z0-9_-]{3,32}$",
-            Self::MissingAt => "actor must have the form handle@domain",
-            Self::Authority => "malformed provider authority",
-            Self::NotCanonical => "identifier is not in canonical form",
-        })
-    }
-}
-
-impl std::error::Error for IdentError {}
 
 /// Whether `handle` matches `^[a-z0-9_-]{3,32}$` (§2.2.1).
 pub fn is_valid_handle(handle: &str) -> bool {
@@ -297,6 +288,18 @@ mod tests {
         let home = Authority::parse_canonical("a.example").unwrap();
         assert!(local.is_local_to(&home));
         assert!(!remote.is_local_to(&home));
+    }
+
+    #[test]
+    fn error_messages() {
+        assert_eq!(
+            IdentError::Handle.to_string(),
+            "handle must match ^[a-z0-9_-]{3,32}$"
+        );
+        assert_eq!(
+            IdentError::NotCanonical.to_string(),
+            "identifier is not in canonical form"
+        );
     }
 
     #[test]
