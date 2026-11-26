@@ -105,7 +105,10 @@ impl Handshake<'_> {
         let data: Authenticate = match serde_json::from_value(cmd.data) {
             Ok(d) => d,
             Err(_) => {
-                let e = WsError::bad_request(
+                // A malformed authenticate is a failed sign-in, not a bad
+                // request: unauthorized, then close 4001
+                // (lost-conn/ofscp#27).
+                let e = WsError::unauthorized(
                     "authenticate needs actor, keyId, timestamp and signature",
                 );
                 self.fail(Some(&cmd.id), &e);

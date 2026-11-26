@@ -27,7 +27,20 @@ required). `data` stays required in both.
   Close codes are `CLOSE_AUTH_FAILED` (4001) and `CLOSE_REVOKED` (4003).
 - **Open, as §2.3 asks.** An unknown `type` decodes as `Other { kind, data }`
   and keeps its data. The payload structs ignore unknown fields. Call
-  events (§9) land in `Other` until calls are implemented.
+  events (§9) land in `Other` until calls are implemented. An `Other` built
+  by hand with a standard kind is sent under that kind and so decodes back
+  as its variant, never as `Other`.
+- **Every enumerated field is open too.** `TypingState` and `ReactionState`
+  are `open_enum!`s, like the REST enums (0013): an unknown `state` is kept
+  in `Other`, so a `channel.typing` with a future `"paused"` still decodes
+  rather than failing as a whole.
+- **A bad `data` keeps its envelope.** `DecodeError::Data` carries the
+  frame's `id`, `kind` and `correlationId`, so a provider can answer with
+  `error` whose `correlationId` is the command's `id` (§7.1).
+- **`KINDS` track the spec.** `tests/ws_roundtrip.rs` compares
+  `Command::KINDS` and `Event::KINDS` with `WsCommandType` and
+  `WsEventType` in `schemas/v0.1/ws/types.json`, leaving out only the
+  `call.*` events (a later wave).
 - **Encoding is strict, decoding is lenient.**
   - `Envelope::encode` always writes `id`, `type`, `ts` and `data`, so every
     frame we send validates against spec main's envelope, and also against
@@ -62,15 +75,28 @@ required). `data` stays required in both.
   schema of its `type` (with `jsonschema`, a dev-dependency only). A
   listing test fails when the spec gains a `ws-*` sample no list covers.
 
-## Open question for the OFSCP oracle
+## Answered by the OFSCP oracle (lost-conn/ofscp#27, head 194b3b2)
 
-Should a sender always include `ts` and `data`, even where #27 lets a
-command leave `ts` out, and is `{}` the right `data` for a re-sent unknown
-frame that arrived without one? We do both, as the reading valid under
-spec main and #27 alike. When #27 merges, its command samples without `ts`
-will decode but no longer re-encode byte-for-byte; the roundtrip test
-must then compare those leniently (or compare `ts` only when the sample
-has one), not drop the check.
+- **`ts` is always sent.** On commands a provider must not reject a
+  missing `ts` and must ignore its value, so our lenient decode stands.
+  If #27's command samples leave `ts` out, they decode but no longer
+  re-encode byte-for-byte; the roundtrip test must then compare `ts` only
+  where the sample has one, not drop the check.
+- **The `data` key is always present, and `{}` is always safe.** A re-sent
+  unknown frame passes a non-null `data` through untouched; only `null`
+  (or no `data`) becomes `{}`. That is what `known_data` does.
+- **How a provider answers bad frames** (the server, decision 0010, follows
+  these; `tests/ws.rs` covers each):
+  - a standard command whose `data` fails its schema: `error`
+    `bad_request`, `correlationId` the command's `id`, connection kept;
+  - a malformed `authenticate`: `error` `unauthorized` (401), then close
+    4001 (the server answered `bad_request` before this change);
+  - a command with no `id`: after sign-in, `bad_request` without a
+    `correlationId`; before it, close 4001;
+  - a standard command the provider does not implement: `bad_request`;
+    only nonstandard types are ignored (§2.3).
+- **A client never replies to an event it cannot read.** A malformed
+  known event is a local `DecodeError::Data`, not a frame to answer.
 
 ## Consequences
 

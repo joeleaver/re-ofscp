@@ -61,11 +61,21 @@ pub enum DecodeError {
     /// It is not a JSON envelope.
     #[error("not an OFSCP frame: {0}")]
     Envelope(#[source] serde_json::Error),
-    /// Its `data` does not fit its `type`.
-    #[error("bad data for {kind}: {source}")]
+    /// Its envelope was read, but its `data` does not fit its `type`.
+    ///
+    /// A provider answers a command like this with an `error`
+    /// (`bad_request`) whose `correlationId` is `id`, and keeps the
+    /// connection open (§7.1, lost-conn/ofscp#27); for `authenticate` it
+    /// answers `unauthorized` and closes 4001 instead. A client that cannot
+    /// read an event keeps this to itself: it never sends a reply.
+    #[error("bad data for {kind} {id}: {source}")]
     Data {
+        /// The frame's `id`, to echo as `correlationId`.
+        id: String,
         /// The frame's `type`.
         kind: String,
+        /// The frame's `correlationId`, when it had one.
+        correlation_id: Option<String>,
         /// What did not fit.
         #[source]
         source: serde_json::Error,
@@ -117,16 +127,27 @@ impl<T: Body> Envelope<T> {
     /// Read a frame's text.
     pub fn decode(text: &str) -> Result<Self, DecodeError> {
         let raw: RawFrame = serde_json::from_str(text).map_err(DecodeError::Envelope)?;
-        let body = T::decode(&raw.kind, raw.data).map_err(|source| DecodeError::Data {
-            kind: raw.kind,
-            source,
-        })?;
-        Ok(Self {
-            id: raw.id,
-            ts: raw.ts,
-            correlation_id: raw.correlation_id,
-            body,
-        })
+        let RawFrame {
+            id,
+            kind,
+            ts,
+            correlation_id,
+            data,
+        } = raw;
+        match T::decode(&kind, data) {
+            Ok(body) => Ok(Self {
+                id,
+                ts,
+                correlation_id,
+                body,
+            }),
+            Err(source) => Err(DecodeError::Data {
+                id,
+                kind,
+                correlation_id,
+                source,
+            }),
+        }
     }
 
     /// The frame's text, to send. It always carries `ts` (so `ts` must be
@@ -161,6 +182,11 @@ macro_rules! ws_body {
         pub enum $name {
             $( $(#[$vmeta])* $variant($data), )+
             /// A type this version does not know, kept as received.
+            ///
+            /// Build it only for a nonstandard type: one built with a kind
+            /// in [`Self::KINDS`] is sent under that kind, and so decodes
+            /// back as that kind's variant (or fails to, if `data` does not
+            /// fit), never as `Other`.
             Other {
                 /// Its `type`.
                 kind: String,

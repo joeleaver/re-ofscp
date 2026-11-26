@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::wire::{
     DmConversation, ErrorCode, GroupPointer, Member, Message, Notification, Presence, Reaction,
-    ReadMarker, Timestamp,
+    ReadMarker, Timestamp, open_enum,
 };
 use crate::{Actor, DmId, LocalId, ObjectUri};
 
@@ -168,14 +168,16 @@ pub struct ReactionRemoved {
     pub author: Actor,
 }
 
-/// Whether someone started or stopped typing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum TypingState {
-    /// Started.
-    Start,
-    /// Stopped.
-    Stop,
+open_enum! {
+    /// Whether someone started or stopped typing. Open (§2.3): a state this
+    /// version does not know, such as a future `paused`, is kept, so the
+    /// rest of the event still reads.
+    pub enum TypingState {
+        /// Started.
+        Start = "start",
+        /// Stopped.
+        Stop = "stop",
+    }
 }
 
 /// `channel.typing` (§7.1).
@@ -210,14 +212,15 @@ pub struct DmConversationEvent {
     pub conversation: Box<DmConversation>,
 }
 
-/// Whether a reaction was added or removed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ReactionState {
-    /// Added.
-    Added,
-    /// Removed.
-    Removed,
+open_enum! {
+    /// Whether a reaction was added or removed. Open (§2.3), as
+    /// [`TypingState`] is.
+    pub enum ReactionState {
+        /// Added.
+        Added = "added",
+        /// Removed.
+        Removed = "removed",
+    }
 }
 
 /// `dm.reaction` (§7.4). An addition carries the reaction; a removal

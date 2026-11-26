@@ -193,3 +193,37 @@ fn an_unknown_frame_is_sent_as_a_valid_envelope() {
         "{errors}"
     );
 }
+
+/// The strings of `$defs.<name>.enum` in the spec's `ws/types.json`.
+fn spec_types(name: &str) -> BTreeSet<String> {
+    let path = spec_dir().join("schemas/v0.1/ws/types.json");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "cannot read {} ({e}); clone lost-conn/ofscp beside this repo or set OFSCP_SPEC_DIR",
+            path.display()
+        )
+    });
+    let types: Value = serde_json::from_str(&text).unwrap();
+    types["$defs"][name]["enum"]
+        .as_array()
+        .unwrap_or_else(|| panic!("types.json has no $defs.{name}.enum"))
+        .iter()
+        .map(|v| v.as_str().unwrap().to_owned())
+        .collect()
+}
+
+fn set(kinds: &[&str]) -> BTreeSet<String> {
+    kinds.iter().map(|&k| k.to_owned()).collect()
+}
+
+#[test]
+fn the_kinds_are_the_spec_types() {
+    assert_eq!(set(Command::KINDS), spec_types("WsCommandType"));
+    // The call signalling events of §9 are left out on purpose: calls are a
+    // later wave, so they decode as `Event::Other` for now. Adding them to
+    // `Event` must also drop them from this list.
+    let calls = set(&["call.started", "call.ended", "call.participant"]);
+    let spec = spec_types("WsEventType");
+    assert!(calls.is_subset(&spec), "the spec no longer lists {calls:?}");
+    assert_eq!(set(Event::KINDS), &spec - &calls);
+}
