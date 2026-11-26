@@ -9,6 +9,7 @@ use axum::http::{Request, StatusCode, header};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use ed25519_dalek::SigningKey;
+use re_ofscp_server::privacy::{GroupMemberships, Liveness};
 use re_ofscp_server::signing::StaticKeys;
 use re_ofscp_server::{AppState, Config, router};
 use serde_json::{Value, json};
@@ -39,6 +40,10 @@ pub struct EnvOptions {
     pub registration: Option<&'static str>,
     /// Leave `ADMIN_SECRET_KEY` unset (the admin API is then off).
     pub no_admin: bool,
+    /// Group memberships for the visibility policy.
+    pub groups: Option<Arc<dyn GroupMemberships>>,
+    /// Connection liveness for presence.
+    pub liveness: Option<Arc<dyn Liveness>>,
 }
 
 /// `ADMIN_SETUP_TOKEN` in tests.
@@ -71,6 +76,12 @@ pub async fn env_with(opts: EnvOptions) -> Env {
         AppState::builder(config(&server, opts.registration, !opts.no_admin)).clock(clock.clone());
     if let Some(r) = opts.remote {
         b = b.remote_keys(Arc::new(r));
+    }
+    if let Some(g) = opts.groups {
+        b = b.group_memberships(g);
+    }
+    if let Some(l) = opts.liveness {
+        b = b.liveness(l);
     }
     let state = b.build().unwrap();
     state.restore_replay().await.unwrap();

@@ -121,6 +121,28 @@ where
     }
 }
 
+impl GroupStore {
+    /// The one write a revision claim's holder makes. Run once, never
+    /// retried, so the claim's lease covers it (claims.rs): a write that
+    /// lost a conflict, or met its object deleted, wrote nothing and
+    /// returns no rows, and the edit retries from a fresh read.
+    async fn claimed_write(&self, q: &Ql) -> Result<rhypedb_client::QueryResult, DbError> {
+        match self.db.write_rows(q).await {
+            Err(DbError::Contended(_) | DbError::Vanished(_)) => {
+                Ok(rhypedb_client::QueryResult::Objects(Vec::new()))
+            }
+            other => other,
+        }
+    }
+}
+
+/// Group ids looked up per statement by [`GroupStore::active_groups`].
+const GROUPS_PER_LOOKUP: usize = 50;
+
+fn decode_groups(rows: Vec<rhypedb_client::Row<GroupRow>>) -> Result<Vec<StoredGroup>, DbError> {
+    rows.into_iter().map(|r| r.data.decode()).collect()
+}
+
 /// Group, channel and membership storage.
 #[derive(Debug, Clone)]
 pub struct GroupStore {
@@ -187,6 +209,43 @@ impl GroupStore {
         }
     }
 
+    /// The active groups `owner` owns, at most `cap` of them.
+    pub async fn owned_groups(
+        &self,
+        owner: &Actor,
+        cap: usize,
+    ) -> Result<Vec<StoredGroup>, DbError> {
+        let q = Ql::new("Group.filter(.owner == ")
+            .str(&owner.to_string())
+            .raw(" && .status == ")
+            .str(status::ACTIVE)
+            .raw(").limit(")
+            .uint(cap as u64)
+            .raw(")");
+        decode_groups(self.db.fetch::<GroupRow>(&q).await?)
+    }
+
+    /// Those of `ids` that are active groups, in no particular order.
+    pub async fn active_groups(&self, ids: &[String]) -> Result<Vec<StoredGroup>, DbError> {
+        let mut found = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(GROUPS_PER_LOOKUP) {
+            let mut q = Ql::new("Group.filter(.status == ")
+                .str(status::ACTIVE)
+                .raw(" && (");
+            for (i, id) in chunk.iter().enumerate() {
+                q = q.raw(if i == 0 {
+                    ".group_id == "
+                } else {
+                    " || .group_id == "
+                });
+                q = q.str(id);
+            }
+            q = q.raw("))");
+            found.extend(decode_groups(self.db.fetch::<GroupRow>(&q).await?)?);
+        }
+        Ok(found)
+    }
+
     /// How many active groups `owner` owns, counting at most `cap`.
     pub async fn owned_count(&self, owner: &Actor, cap: usize) -> Result<usize, DbError> {
         let q = Ql::new("Group.filter(.owner == ")
@@ -199,9 +258,11 @@ impl GroupStore {
         Ok(self.db.fetch::<serde::de::IgnoredAny>(&q).await?.len())
     }
 
-    /// Write `fields` to `group` if nobody changed it since it was read
-    /// (its revision is unchanged). `None` when the revision moved on or
-    /// the group is gone or being deleted.
+    /// Write `fields` to `group` as its next revision. The caller must
+    /// hold that revision's claim (claims.rs): the filter on the old
+    /// revision only refuses a stale read, since it is not compare-and-set.
+    /// `None` when the revision moved on or the group is gone or being
+    /// deleted.
     pub async fn update_group(
         &self,
         group: &StoredGroup,
@@ -227,7 +288,7 @@ impl GroupStore {
             .raw(", updated_at: ")
             .unix_seconds(now)
             .raw(" })");
-        decode_updated(self.db.write_rows(&q).await?, GroupRow::decode)
+        decode_updated(self.claimed_write(&q).await?, GroupRow::decode)
     }
 
     /// Begin deleting `group_id`: from now on it is invisible. `false` if
@@ -240,7 +301,12 @@ impl GroupStore {
             .raw(").update({ status: ")
             .str(status::DELETING)
             .raw(" })");
-        Ok(!self.db.write_rows(&q).await?.into_objects().is_empty())
+        Ok(!self
+            .db
+            .write_one_object(&q)
+            .await?
+            .into_objects()
+            .is_empty())
     }
 
     /// Remove a group being deleted: its channels and memberships (pending
@@ -333,7 +399,12 @@ impl GroupStore {
             .raw(").update({ status: ")
             .str(status::ACTIVE)
             .raw(" })");
-        Ok(!self.db.write_rows(&q).await?.into_objects().is_empty())
+        Ok(!self
+            .db
+            .write_one_object(&q)
+            .await?
+            .into_objects()
+            .is_empty())
     }
 
     /// Remove the pending channels and memberships written before `cutoff`
@@ -404,8 +475,9 @@ impl GroupStore {
         }
     }
 
-    /// Write `fields` to `channel` if its revision is unchanged. `None`
-    /// when the revision moved on or the channel is gone.
+    /// Write `fields` to `channel` as its next revision, under that
+    /// revision's claim, as for [`Self::update_group`]. `None` when the
+    /// revision moved on or the channel is gone.
     pub async fn update_channel(
         &self,
         channel: &StoredChannel,
@@ -429,7 +501,7 @@ impl GroupStore {
             .raw(", updated_at: ")
             .unix_seconds(now)
             .raw(" })");
-        decode_updated(self.db.write_rows(&q).await?, ChannelRow::decode)
+        decode_updated(self.claimed_write(&q).await?, ChannelRow::decode)
     }
 
     /// Delete channel `channel_id` of `group_id`, pending or active (a
@@ -440,6 +512,6 @@ impl GroupStore {
             .raw(" && .group_id == ")
             .str(group_id)
             .raw(").delete()");
-        self.db.execute(&q).await
+        self.db.write_one_object(&q).await.map(|_| ())
     }
 }

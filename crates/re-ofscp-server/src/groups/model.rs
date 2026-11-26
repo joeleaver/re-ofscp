@@ -4,7 +4,7 @@
 //! Scalar fields the server queries or decides on (`tier`, `join_policy`,
 //! `owner`, `kind`) are their own columns; the rest of each object (its
 //! description or topic, permission map, role catalogue, tags, metadata) is
-//! one JSON document column, written and read whole (docs/decisions/0009).
+//! one JSON document column, written and read whole (docs/decisions/0010).
 
 use re_ofscp_types::Actor;
 use re_ofscp_types::groups::{
@@ -21,7 +21,7 @@ pub const DEFAULT_GROUP_TIER: Tier = Tier::Private;
 /// The join policy of a group created without one (§5.5 RECOMMENDED).
 pub const DEFAULT_JOIN_POLICY: JoinPolicy = JoinPolicy::Invite;
 /// The tier of a channel created without one: members only, the
-/// conservative choice (docs/decisions/0009).
+/// conservative choice (docs/decisions/0010).
 pub const DEFAULT_CHANNEL_TIER: Tier = Tier::Private;
 
 /// The group fields kept in its JSON document column.

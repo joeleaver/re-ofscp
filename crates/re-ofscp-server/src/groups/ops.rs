@@ -3,6 +3,8 @@
 //! apply the [`access`] rule; later surfaces (history,
 //! subscriptions, notifications, discovery samples) use the same two.
 
+use std::time::{Duration, Instant};
+
 use re_ofscp_types::Actor;
 use re_ofscp_types::groups::{
     Channel, ChannelCreateRequest, ChannelUpdateRequest, Group, GroupCreateRequest,
@@ -10,14 +12,36 @@ use re_ofscp_types::groups::{
 };
 
 use super::access::{self, Standing, actions, roles};
+use super::claims;
 use super::model::{self, StoredChannel, StoredGroup};
 use super::validate::Invalid;
-use super::{AccessChange, Caller, Groups, MAX_CHANNELS_PER_GROUP, MAX_GROUPS_PER_OWNER};
+use super::{
+    AccessChange, Caller, Groups, MAX_CHANNELS_PER_GROUP, MAX_GROUPS_PER_OWNER, PENDING_TTL,
+};
 use crate::db::DbError;
 
-/// How often a conditional update is retried against a fresh read before
-/// the request is answered `409`.
+/// How often an edit is retried against a fresh read before the request
+/// is answered `409`. Each retry follows another edit's success, so a
+/// `409` means the object really did keep changing.
 const UPDATE_ATTEMPTS: usize = 5;
+
+/// How long after writing a pending row its writer may still activate it.
+/// The sweeper deletes pending rows older than [`PENDING_TTL`], and its
+/// delete is not conditional at the moment of writing (claims.rs), so an
+/// expiry that saw the row pending could delete it just after activation.
+/// Activating only well inside the TTL leaves that impossible but for a
+/// stall of minutes inside one statement, which the data layer's 10 s
+/// timeout rules out; a writer slower than this takes its row back.
+const ACTIVATE_WITHIN: Duration = PENDING_TTL.saturating_sub(Duration::from_secs(300));
+const _: () = assert!(
+    PENDING_TTL.as_secs() >= 2 * 300,
+    "PENDING_TTL must be at least 600 s, leaving ACTIVATE_WITHIN at least 300 s"
+);
+
+/// The pause after losing a revision claim, times the attempt number: the
+/// claim's holder is writing, and an immediate re-read would likely see
+/// the revision it is replacing.
+const CLAIM_BACKOFF: Duration = Duration::from_millis(20);
 
 /// Most channel rows one listing reads. A group holds at most
 /// [`MAX_CHANNELS_PER_GROUP`] channels once concurrent creates settle, but
@@ -60,6 +84,7 @@ const GROUP_HIDDEN: &str = "this group is visible to its members only";
 const GROUP_LIMIT: &str = "you already own the most groups this provider allows";
 const CHANNEL_LIMIT: &str = "this group has the most channels this provider allows";
 const NOT_MANAGER: &str = "you may not manage this group";
+const SLOW_WRITE: &str = "the write took too long to confirm; retry";
 
 impl Groups {
     /// The group, if it exists (`404`) and the caller may read it (`403`,
@@ -187,13 +212,23 @@ impl Groups {
         patch: &GroupUpdateRequest,
         now: i64,
     ) -> Result<Group, GroupError> {
-        for _ in 0..UPDATE_ATTEMPTS {
+        for attempt in 1..=UPDATE_ATTEMPTS {
             // Re-read and re-authorize on every attempt: a concurrent change
             // may have revoked the caller's `manage`.
             let group = self.group_for(actor, group_id, actions::MANAGE).await?;
             let Some(fields) = model::patch_group(&group, patch)? else {
                 return Ok(group.to_wire());
             };
+            // Only the holder of the claim on the next revision writes it
+            // (claims.rs: a filtered update alone is not compare-and-set).
+            let next = claims::group_key(&group.id, group.revision.saturating_add(1));
+            // The lease runs from the clock at claiming, not from the
+            // request's `now`, which earlier attempts may have aged; the
+            // one write below follows at once.
+            if !self.store.claim(&next, self.now()).await? {
+                lost_claim(attempt).await;
+                continue;
+            }
             if let Some(updated) = self.store.update_group(&group, &fields, now).await? {
                 self.changed(AccessChange::Group {
                     group_id: group_id.to_owned(),
@@ -255,6 +290,9 @@ impl Groups {
         req: ChannelCreateRequest,
         now: i64,
     ) -> Result<Channel, GroupError> {
+        // The row's age, as the sweeper reckons it, runs from `now`, read
+        // just before this call.
+        let started = Instant::now();
         self.group_for(actor, group_id, actions::MANAGE).await?;
         let (kind, fields) = model::new_channel(req)?;
         if self.channel_count(group_id).await? >= MAX_CHANNELS_PER_GROUP {
@@ -272,18 +310,29 @@ impl Groups {
             self.store.delete_channel(group_id, &channel.id).await?;
             return Err(GroupError::Forbidden(CHANNEL_LIMIT));
         }
-        self.confirm_channel(group_id, &channel.id).await?;
+        self.confirm_channel(group_id, &channel.id, started).await?;
         Ok(channel.to_wire())
     }
 
     /// Make a channel just written `pending` visible, once its group is
     /// known to be still active. A purge of the group that runs at any
     /// moment of this removes the channel, pending or active, so the
-    /// channel never outlives its group (see `store.rs`).
-    async fn confirm_channel(&self, group_id: &str, channel_id: &str) -> Result<(), GroupError> {
+    /// channel never outlives its group (see `store.rs`). A create that
+    /// began more than [`ACTIVATE_WITHIN`] ago takes its row back instead,
+    /// so the sweeper's expiry never meets an activated row.
+    async fn confirm_channel(
+        &self,
+        group_id: &str,
+        channel_id: &str,
+        started: Instant,
+    ) -> Result<(), GroupError> {
         if self.store.group(group_id).await?.is_none() {
             self.store.delete_channel(group_id, channel_id).await?;
             return Err(GroupError::NotFound(NO_GROUP));
+        }
+        if started.elapsed() > ACTIVATE_WITHIN {
+            self.store.delete_channel(group_id, channel_id).await?;
+            return Err(GroupError::Conflict(SLOW_WRITE));
         }
         if self.store.activate_channel(group_id, channel_id).await? {
             return Ok(());
@@ -321,12 +370,20 @@ impl Groups {
         patch: &ChannelUpdateRequest,
         now: i64,
     ) -> Result<Channel, GroupError> {
-        for _ in 0..UPDATE_ATTEMPTS {
+        for attempt in 1..=UPDATE_ATTEMPTS {
             // Re-read and re-authorize on every attempt, as for groups.
             let channel = self.managed_channel(actor, group_id, channel_id).await?;
             let Some(fields) = model::patch_channel(&channel, patch)? else {
                 return Ok(channel.to_wire());
             };
+            let next = claims::channel_key(&channel.id, channel.revision.saturating_add(1));
+            // The lease runs from the clock at claiming, not from the
+            // request's `now`, which earlier attempts may have aged; the
+            // one write below follows at once.
+            if !self.store.claim(&next, self.now()).await? {
+                lost_claim(attempt).await;
+                continue;
+            }
             if let Some(updated) = self.store.update_channel(&channel, &fields, now).await? {
                 self.channel_changed(group_id, channel_id);
                 return Ok(updated.to_wire());
@@ -375,6 +432,8 @@ impl Groups {
         role: &str,
         now: i64,
     ) -> Result<bool, GroupError> {
+        // As for channels: the row's age runs from `now`.
+        let started = Instant::now();
         member_role(role)?;
         let group = self
             .store
@@ -399,6 +458,10 @@ impl Groups {
         if self.store.group(group_id).await?.is_none() {
             self.store.remove_member(group_id, actor).await?;
             return Err(GroupError::NotFound(NO_GROUP));
+        }
+        if started.elapsed() > ACTIVATE_WITHIN {
+            self.store.remove_member(group_id, actor).await?;
+            return Err(GroupError::Conflict(SLOW_WRITE));
         }
         if !self.store.activate_member(group_id, actor).await? {
             if self.store.group(group_id).await?.is_none() {
@@ -446,4 +509,10 @@ fn member_role(role: &str) -> Result<(), GroupError> {
         )));
     }
     Ok(())
+}
+
+/// Wait before retrying an edit whose revision claim another edit holds.
+async fn lost_claim(attempt: usize) {
+    let factor = u32::try_from(attempt).unwrap_or(u32::MAX);
+    tokio::time::sleep(CLAIM_BACKOFF.saturating_mul(factor)).await;
 }

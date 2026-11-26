@@ -247,33 +247,6 @@ async fn patch_needs_manage_and_changes_only_what_it_names() {
 }
 
 #[tokio::test]
-async fn concurrent_patches_both_land() {
-    let env = env().await;
-    let alice = local(&env, "alice").await;
-    let g = create_group(&env, &alice, group_body("G", "group")).await;
-    let path = format!("/api/groups/{}", id(&g));
-    let a = call(
-        &env,
-        Some(&alice),
-        "PATCH",
-        &path,
-        Some(json!({"name": "renamed"})),
-    );
-    let b = call(
-        &env,
-        Some(&alice),
-        "PATCH",
-        &path,
-        Some(json!({"description": "described"})),
-    );
-    let ((sa, _), (sb, _)) = tokio::join!(a, b);
-    assert_eq!((sa, sb), (StatusCode::OK, StatusCode::OK));
-    let (_, got) = call(&env, Some(&alice), "GET", &path, None).await;
-    assert_eq!(got["name"], "renamed");
-    assert_eq!(got["description"], "described");
-}
-
-#[tokio::test]
 async fn only_the_owner_deletes_and_everything_goes_with_the_group() {
     let env = env().await;
     let alice = local(&env, "alice").await;

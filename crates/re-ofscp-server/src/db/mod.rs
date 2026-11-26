@@ -30,6 +30,27 @@ pub use ql::Ql;
 /// How rhypedb begins the message for a violated `@unique` constraint.
 const UNIQUE_VIOLATION_PREFIX: &str = "engine error: unique constraint violated: ";
 
+/// How rhypedb begins the message for a write to an object that is gone:
+/// a filtered `update` or `delete` matched it on its snapshot, and it was
+/// deleted before the statement's write to it.
+const OBJECT_NOT_FOUND_PREFIX: &str = "engine error: object not found: ";
+
+/// How rhypedb reports a write-write conflict under snapshot isolation:
+/// a concurrent transaction committed a write to the same key first, and
+/// the losing transaction was aborted.
+///
+/// rhypedb runs each object's write in its own transaction (a filtered
+/// `update` evaluates the filter on a snapshot, then updates each matching
+/// object separately), so a statement that touches one object is aborted
+/// whole and may be run again, but one that touches several may have
+/// applied to some before the conflict. Retrying is therefore the
+/// caller's decision (see [`DbError::Contended`]).
+const WRITE_CONFLICT_MESSAGE: &str = "engine error: write conflict";
+
+/// How often [`Db::write_one_object`] tries a write in all while it keeps
+/// losing write conflicts.
+pub const ONE_OBJECT_WRITE_ATTEMPTS: u32 = 6;
+
 /// A data-layer failure.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DbError {
@@ -40,6 +61,18 @@ pub enum DbError {
     /// A `@unique` constraint rejected the write.
     #[error("unique constraint violated: {0}")]
     Conflict(String),
+    /// A concurrent write to the same object won, and this one was aborted.
+    /// For a statement that writes one object, nothing was written and it
+    /// may be run again; for one that writes several, those before the
+    /// conflicting object may have been written.
+    #[error("write conflict: {0}")]
+    Contended(String),
+    /// An object the statement matched was deleted before the statement
+    /// wrote it. As for [`Self::Contended`], a statement that writes one
+    /// object wrote nothing and may be run again (its filter then no longer
+    /// matches the object).
+    #[error("object gone: {0}")]
+    Vanished(String),
     /// The server rejected the query (a bug in this code, or a schema
     /// mismatch).
     #[error("query rejected: {0}")]
@@ -61,6 +94,10 @@ impl DbError {
                 // `tests/db.rs` pins this against a real server.
                 if msg.starts_with(UNIQUE_VIOLATION_PREFIX) {
                     Self::Conflict(msg)
+                } else if msg == WRITE_CONFLICT_MESSAGE {
+                    Self::Contended(msg)
+                } else if msg.starts_with(OBJECT_NOT_FOUND_PREFIX) {
+                    Self::Vanished(msg)
                 } else {
                     Self::Query(msg)
                 }
@@ -338,6 +375,46 @@ impl Db {
     /// retried after a failure mid-exchange.
     pub async fn write_rows(&self, q: &Ql) -> Result<QueryResult, DbError> {
         self.query_once(q).await
+    }
+
+    /// Run a write that touches at most one object (a `create`, or an
+    /// `update` or `delete` filtered on a `@unique` field), and return what
+    /// it returned.
+    ///
+    /// Such a write is one rhypedb transaction, so when it loses a
+    /// write-write conflict, or the object it matched is deleted before it
+    /// is written, nothing of it was applied, and it is run again (its
+    /// filter evaluated afresh) up to [`ONE_OBJECT_WRITE_ATTEMPTS`] times
+    /// with a short growing pause (see [`DbError::Contended`] and
+    /// [`DbError::Vanished`]). Never use this for a write that may touch
+    /// several objects.
+    pub async fn write_one_object(&self, q: &Ql) -> Result<QueryResult, DbError> {
+        let mut attempt = 1;
+        loop {
+            match self.query_once(q).await {
+                Err(DbError::Contended(_) | DbError::Vanished(_))
+                    if attempt < ONE_OBJECT_WRITE_ATTEMPTS =>
+                {
+                    tokio::time::sleep(Duration::from_millis(1 << attempt)).await;
+                    attempt += 1;
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// [`Self::write_one_object`], decoding every object it returned into
+    /// `T`.
+    pub async fn write_one_object_as<T: DeserializeOwned>(
+        &self,
+        q: &Ql,
+    ) -> Result<Vec<Row<T>>, DbError> {
+        self.write_one_object(q)
+            .await?
+            .into_objects()
+            .iter()
+            .map(|o| Row::from_object(o).map_err(DbError::from_client))
+            .collect()
     }
 
     /// Whether the database answers a ping (retried once, like a read).

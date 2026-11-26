@@ -10,6 +10,7 @@ pub mod discovery;
 pub mod dm;
 pub mod federation;
 pub mod groups;
+pub mod profile;
 
 pub use actor::{Actor, Authority, IdentError, is_valid_handle};
 pub use dm::dm_id;

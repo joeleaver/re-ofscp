@@ -13,7 +13,9 @@ pub mod discovery;
 pub mod federation;
 pub mod groups;
 pub mod outbound;
+pub mod privacy;
 pub mod problem;
+pub mod profiles;
 pub mod provider_key;
 pub mod ratelimit;
 pub mod registrable;
@@ -25,7 +27,7 @@ pub mod timefmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router, extract::State, middleware};
 use problem::ProblemBase;
 use re_ofscp_types::{Health, OFSCP_VERSION};
@@ -40,6 +42,8 @@ use federation::FederationPolicy;
 use federation::store::PolicyStore;
 use groups::Groups;
 use outbound::{OutboundClient, OutboundConfig};
+use privacy::{Contacts, GroupMemberships, Liveness, NoConnections, Relationships};
+use profiles::Profiles;
 use remote_keys::RemoteKeys;
 use replay::ReplayStore;
 use replay::ledger::{LedgerError, NonceLedger, RhypeLedger};
@@ -72,6 +76,8 @@ pub struct AppState {
     /// in force in the verifier, the remote key resolver and the outbound
     /// client.
     pub federation: Arc<PolicyStore>,
+    /// Profiles, presence and privacy settings (§5.1, §6).
+    pub profiles: Arc<Profiles>,
 }
 
 /// Why [`AppStateBuilder::build`] failed.
@@ -98,6 +104,9 @@ pub struct AppStateBuilder {
     outbound: Option<Arc<OutboundClient>>,
     ledger: Option<Arc<dyn NonceLedger>>,
     clock: Arc<dyn Clock>,
+    relationships: Relationships,
+    group_memberships: Option<Arc<dyn GroupMemberships>>,
+    liveness: Arc<dyn Liveness>,
 }
 
 impl AppStateBuilder {
@@ -130,6 +139,30 @@ impl AppStateBuilder {
     #[must_use]
     pub fn ledger(mut self, ledger: Arc<dyn NonceLedger>) -> Self {
         self.ledger = Some(ledger);
+        self
+    }
+
+    /// Answer the `sharedGroups` tier and membership listings (§6.1, §6.5)
+    /// from `groups` instead of this provider's own groups (tests).
+    #[must_use]
+    pub fn group_memberships(mut self, groups: Arc<dyn GroupMemberships>) -> Self {
+        self.group_memberships = Some(groups);
+        self
+    }
+
+    /// Answer the `contacts` tier (§6.1) from `contacts` instead of
+    /// [`privacy::NoContacts`].
+    #[must_use]
+    pub fn contacts(mut self, contacts: Arc<dyn Contacts>) -> Self {
+        self.relationships.contacts = contacts;
+        self
+    }
+
+    /// Derive online/offline (§7.5) from `liveness` instead of
+    /// [`NoConnections`].
+    #[must_use]
+    pub fn liveness(mut self, liveness: Arc<dyn Liveness>) -> Self {
+        self.liveness = liveness;
         self
     }
 
@@ -190,7 +223,22 @@ impl AppStateBuilder {
                 setup_token: config.admin_setup_token.as_ref().map(|t| t.0.clone()),
             },
         ));
-        let groups = Arc::new(Groups::new(config.domain.clone(), db.clone()));
+        let groups = Arc::new(Groups::new(
+            config.domain.clone(),
+            db.clone(),
+            self.clock.clone(),
+        ));
+        let mut relationships = self.relationships;
+        relationships.groups = match self.group_memberships {
+            Some(g) => g,
+            None => groups.clone(),
+        };
+        let profiles = Arc::new(Profiles::new(
+            config.domain.clone(),
+            db.clone(),
+            relationships,
+            self.liveness,
+        ));
         let keys: Arc<dyn KeyResolver> = self.keys.unwrap_or_else(|| accounts.keys.clone());
         let verifier = Arc::new(Verifier::new(
             config.domain.clone(),
@@ -210,6 +258,7 @@ impl AppStateBuilder {
             verifier,
             discovery,
             federation,
+            profiles,
         })
     }
 }
@@ -224,6 +273,9 @@ impl AppState {
             outbound: None,
             ledger: None,
             clock: Arc::new(SystemClock),
+            relationships: Relationships::default(),
+            group_memberships: None,
+            liveness: Arc::new(NoConnections),
         }
     }
 
@@ -320,6 +372,33 @@ pub fn router(state: AppState) -> Router {
                 .delete(groups::routes::delete_channel),
         )
         .route("/api/tiers", get(groups::routes::tiers))
+        .route("/api/me", get(profiles::routes::me))
+        .route(
+            "/api/me/profile",
+            patch(profiles::routes::update_profile).layer(profile_body_limit()),
+        )
+        .route(
+            "/api/me/presence",
+            put(profiles::routes::set_presence).layer(profile_body_limit()),
+        )
+        .route(
+            "/api/me/privacy",
+            get(profiles::routes::privacy)
+                .put(profiles::routes::update_privacy)
+                .layer(profile_body_limit()),
+        )
+        .route(
+            "/api/users/{user_ref}/profile",
+            get(profiles::routes::user_profile),
+        )
+        .route(
+            "/api/users/{user_ref}/presence",
+            get(profiles::routes::user_presence),
+        )
+        .route(
+            "/api/users/{user_ref}/groups",
+            get(profiles::routes::user_groups),
+        )
         .route(discovery::PATH, get(discovery::get))
         .route("/problems/{code}", get(problem::describe))
         .fallback(|| async { Problem::not_found() })
@@ -363,6 +442,11 @@ pub fn router(state: AppState) -> Router {
 /// before any check.
 fn auth_body_limit() -> axum::extract::DefaultBodyLimit {
     axum::extract::DefaultBodyLimit::max(accounts::routes::AUTH_BODY_LIMIT)
+}
+
+/// Body limit for the profile, presence and privacy updates.
+fn profile_body_limit() -> axum::extract::DefaultBodyLimit {
+    axum::extract::DefaultBodyLimit::max(profiles::routes::PROFILE_BODY_LIMIT)
 }
 
 /// `GET /api/health` — liveness plus a database reachability probe.

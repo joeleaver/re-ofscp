@@ -1,4 +1,4 @@
-//! Groups and channels (spec §5.2, §5.2.1, §5.5, §11; docs/decisions/0009).
+//! Groups and channels (spec §5.2, §5.2.1, §5.5, §11; docs/decisions/0010).
 //!
 //! - [`access`]: the one effective-read-access and permission rule.
 //! - [`model`]: stored shapes and request → state.
@@ -13,9 +13,11 @@
 //! (§5.7), invites (§5.6) and guests (§4.8) build on.
 
 pub mod access;
+mod claims;
 mod members;
 pub mod model;
 pub mod ops;
+mod relations;
 pub mod routes;
 pub mod store;
 pub mod validate;
@@ -90,6 +92,7 @@ pub struct Groups {
     /// Storage.
     pub store: GroupStore,
     home: Authority,
+    clock: Arc<dyn Clock>,
     changes: broadcast::Sender<AccessChange>,
 }
 
@@ -100,11 +103,13 @@ impl std::fmt::Debug for Groups {
 }
 
 impl Groups {
-    /// Groups hosted by `home`, stored in `db`.
-    pub fn new(home: Authority, db: Arc<Db>) -> Self {
+    /// Groups hosted by `home`, stored in `db`, telling the time by
+    /// `clock` (revision claims and the sweeper).
+    pub fn new(home: Authority, db: Arc<Db>, clock: Arc<dyn Clock>) -> Self {
         Self {
             store: GroupStore::new(db),
             home,
+            clock,
             changes: broadcast::channel(CHANGE_BUFFER).0,
         }
     }
@@ -112,6 +117,11 @@ impl Groups {
     /// This provider's authority.
     pub fn home(&self) -> &Authority {
         &self.home
+    }
+
+    /// Now, in unix seconds.
+    fn now(&self) -> i64 {
+        self.clock.now().unix_timestamp()
     }
 
     /// Receive every [`AccessChange`] from now on.
@@ -150,15 +160,19 @@ impl Groups {
     }
 
     /// One sweeper pass at `now` (unix seconds): finish the group
-    /// deletions a crash or a database fault interrupted, and expire the
+    /// deletions a crash or a database fault interrupted, expire the
     /// pending channels and memberships whose writers never confirmed them
-    /// (older than [`PENDING_TTL`]). A group whose purge fails is logged
-    /// and left for the next pass; the rest of the pass goes on.
+    /// (older than [`PENDING_TTL`]), and delete expired revision claims. A
+    /// step or a group's purge that fails is logged and left for the next
+    /// pass; the rest of the pass goes on.
     pub async fn sweep(&self, now: i64) -> Result<usize, DbError> {
         // Expiry failing must not hold up the purges (nor the reverse).
         let cutoff = now.saturating_sub(PENDING_TTL.as_secs() as i64);
         if let Err(e) = self.store.expire_pending(cutoff).await {
             tracing::warn!(error = %e, "expiring pending group rows failed");
+        }
+        if let Err(e) = self.store.purge_claims(now).await {
+            tracing::warn!(error = %e, "purging expired revision claims failed");
         }
         let mut purged = 0;
         loop {
@@ -182,14 +196,14 @@ impl Groups {
         }
     }
 
-    /// Run [`Groups::sweep`] now and every [`SWEEP_INTERVAL`], reading
-    /// the time from `clock`, until the task is dropped.
-    pub async fn sweep_forever(self: Arc<Self>, clock: Arc<dyn Clock>) {
+    /// Run [`Groups::sweep`] now and every [`SWEEP_INTERVAL`] until the
+    /// task is dropped.
+    pub async fn sweep_forever(self: Arc<Self>) {
         let mut tick = tokio::time::interval(SWEEP_INTERVAL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            match self.sweep(clock.now().unix_timestamp()).await {
+            match self.sweep(self.now()).await {
                 Ok(0) => {}
                 Ok(n) => tracing::info!(groups = n, "finished interrupted group deletions"),
                 Err(e) => tracing::warn!(error = %e, "sweeping deleted groups failed"),

@@ -16,6 +16,12 @@ struct RoleRow {
     role: String,
 }
 
+#[derive(Deserialize)]
+struct MembershipRow {
+    group_id: String,
+    role: String,
+}
+
 /// The membership key: one row per (group, actor).
 fn member_key(group_id: &str, actor: &Actor) -> String {
     format!("{group_id} {actor}")
@@ -37,6 +43,29 @@ impl GroupStore {
             .into_iter()
             .next()
             .map(|r| r.data.role))
+    }
+
+    /// `actor`'s active memberships as `(group_id, role)`, at most `cap`
+    /// (their groups may be active or being deleted).
+    pub async fn memberships_of(
+        &self,
+        actor: &Actor,
+        cap: usize,
+    ) -> Result<Vec<(String, String)>, DbError> {
+        let q = Ql::new("Membership.filter(.actor == ")
+            .str(&actor.to_string())
+            .raw(" && .status == ")
+            .str(status::ACTIVE)
+            .raw(").limit(")
+            .uint(cap as u64)
+            .raw(")");
+        Ok(self
+            .db
+            .fetch::<MembershipRow>(&q)
+            .await?
+            .into_iter()
+            .map(|r| (r.data.group_id, r.data.role))
+            .collect())
     }
 
     /// Write a `pending` membership of `actor` in `group_id` with `role`;
@@ -64,7 +93,8 @@ impl GroupStore {
             .raw(" })");
         match self.db.execute(&q).await {
             Ok(()) => Ok(true),
-            Err(DbError::Conflict(_)) => Ok(false),
+            // Taken, or another create of this key won at commit.
+            Err(DbError::Conflict(_) | DbError::Contended(_)) => Ok(false),
             Err(e) => Err(e),
         }
     }
@@ -79,7 +109,12 @@ impl GroupStore {
             .raw(").update({ status: ")
             .str(status::ACTIVE)
             .raw(" })");
-        Ok(!self.db.write_rows(&q).await?.into_objects().is_empty())
+        Ok(!self
+            .db
+            .write_one_object(&q)
+            .await?
+            .into_objects()
+            .is_empty())
     }
 
     /// Change an active member's role. `false` if not a member.
@@ -96,7 +131,12 @@ impl GroupStore {
             .raw(").update({ role: ")
             .str(role)
             .raw(" })");
-        Ok(!self.db.write_rows(&q).await?.into_objects().is_empty())
+        Ok(!self
+            .db
+            .write_one_object(&q)
+            .await?
+            .into_objects()
+            .is_empty())
     }
 
     /// End `actor`'s membership of `group_id`, pending or active (a no-op
@@ -105,7 +145,7 @@ impl GroupStore {
         let q = Ql::new("Membership.filter(.key == ")
             .str(&member_key(group_id, actor))
             .raw(").delete()");
-        self.db.execute(&q).await
+        self.db.write_one_object(&q).await.map(|_| ())
     }
 
     /// Remove the pending memberships written before `cutoff` (unix

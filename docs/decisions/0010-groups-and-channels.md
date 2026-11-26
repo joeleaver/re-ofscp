@@ -1,4 +1,4 @@
-# 0009: Groups, channels and effective read access
+# 0010: Groups, channels and effective read access
 
 - **Status:** accepted
 - **Date:** 2026-11-26
@@ -121,11 +121,58 @@ it sends.
   roles, metadata; name, topic, tags, permissions, metadata for channels)
   are one JSON `doc` column. The fields queries filter on are their own
   columns.
-- **Optimistic concurrency.** Each row has a `revision`. An update writes
-  only where `revision` still matches, and retries from a fresh read (and
-  a fresh authorization) up to five times, then answers `409`. Concurrent
+- **Optimistic concurrency.** Each group and channel has a `revision`.
+  An edit from revision `n` writes revision `n + 1` only while holding the
+  claim on it (next section). It retries from a fresh read (and a fresh
+  authorization) up to five times, then answers `409`. Concurrent
   `PATCH`es of different fields both land. A `PATCH` that changes nothing
   writes nothing and keeps `updatedAt`.
+
+### Concurrency without compare-and-set
+
+rhypedb's filtered writes are not compare-and-set (at the pinned c73cc88,
+and on the managed server production runs). `X.filter(p).update(...)`
+evaluates `p` on a snapshot, then writes each matching object in its own
+transaction, which does not re-check `p`. A rhypedb fix is in progress,
+but production waits on jkbase upgrading its managed server, so this code
+must be correct without it. The rule, per guard:
+
+- **Revisions: claims.** `GroupClaim` holds `@unique` keys
+  `group:{id}:{revision}` and `channel:{id}:{revision}`. A `create` on a
+  `@unique` field is atomic (16 concurrent creates of one key leave one
+  row), so an edit first claims the revision it will write. It writes only
+  if it created the claim; otherwise it backs off (20 ms × attempt) and
+  retries from a fresh read. The filter on the old revision stays, to
+  refuse a stale read. A claim is a lease of `LEASE_SECS` (120 s),
+  stamped with the clock when it is claimed (not the request's time,
+  which earlier attempts may have aged). Its holder writes once, right
+  away, in one statement that is never retried and that the data layer
+  times out after 10 s; a write that loses a conflict wrote nothing, and
+  the edit starts over. A claim that outlived its lease unused belongs to
+  a dead writer, and the next edit takes it over (by deleting exactly that
+  row, by id, then claiming again; a row already gone is fine). The
+  sweeper deletes expired claims. The residual is a holder stalled for
+  over 110 s between claiming and its write reaching the server, which
+  the timeouts rule out.
+- **Status guards need no claim.** Every status transition is one-way
+  (`pending → active`, `active → deleting`), deletes are final, and no edit
+  writes `status`. So a guarded update that runs after its guard stopped
+  holding either writes the same thing again or finds the object gone.
+  Edits (`PATCH`, `set_role`) never write `status`, so a group being
+  deleted stays deleting. Membership roles are last-writer-wins.
+- **Expiry vs. activation.** The sweeper's delete of pending rows older
+  than `PENDING_TTL` could, in principle, meet a row that was activated
+  after the sweeper's snapshot. A writer therefore activates only within
+  `ACTIVATE_WITHIN` (300 s) of starting, and otherwise takes its row back
+  and answers `409`. An expiry can only meet an activated row if one
+  statement stalls for minutes.
+- **Single-object writes retry.** A write that touches one object (by a
+  `@unique` key) and loses a write-write conflict (`DbError::Contended`),
+  or finds that the object it matched was deleted meanwhile
+  (`DbError::Vanished`), wrote nothing. `Db::write_one_object` runs it
+  again with its filter evaluated afresh. Profiles uses the same helper.
+  The one exception is the write under a revision claim, which runs once
+  (above).
 
 ### Deletion without transactions
 
@@ -144,8 +191,8 @@ it sends.
   cleanly (`404`, or `409` to retry).
 - A writer that dies or fails before confirming leaves a pending row. The
   sweeper deletes pending rows older than `PENDING_TTL` (600 s), so they
-  never accumulate, and this relies on no request taking any particular
-  time: a create slower than that finds its row gone and fails cleanly.
+  never accumulate. A create slower than `ACTIVATE_WITHIN` takes its row
+  back and answers `409` (see "Concurrency without compare-and-set").
 - A sweeper pass carries on past a failed step (expiry, or one group's
   purge), logging it and leaving it for the next pass.
 - `add_member` answers a pending membership (another add in flight, or a
@@ -198,6 +245,18 @@ so channels about to be taken back cannot crowd real ones out.
 `GET /api/tiers` lists the four canonical tiers with a name and
 description, and discovery's `capabilities.tiers` lists their ids.
 
+### Memberships for the visibility policy (§6.1, §6.5)
+
+`Groups` implements profiles' `GroupMemberships` seam, and the app wires
+it in by default (a test may override it). A user belongs to a group as
+its owner or as an active member, and only active groups count.
+`share_a_group` compares full actors, so `bob@b` never shares a group on
+the strength of a local `bob`. `groups_visible_to` lists the subject's
+groups that the viewer may read (§5.5: open tiers, or the viewer belongs),
+as object URIs `https://{domain}/api/groups/{id}`. At most 1,000
+memberships and owned groups are read per user. Past that, a lookup fails
+closed: a group left out is neither shared nor listed.
+
 ## Follow-ups
 
 - An admin-console (read-only) group list. It needs admin API routes and
@@ -207,3 +266,5 @@ description, and discovery's `capabilities.tiers` lists their ids.
   announces its change) and `access::join_gate`.
 - Switch the references to rhypedb links with `@on_delete(cascade)` once
   the pinned rhypedb supports linking on create.
+- Once the managed rhypedb re-checks filters at write time, the claims can
+  go. Until then they are the design, not a stopgap.
