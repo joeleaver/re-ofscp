@@ -9,7 +9,7 @@
 use re_ofscp_types::auth::{RegistrationMode, RegistrationRequest};
 
 use super::invites::{
-    DEFAULT_INVITE_TTL_SECS, IssuedInvite, MAX_INVITE_TTL_SECS, new_token, token_hash,
+    DEFAULT_INVITE_TTL_SECS, InviteClaim, IssuedInvite, MAX_INVITE_TTL_SECS, new_token, token_hash,
 };
 use super::password::check_length;
 use super::{Accounts, CreateError, PasswordError, StoreError, User, check_new_handle};
@@ -165,9 +165,9 @@ impl Accounts {
         // whose account cannot be created is released before anyone else
         // looks.
         let _serial = self.registration_lock.lock().await;
-        if !self.invites.claim(&hash, &req.handle, now).await? {
+        let Some(claim) = self.invites.claim(&hash, &req.handle, now).await? else {
             return Err(RegisterError::InviteRequired);
-        }
+        };
         match self
             .store
             .create_user(&req.handle, &req.handle, &password_hash, now)
@@ -175,7 +175,7 @@ impl Accounts {
         {
             Ok(user) => Ok(user),
             Err(StoreError::HandleTaken) => {
-                self.release_invite(&hash, &req.handle).await;
+                self.release_invite(&claim, &req.handle).await;
                 Err(RegisterError::HandleTaken)
             }
             Err(e) => {
@@ -183,7 +183,7 @@ impl Accounts {
                 // the row was stored). Release only if the account is
                 // certainly absent, or one invite could create two accounts.
                 match self.store.find_user(&req.handle).await {
-                    Ok(None) => self.release_invite(&hash, &req.handle).await,
+                    Ok(None) => self.release_invite(&claim, &req.handle).await,
                     Ok(Some(_)) => {}
                     Err(check) => tracing::error!(
                         error = %check,
@@ -197,13 +197,14 @@ impl Accounts {
         }
     }
 
-    async fn release_invite(&self, hash: &str, handle: &str) {
-        if let Err(e) = self.invites.release(hash).await {
+    async fn release_invite(&self, claim: &InviteClaim, handle: &str) {
+        if let Err(e) = self.invites.release(claim).await {
             tracing::error!(
                 error = %e,
                 handle = %handle,
                 "could not release an invite after a failed registration; \
-                 the invite stays spent"
+                 the invite stays spent (or, if only its claim was left, \
+                 usable again once the claim's lease ends)"
             );
         }
     }

@@ -168,6 +168,7 @@ impl NonceLedger for NoLedger {
 pub struct RhypeLedger {
     db: Arc<Db>,
     page: u64,
+    clock_page: u64,
 }
 
 /// Rows read per page when restoring.
@@ -179,7 +180,8 @@ const LOAD_PAGE: u64 = 5_000;
 const PURGE_BATCH: u64 = 1_000;
 const PURGE_MAX_BATCHES: usize = 100;
 
-/// Clock rows read per page (pruning keeps one or two).
+/// Clock rows read per statement (pruning keeps one or two, so a full page
+/// is logged as pruning lagging).
 const CLOCK_PAGE: u64 = 1_000;
 
 #[derive(Deserialize)]
@@ -224,11 +226,13 @@ impl RhypeLedger {
     }
 
     /// As [`RhypeLedger::new`], reading `page` rows per query when restoring
-    /// (tests use small pages to exercise paging).
+    /// nonces and clock rows (tests use small pages to exercise paging).
     pub fn with_page_size(db: Arc<Db>, page: u64) -> Self {
+        let page = page.max(1);
         Self {
             db,
-            page: page.max(1),
+            page,
+            clock_page: page.min(CLOCK_PAGE),
         }
     }
 
@@ -254,25 +258,45 @@ impl RhypeLedger {
     }
 
     /// The persisted replay clock, if any: the highest `ReplayClock` row.
+    ///
+    /// rhypedb has no sort, so the maximum is found by raising a floor
+    /// rather than by paging with `offset`: a prune deleting rows between
+    /// two `offset` pages shifts the rest down, and the highest row could
+    /// fall into a page already read. Each statement reads one snapshot,
+    /// and every snapshot holds the highest row (a prune deletes only rows
+    /// below a value whose row exists). So a page that is not full holds
+    /// every row above the floor, and its maximum is the clock; a full page
+    /// raises the floor to its maximum and the next statement reads only
+    /// rows above it. The floor only rises, so this ends.
     async fn read_clock(&self) -> Result<Option<i64>, LedgerError> {
         let mut clock: Option<i64> = None;
-        let mut offset = 0u64;
+        let mut warned = false;
         loop {
-            let q = Ql::new("ReplayClock.offset(")
-                .uint(offset)
-                .raw(").limit(")
-                .uint(CLOCK_PAGE)
-                .raw(")");
+            let q = match clock {
+                None => Ql::new("ReplayClock.limit("),
+                Some(floor) => Ql::new("ReplayClock.filter(.high_water > ")
+                    .unix_seconds(floor)
+                    .raw(").limit("),
+            }
+            .uint(self.clock_page)
+            .raw(")");
             let rows = self.db.fetch::<ClockRow>(&q).await.map_err(unavailable)?;
-            let n = rows.len() as u64;
+            let full = rows.len() as u64 >= self.clock_page;
             for r in rows {
                 let t = unix(&r.data.high_water)?;
                 clock = Some(clock.map_or(t, |c| c.max(t)));
             }
-            if n < CLOCK_PAGE {
+            if !full {
                 return Ok(clock);
             }
-            offset += CLOCK_PAGE;
+            if !warned {
+                // Pruning keeps one or two rows; a full page means it lags.
+                tracing::warn!(
+                    page = self.clock_page,
+                    "replay clock has a page or more of rows; pruning lags"
+                );
+                warned = true;
+            }
         }
     }
 

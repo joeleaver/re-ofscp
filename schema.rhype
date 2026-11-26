@@ -66,6 +66,9 @@ type InviteClaim {
     token_hash: String @unique
     handle: String
     claimed_at: DateTime
+    // A lease: once past, a claim beside an invite still unused, whose
+    // handle has no account, was abandoned and may be taken over.
+    expires_at: DateTime
 }
 
 // The persistent replay ledger (spec §4.5 "Restarts"; docs/decisions/0001).

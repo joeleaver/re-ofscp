@@ -8,7 +8,8 @@ use std::future::Future;
 use std::sync::Arc;
 
 use common::rhypedb::RhypeServer;
-use re_ofscp_server::accounts::invites::InviteStore;
+use re_ofscp_server::accounts::AccountStore;
+use re_ofscp_server::accounts::invites::{INVITE_CLAIM_LEASE_SECS, InviteStore};
 use re_ofscp_server::admin::claims::{self, Claims};
 use re_ofscp_server::admin::{Admin, AdminStore, NewAdmin};
 use re_ofscp_server::db::{Db, DbConfig, Ql};
@@ -326,9 +327,10 @@ async fn an_invite_is_claimed_exactly_once_under_concurrency() {
             }
         })
         .await;
-        assert_eq!(winners(&results), 1, "round {round}: {results:?}");
+        let won: Vec<_> = results.into_iter().flatten().collect();
+        assert_eq!(won.len(), 1, "round {round}: {won:?}");
         if round == 0 {
-            invites.release(&hash).await.unwrap();
+            invites.release(&won[0]).await.unwrap();
         }
     }
     assert!(invites.find_usable(&hash, NOW + 2).await.unwrap().is_none());
@@ -338,8 +340,154 @@ async fn an_invite_is_claimed_exactly_once_under_concurrency() {
         .create(&old, None, "owner", NOW, NOW + 10)
         .await
         .unwrap();
-    assert!(!invites.claim(&old, "late", NOW + 10).await.unwrap());
+    assert!(
+        invites
+            .claim(&old, "late", NOW + 10)
+            .await
+            .unwrap()
+            .is_none()
+    );
     let db = db(&server);
     let claims = db.fetch::<Any>(&Ql::new("InviteClaim")).await.unwrap();
     assert_eq!(claims.len(), 1);
+}
+
+/// Leave a claim by `handle` on `hash`, claimed at `at`, as a registration
+/// that crashed after claiming (or whose update failed, or whose release
+/// could not drop it) leaves it: beside an invite still unused.
+async fn strand_claim(db: &Db, hash: &str, handle: &str, at: i64) {
+    let q = Ql::new("InviteClaim.create({ token_hash: ")
+        .str(hash)
+        .raw(", handle: ")
+        .str(handle)
+        .raw(", claimed_at: ")
+        .unix_seconds(at)
+        .raw(", expires_at: ")
+        .unix_seconds(at + INVITE_CLAIM_LEASE_SECS)
+        .raw(" })");
+    db.execute(&q).await.unwrap();
+}
+
+async fn race_claims(invites: &Arc<InviteStore>, hash: &str, now: i64) -> usize {
+    let results = race(|i| {
+        let (invites, hash) = (invites.clone(), hash.to_owned());
+        async move {
+            let handle = format!("user{i}");
+            invites.claim(&hash, &handle, now).await.unwrap()
+        }
+    })
+    .await;
+    results.iter().filter(|c| c.is_some()).count()
+}
+
+/// A claim stranded beside an unused invite blocks it only until its lease
+/// ends. Then many registrations take it over at once, and exactly one
+/// wins; the invite is used once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stranded_invite_claim_is_taken_over_exactly_once_after_its_lease() {
+    let server = RhypeServer::start();
+    let db = db(&server);
+    let invites = Arc::new(InviteStore::new(db.clone()));
+    let hash = "c".repeat(64);
+    invites
+        .create(&hash, None, "owner", NOW, NOW + 3_600)
+        .await
+        .unwrap();
+    strand_claim(&db, &hash, "crashed", NOW).await;
+    // Within the lease: it may still be in flight, so nobody takes it.
+    let lease_end = NOW + INVITE_CLAIM_LEASE_SECS;
+    assert_eq!(race_claims(&invites, &hash, lease_end - 1).await, 0);
+    assert!(
+        invites
+            .find_usable(&hash, lease_end)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    // Expired: exactly one taker wins, and the invite is then used.
+    for round in 0..3 {
+        let now = lease_end + round * (INVITE_CLAIM_LEASE_SECS + 1);
+        let won = race_claims(&invites, &hash, now).await;
+        if round == 0 {
+            assert_eq!(won, 1, "round {round}");
+        } else {
+            // Used: the winner's claim is the record, never taken over.
+            assert_eq!(won, 0, "round {round}");
+        }
+    }
+    assert!(
+        invites
+            .find_usable(&hash, lease_end)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let claims = db.fetch::<Any>(&Ql::new("InviteClaim")).await.unwrap();
+    assert_eq!(claims.len(), 1);
+}
+
+/// An expired claim whose handle has an account is kept: that holder may
+/// have made it, so the invite is not reopened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_expired_invite_claim_with_an_account_is_not_taken_over() {
+    let server = RhypeServer::start();
+    let db = db(&server);
+    let invites = Arc::new(InviteStore::new(db.clone()));
+    let hash = "d".repeat(64);
+    invites
+        .create(&hash, None, "owner", NOW, NOW + 3_600)
+        .await
+        .unwrap();
+    strand_claim(&db, &hash, "made", NOW).await;
+    AccountStore::new(db.clone())
+        .create_user("made", "made", "$argon2id$placeholder", NOW)
+        .await
+        .unwrap();
+    let later = NOW + INVITE_CLAIM_LEASE_SECS + 1;
+    assert_eq!(race_claims(&invites, &hash, later).await, 0);
+    let claims = db.fetch::<Any>(&Ql::new("InviteClaim")).await.unwrap();
+    assert_eq!(claims.len(), 1);
+}
+
+/// The persisted clock is the highest row even when there are more rows
+/// than one read returns and purges prune them while readers read (an
+/// `offset` page could skip the highest row once a prune shifted the rest).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_replay_clock_is_read_whole_while_rows_are_pruned() {
+    let server = RhypeServer::start();
+    let db = db(&server);
+    // Rows created out of order, more than several pages of two.
+    for v in [5i64, 1, 9, 3, 7, 2, 8, 4, 6, 0] {
+        let q = Ql::new("ReplayClock.create({ name: ")
+            .str(&format!("replay@{}", NOW + v))
+            .raw(", high_water: ")
+            .unix_seconds(NOW + v)
+            .raw(" })");
+        db.execute(&q).await.unwrap();
+    }
+    let reader = RhypeLedger::with_page_size(db.clone(), 2);
+    assert_eq!(reader.load(0).await.unwrap().clock, Some(NOW + 9));
+    // Readers with small pages race writers that raise and prune.
+    let readers: Vec<_> = (0..RACERS)
+        .map(|i| (i, Arc::new(RhypeLedger::with_page_size(db.clone(), 2))))
+        .collect();
+    let rs = &readers;
+    let results = race(move |i| {
+        let (n, l) = (rs[i].0, rs[i].1.clone());
+        async move {
+            if n % 2 == 0 {
+                l.purge(NOW + 10 + n as i64).await.map(|()| None)
+            } else {
+                l.load(0).await.map(|r| r.clock)
+            }
+        }
+    })
+    .await;
+    for r in &results {
+        // Every reader saw at least the highest row there from the start.
+        let clock = r.as_ref().unwrap();
+        assert!(clock.is_none_or(|c| c >= NOW + 9), "{results:?}");
+    }
+    let last = NOW + 10 + RACERS as i64 - 2;
+    assert_eq!(reader.load(0).await.unwrap().clock, Some(last));
 }

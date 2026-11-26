@@ -12,6 +12,13 @@
 //! it. Registration is also serialized in-process (see
 //! `Accounts::register`), so a failed registration releases its claim
 //! before anyone else looks.
+//!
+//! A claim is a lease ([`INVITE_CLAIM_LEASE_SECS`]). A claim left beside an
+//! invite that is still unused (its holder crashed before marking it, or
+//! could not delete the claim when releasing it) would otherwise block the
+//! invite forever; once the lease has expired, the invite is still usable
+//! and no account has the claim's handle, the next registration takes it
+//! over.
 
 use std::sync::Arc;
 
@@ -19,6 +26,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 use crate::db::{Db, DbError, Ql};
 
@@ -26,6 +35,15 @@ use crate::db::{Db, DbError, Ql};
 pub const INVITE_PREFIX: &str = "ai_";
 
 pub use re_ofscp_types::admin::{DEFAULT_INVITE_TTL_SECS, MAX_INVITE_TTL_SECS};
+
+/// How long an invite claim (a lease) lives. Its holder marks the invite
+/// used in one guarded update, which the data layer times out after 10 s,
+/// and creates the account in the next statement; a claim older than this
+/// was abandoned, and may be taken over (docs/decisions/0012).
+pub const INVITE_CLAIM_LEASE_SECS: i64 = 120;
+
+/// Attempts at one claim before giving up (failing closed).
+const CLAIM_PASSES: usize = 4;
 
 /// Longest token accepted from a client. Ours are 46 characters; anything
 /// much longer is not one of ours and is refused without a lookup.
@@ -81,9 +99,25 @@ pub struct InviteSummary {
     pub expires_at: String,
 }
 
+/// A claim this registration holds on an invite, returned by
+/// [`InviteStore::claim`] and given back to [`InviteStore::release`] so that
+/// exactly this claim, and no later one, is dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InviteClaim {
+    id: u64,
+    token_hash: String,
+    handle: String,
+}
+
 /// Any row (only its id matters).
 #[derive(Deserialize)]
 struct Exists {}
+
+#[derive(Deserialize)]
+struct ClaimRow {
+    handle: String,
+    expires_at: String,
+}
 
 #[derive(Deserialize)]
 struct InviteRow {
@@ -170,39 +204,22 @@ impl InviteStore {
     }
 
     /// Mark the invite used by `handle`, if it is still unused and
-    /// unexpired at `now`. `false` if it was not (used meanwhile, expired).
+    /// unexpired at `now`. `None` if it was not (used meanwhile, expired, or
+    /// claimed by a registration in flight).
     ///
     /// The `used == false` guard alone is not compare-and-set (decision
     /// 0012), so the claim is made first as an `InviteClaim` row, `@unique`
     /// on the token hash: of any number of registrations presenting the
     /// invite, in this process or another, only the one that creates it
     /// goes on to mark the invite used.
-    pub async fn claim(&self, token_hash: &str, handle: &str, now: i64) -> Result<bool, DbError> {
-        let create = Ql::new("InviteClaim.create({ token_hash: ")
-            .str(token_hash)
-            .raw(", handle: ")
-            .str(handle)
-            .raw(", claimed_at: ")
-            .unix_seconds(now)
-            .raw(" })");
-        let mut claim_id = None;
-        for _ in 0..3 {
-            match self.db.write_one::<Exists>(&create).await {
-                Ok(row) => {
-                    claim_id = Some(row.id);
-                    break;
-                }
-                Err(DbError::Conflict(_)) => return Ok(false),
-                // Aborted by a concurrent create (nothing written): again,
-                // which then conflicts if that one landed.
-                Err(DbError::Contended(_)) => {}
-                Err(e) => return Err(e),
-            }
-        }
-        let Some(claim_id) = claim_id else {
-            return Err(DbError::Contended(
-                "invite claim stayed contended".to_owned(),
-            ));
+    pub async fn claim(
+        &self,
+        token_hash: &str,
+        handle: &str,
+        now: i64,
+    ) -> Result<Option<InviteClaim>, DbError> {
+        let Some(claim) = self.take_claim(token_hash, handle, now).await? else {
+            return Ok(None);
         };
         // Ours alone from here: no other request writes `used: true`.
         let q = Ql::new("RegistrationInvite.filter(.token_hash == ")
@@ -214,14 +231,123 @@ impl InviteStore {
             .raw(", used_by: ")
             .str(handle)
             .raw(" })");
-        if !self.db.write_rows(&q).await?.into_objects().is_empty() {
-            return Ok(true);
+        match self.db.write_rows(&q).await.map(|r| r.into_objects().len()) {
+            Ok(1..) => Ok(Some(claim)),
+            // Unusable (expired, revoked, or used before claims existed):
+            // drop our claim, which guards nothing.
+            Ok(_) => {
+                self.drop_claim(claim.id).await?;
+                Ok(None)
+            }
+            // Failed, or perhaps landed with its reply lost. Either way no
+            // account is made under this claim, so drop it rather than
+            // leave it beside an invite that may still read as unused. (Had
+            // the update landed, the invite reads as used and a later claim
+            // finds it so.) Should the drop fail too, the lease frees it.
+            Err(e) => {
+                if let Err(d) = self.drop_claim(claim.id).await {
+                    tracing::warn!(
+                        error = %d,
+                        "could not drop an invite claim after a failed update; \
+                         its lease will free it"
+                    );
+                }
+                Err(e)
+            }
         }
-        // Unusable (expired, revoked, or used before claims existed): drop
-        // our claim, which guards nothing.
-        let drop = Ql::new("InviteClaim.get(").uint(claim_id).raw(").delete()");
-        self.db.execute(&drop).await?;
-        Ok(false)
+    }
+
+    /// Create the claim on `token_hash` for `handle`, taking over an
+    /// abandoned one. `None` if a live claim holds it, or an expired one
+    /// that is not abandoned (see [`InviteStore::abandoned`]).
+    ///
+    /// Race-safe as in `Claims::claim`: the winner is decided only by the
+    /// `@unique` create, never by the read or the delete. A taker deletes
+    /// the expired claim **by id**, so it can never delete a fresh claim
+    /// another taker created meanwhile (that delete is `NotFound`, treated
+    /// as "someone else deleted it"); of any number of takers, exactly one
+    /// create then succeeds, and the rest conflict, read the new claim, find
+    /// it live and lose.
+    async fn take_claim(
+        &self,
+        token_hash: &str,
+        handle: &str,
+        now: i64,
+    ) -> Result<Option<InviteClaim>, DbError> {
+        let create = Ql::new("InviteClaim.create({ token_hash: ")
+            .str(token_hash)
+            .raw(", handle: ")
+            .str(handle)
+            .raw(", claimed_at: ")
+            .unix_seconds(now)
+            .raw(", expires_at: ")
+            .unix_seconds(now + INVITE_CLAIM_LEASE_SECS)
+            .raw(" })");
+        // Several passes: another follows a takeover, a holder that dropped
+        // its claim between our create and our read, or a create aborted by
+        // a concurrent one (`Contended`: nothing written) before that one is
+        // visible.
+        for _ in 0..CLAIM_PASSES {
+            match self.db.write_one::<Exists>(&create).await {
+                Ok(row) => {
+                    return Ok(Some(InviteClaim {
+                        id: row.id,
+                        token_hash: token_hash.to_owned(),
+                        handle: handle.to_owned(),
+                    }));
+                }
+                Err(DbError::Conflict(_) | DbError::Contended(_)) => {}
+                Err(e) => return Err(e),
+            }
+            let q = Ql::new("InviteClaim.filter(.token_hash == ")
+                .str(token_hash)
+                .raw(")");
+            let Some(held) = self.db.fetch::<ClaimRow>(&q).await?.into_iter().next() else {
+                continue;
+            };
+            let held_until = OffsetDateTime::parse(&held.data.expires_at, &Rfc3339)
+                .map_err(|e| DbError::Decode(format!("invite claim expiry: {e}")))?
+                .unix_timestamp();
+            if held_until > now || !self.abandoned(token_hash, &held.data.handle, now).await? {
+                return Ok(None);
+            }
+            let delete = Ql::new("InviteClaim.get(").uint(held.id).raw(").delete()");
+            match self.db.execute(&delete).await {
+                // Deleted (or being deleted) by a concurrent taker.
+                Ok(()) | Err(DbError::NotFound(_) | DbError::Contended(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        // Never decided: neither ours nor a visible holder's. Fail closed.
+        Err(DbError::Contended(
+            "invite claim stayed contended".to_owned(),
+        ))
+    }
+
+    /// Whether an expired claim by `handle` on `token_hash` was abandoned:
+    /// the invite is still usable at `now` (its holder never marked it, or
+    /// marked it and released it) and no account has `handle` (it made
+    /// none). A claim whose invite reads used is the record of a
+    /// registration, and is kept. An account with `handle` made some other
+    /// way also keeps it, conservatively: the owner then revokes the invite.
+    async fn abandoned(&self, token_hash: &str, handle: &str, now: i64) -> Result<bool, DbError> {
+        if self.find_usable(token_hash, now).await?.is_none() {
+            return Ok(false);
+        }
+        let q = Ql::new("User.filter(.handle == ")
+            .str(handle)
+            .raw(").limit(1)");
+        Ok(self.db.fetch::<Exists>(&q).await?.is_empty())
+    }
+
+    /// Delete exactly the claim `id` (a claim is never updated, and a later
+    /// one has another id). Already gone is fine.
+    async fn drop_claim(&self, id: u64) -> Result<(), DbError> {
+        let drop = Ql::new("InviteClaim.get(").uint(id).raw(").delete()");
+        match self.db.execute(&drop).await {
+            Ok(()) | Err(DbError::NotFound(_)) => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     /// Up to `limit` invites usable at `now`, in no particular order.
@@ -272,18 +398,20 @@ impl InviteStore {
     }
 
     /// Undo [`InviteStore::claim`] after the account could not be created,
-    /// so the invite stays usable. Only the claim's holder calls this. The
-    /// invite is marked unused before the claim is dropped, so a new claim
-    /// always finds it unused; the `used == true` guard is idempotent.
-    pub async fn release(&self, token_hash: &str) -> Result<(), DbError> {
+    /// so the invite stays usable. Only the claim's holder calls this, with
+    /// the claim it was given. The invite is marked unused before the claim
+    /// is dropped, so a new claim always finds it unused; the `used == true`
+    /// guard is idempotent. The claim is dropped by id, so a release can
+    /// never drop a later registration's claim. If the drop fails, the
+    /// claim's lease frees the invite.
+    pub async fn release(&self, claim: &InviteClaim) -> Result<(), DbError> {
         let q = Ql::new("RegistrationInvite.filter(.token_hash == ")
-            .str(token_hash)
-            .raw(" && .used == true).update({ used: false })");
+            .str(&claim.token_hash)
+            .raw(" && .used == true && .used_by == ")
+            .str(&claim.handle)
+            .raw(").update({ used: false })");
         self.db.write_rows(&q).await?;
-        let drop = Ql::new("InviteClaim.filter(.token_hash == ")
-            .str(token_hash)
-            .raw(").delete()");
-        self.db.execute(&drop).await
+        self.drop_claim(claim.id).await
     }
 }
 

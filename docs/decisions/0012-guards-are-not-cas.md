@@ -96,8 +96,35 @@ grant anything (a role landing on an admin who was just disabled).
   reads it, and it enrolls exactly the secret its caller proved a code for.
 - **Account invites** (`InviteClaim`, `@unique` on the token hash). Only
   the claim's creator marks the invite used. Release marks the invite
-  unused, then deletes the claim. Registration's in-process lock stays,
-  for its release-before-anyone-looks ordering.
+  unused, then deletes the claim **by id**, so it never drops a later
+  claim. Registration's in-process lock stays, for its
+  release-before-anyone-looks ordering.
+  - **A lease.** A claim left beside an invite still `used == false` (the
+    holder's update failed, it crashed between the claim and the update,
+    or its release could not delete the claim) would make every later
+    claim conflict, while the invite still listed as usable. So a claim
+    carries `expires_at`, 120 s after it is made (as for epoch claims: the
+    holder's one guarded update times out after 10 s, and the account is
+    created in the next statement). On `Conflict` the claimer reads the
+    claim; if its lease has passed, the invite is still usable and no
+    account has the claim's handle, it was abandoned: the claimer deletes
+    it by id and claims again. A claim whose invite reads used is the
+    record of a registration and is never taken over. An account with the
+    claim's handle, made some other way, also keeps it (conservatively;
+    the owner revokes the invite).
+  - **Why the takeover is race-safe.** As in step 5 above: the winner is
+    decided only by the `@unique` create, never by the read, the checks or
+    the delete. A taker deletes the expired claim by its id, so it cannot
+    delete a fresh claim another taker made meanwhile (that delete is
+    `NotFound`); of any number of takers exactly one create succeeds, and
+    the rest conflict, read the new claim, find it live and lose. The old
+    holder cannot still be writing: its update would have landed or timed
+    out well inside the lease, and a landed update makes the invite read
+    used, which forbids the takeover.
+  - **A failed update** (an error, perhaps with the write landed and its
+    reply lost) drops the claim before returning; no account is made under
+    it. Had the update landed, the invite reads used and the next claimer
+    finds it so.
 - **Replay ledger** (`replay/ledger.rs`). Rows are now never updated.
   - **Expired-row reuse:** §4.5 permits reusing a nonce after its window.
     The ledger now persists the clock (at least `now`), deletes the
@@ -113,7 +140,13 @@ grant anything (a role landing on an admin who was just disabled).
     gone.
   - **Clock:** `ReplayClock` holds one row per persisted value
     (`replay@{secs}`); the clock is the highest, and rows below it are
-    pruned. Before, two writers could pass `high_water < X` and leave the
+    pruned. rhypedb has no sort, and reading with `offset` pages while a
+    prune deletes rows can skip the highest (the rest shift into a page
+    already read). Each statement reads a snapshot, and every snapshot
+    holds the highest row, so the read raises a floor instead: a page
+    that is not full holds every row above the floor; a full one raises
+    the floor to its maximum, logs that pruning lags, and the next
+    statement reads only rows above it. Before, two writers could pass `high_water < X` and leave the
     lower value. The first deployments' single `"replay"` row is read like
     any other row and pruned once a higher value is written, so no
     migration step is needed.
@@ -147,9 +180,10 @@ grant anything (a role landing on an admin who was just disabled).
 - **A crash mid-change blocks that admin's next credential change** for up
   to 120 s, until the lease expires.
 - **An invite claimed by a request that crashed before marking it used**
-  stays unclaimable while it still lists as usable. An owner revokes it
-  and issues another, as for a registration that crashed after the claim
-  before this change.
+  is unclaimable for up to 120 s, until its claim's lease ends.
+- **`InviteClaim.expires_at` needs no migration:** the type is new in this
+  change and has never been deployed, so the field is part of it from the
+  start.
 - **New code that needs a conditional write follows the pattern.** Code
   review rejects a guard used as compare-and-set. Example: a
   revision-guarded PATCH (`If-Match: rev`) claims `{object}:{rev + 1}`
