@@ -344,6 +344,11 @@ impl Reader<'_> {
                 return;
             }
         };
+        if cmd.lacks_object_data() {
+            let e = WsError::bad_request(format!("{} needs data, an object", cmd.kind));
+            self.error(Some(&cmd.id), &e);
+            return;
+        }
         match cmd.kind.as_str() {
             "ping" => {
                 let now = self.hub.now();

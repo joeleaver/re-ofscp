@@ -5,6 +5,7 @@
 mod common;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -27,10 +28,12 @@ enum Answer {
 }
 
 /// An authorizer the test steers: per-topic answers (unknown topics are
-/// unreadable), and a pause that holds every check until lifted.
+/// unreadable), a pause that holds every check until lifted, and a count
+/// of the checks made.
 struct Topics {
     answers: Mutex<HashMap<String, Answer>>,
     paused: watch::Sender<bool>,
+    checks: AtomicUsize,
 }
 
 impl Topics {
@@ -38,6 +41,7 @@ impl Topics {
         Arc::new(Self {
             answers: Mutex::new(HashMap::new()),
             paused: watch::channel(false).0,
+            checks: AtomicUsize::new(0),
         })
     }
 
@@ -55,6 +59,7 @@ impl Topics {
 
 impl TopicAuthorizer for Topics {
     fn check<'a>(&'a self, _actor: &'a Actor, topic: &'a str) -> AccessFuture<'a> {
+        self.checks.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
             let mut paused = self.paused.subscribe();
             let _ = paused.wait_for(|p| !*p).await;
@@ -321,6 +326,69 @@ async fn the_subscription_cap_applies() {
     );
 }
 
+/// Only readable channels count towards the cap (10 here), and a
+/// `subscribe` past it subscribes none of them, answered by the one
+/// `subscription_limit` error: no `subscribed`, no `not_found` (§7.1
+/// *Subscriptions*).
+#[tokio::test]
+async fn only_readable_channels_count_towards_the_cap() {
+    let (p, topics) = setup().await;
+    let readable: Vec<String> = (0..12).map(|i| format!("chn_{i}")).collect();
+    for c in &readable {
+        topics.set(c, Answer::Readable);
+    }
+    let mut c = p.alice("10.0.0.1").await;
+    c.command("subscribe", json!({"channels": readable[..9]}))
+        .await;
+    assert_eq!(c.event().await["type"], "subscribed");
+    // Room for one, three listed (within the whole cap), one readable:
+    // the one fits (lost-conn/ofscp#29).
+    let id = c
+        .command(
+            "subscribe",
+            json!({"channels": [readable[9], "chn_x", "chn_y"]}),
+        )
+        .await;
+    let ack = c.event().await;
+    assert_eq!(
+        (&ack["type"], &ack["data"]["channels"]),
+        (&json!("subscribed"), &json!([readable[9]]))
+    );
+    let e = c.event().await;
+    assert_eq!(e["correlationId"], id);
+    assert_eq!(e["data"]["details"]["channels"], json!(["chn_x", "chn_y"]));
+    // At the cap, a channel already subscribed may be listed again.
+    c.command("subscribe", json!({"channels": [readable[0]]}))
+        .await;
+    assert_eq!(c.event().await["data"]["channels"], json!([readable[0]]));
+    // Past it, all or none: neither the readable one, nor a not_found.
+    c.command("unsubscribe", json!({"channels": [readable[0]]}))
+        .await;
+    assert_eq!(c.event().await["type"], "unsubscribed");
+    let id = c
+        .command(
+            "subscribe",
+            json!({"channels": [readable[10], readable[11], "chn_x"]}),
+        )
+        .await;
+    let e = c.event().await;
+    assert_valid("error.json", &e);
+    assert_eq!(
+        (&e["correlationId"], &e["data"]["code"]),
+        (&json!(id), &json!("subscription_limit"))
+    );
+    let ping = c.command("ping", json!({})).await;
+    assert_eq!(
+        c.event().await["correlationId"],
+        ping,
+        "nothing else was sent"
+    );
+    // Nothing of it was kept: one of them alone still fits.
+    c.command("subscribe", json!({"channels": [readable[10]]}))
+        .await;
+    assert_eq!(c.event().await["data"]["channels"], json!([readable[10]]));
+}
+
 #[tokio::test]
 async fn the_periodic_recheck_catches_unreported_changes() {
     let mut config = fast_config();
@@ -335,4 +403,58 @@ async fn the_periodic_recheck_catches_unreported_changes() {
     let e = c.event().await;
     assert_eq!(e["data"]["reason"], "access_revoked");
     sweep.abort();
+}
+
+/// Copies of one channel are one channel: no per-command count limit
+/// (§7.1 names none).
+#[tokio::test]
+async fn duplicate_channels_are_counted_once() {
+    let (p, topics) = setup().await;
+    topics.set("chn_1", Answer::Readable);
+    let mut c = p.alice("10.0.0.1").await;
+    c.command("subscribe", json!({"channels": vec!["chn_1"; 501]}))
+        .await;
+    let ack = c.event().await;
+    assert_eq!(
+        (&ack["type"], &ack["data"]["channels"]),
+        (&json!("subscribed"), &json!(["chn_1"]))
+    );
+}
+
+/// More distinct channels than the whole cap (10 here) could not fit even
+/// if all were readable: `subscription_limit` at once, without checking
+/// any access (lost-conn/ofscp#29).
+#[tokio::test]
+async fn more_channels_than_the_cap_are_refused_unchecked() {
+    let (p, topics) = setup().await;
+    let channels: Vec<String> = (0..11).map(|i| format!("chn_{i}")).collect();
+    for c in &channels {
+        topics.set(c, Answer::Readable);
+    }
+    let mut c = p.alice("10.0.0.1").await;
+    let id = c.command("subscribe", json!({"channels": channels})).await;
+    let e = c.event().await;
+    assert_valid("error.json", &e);
+    assert_eq!(
+        (&e["correlationId"], &e["data"]["code"]),
+        (&json!(id), &json!("subscription_limit"))
+    );
+    assert_eq!(topics.checks.load(Ordering::SeqCst), 0);
+}
+
+/// An `unsubscribe` may list any number of channels, subscribed or not.
+#[tokio::test]
+async fn an_unsubscribe_of_many_is_acknowledged() {
+    let (p, _topics) = setup().await;
+    let channels: Vec<String> = (0..600).map(|i| format!("chn_{i}")).collect();
+    let mut c = p.alice("10.0.0.1").await;
+    let id = c
+        .command("unsubscribe", json!({"channels": channels}))
+        .await;
+    let e = c.event().await;
+    assert_eq!(
+        (&e["type"], &e["correlationId"]),
+        (&json!("unsubscribed"), &json!(id))
+    );
+    assert_eq!(e["data"]["channels"], json!(channels));
 }

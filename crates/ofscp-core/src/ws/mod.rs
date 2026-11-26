@@ -8,8 +8,12 @@
 //! those for now: calls are a later wave.
 //!
 //! Encoding is strict where decoding is lenient (docs/decisions/0016): a
-//! frame is always sent with `ts` and `data`, which spec main's
-//! `ws/envelope.json` requires, but one received without them is still read.
+//! frame is always sent with `ts` and an object `data`, so it validates
+//! against both `ws/command-envelope.json` and `ws/event-envelope.json`.
+//! A received frame needs only `id` and `type` in its envelope; its `ts` is
+//! read when it is a valid RFC 3339 time and ignored otherwise, since
+//! providers must ignore a command's `ts` (§7.1, lost-conn/ofscp#27). The
+//! `data` of a standard type must be an object (§7.1).
 
 mod command;
 mod event;
@@ -35,10 +39,11 @@ pub const CLOSE_REVOKED: u16 = 4003;
 pub struct Envelope<T> {
     /// Unique within the connection.
     pub id: String,
-    /// When it was sent. Spec main's envelope requires it on every frame,
-    /// so [`Envelope::encode`] refuses a frame without it. A received frame
-    /// may lack it: lost-conn/ofscp#27 (open) makes it optional on commands,
-    /// and tells providers to ignore its value there.
+    /// When it was sent. Events must carry it (`ws/event-envelope.json`),
+    /// so [`Envelope::encode`] refuses a frame without it, commands
+    /// included. A received frame may lack it, and one whose `ts` is not an
+    /// RFC 3339 time reads as `None`: on commands it is optional and
+    /// providers must ignore its value (§7.1, lost-conn/ofscp#27).
     pub ts: Option<Timestamp>,
     /// The `id` of the command this answers.
     pub correlation_id: Option<String>,
@@ -61,11 +66,13 @@ pub enum DecodeError {
     /// It is not a JSON envelope.
     #[error("not an OFSCP frame: {0}")]
     Envelope(#[source] serde_json::Error),
-    /// Its envelope was read, but its `data` does not fit its `type`.
+    /// Its envelope was read, but its `data` does not fit its `type`: for
+    /// a standard type, a `data` that is missing, not an object, or not of
+    /// that type's shape.
     ///
     /// A provider answers a command like this with an `error`
     /// (`bad_request`) whose `correlationId` is `id`, and keeps the
-    /// connection open (§7.1, lost-conn/ofscp#27); for `authenticate` it
+    /// connection open (§7.1); for `authenticate` it
     /// answers `unauthorized` and closes 4001 instead. A client that cannot
     /// read an event keeps this to itself: it never sends a reply.
     #[error("bad data for {kind} {id}: {source}")]
@@ -85,7 +92,8 @@ pub enum DecodeError {
 /// Why a frame could not be written.
 #[derive(Debug, thiserror::Error)]
 pub enum EncodeError {
-    /// The frame has no `ts`, which spec main requires on every frame.
+    /// The frame has no `ts`, which every event needs (and which this
+    /// crate also sends on commands, where providers ignore it).
     #[error("a frame needs a ts")]
     MissingTs,
     /// Its body did not serialize.
@@ -94,14 +102,15 @@ pub enum EncodeError {
 }
 
 /// The envelope as received, before `data` is decoded. Only `id` and
-/// `type` are required here; a missing `data` reads as `null`.
+/// `type` are required here; a missing `data` reads as `null` (which only
+/// an unknown type accepts), and a `ts` that is not a time reads as `None`.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawFrame {
     id: String,
     #[serde(rename = "type")]
     kind: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_ts")]
     ts: Option<Timestamp>,
     #[serde(default)]
     correlation_id: Option<String>,
@@ -110,7 +119,8 @@ struct RawFrame {
 }
 
 /// The envelope as sent: `id`, `type`, `ts` and `data` always present, as
-/// spec main's `ws/envelope.json` requires.
+/// `ws/event-envelope.json` requires (and `ws/command-envelope.json`
+/// allows).
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct OutFrame<'a> {
@@ -153,8 +163,8 @@ impl<T: Body> Envelope<T> {
     /// The frame's text, to send. It always carries `ts` (so `ts` must be
     /// set) and `data`. A `data` of `null`, which only an unknown frame
     /// received without one can hold, is written as `{}`: an object is the
-    /// one form every envelope schema accepts, at spec main and in
-    /// lost-conn/ofscp#27.
+    /// one form every envelope schema accepts (the base, command and event
+    /// envelopes).
     pub fn encode(&self) -> Result<String, EncodeError> {
         let ts = self.ts.ok_or(EncodeError::MissingTs)?;
         let (kind, data) = self.body.encode()?;
@@ -211,7 +221,7 @@ macro_rules! ws_body {
         impl $crate::ws::Body for $name {
             fn decode(kind: &str, data: serde_json::Value) -> Result<Self, serde_json::Error> {
                 Ok(match kind {
-                    $( $kind => Self::$variant(serde_json::from_value($crate::ws::known_data(data))?), )+
+                    $( $kind => Self::$variant(serde_json::from_value($crate::ws::object_data(data)?)?), )+
                     other => Self::Other { kind: other.to_owned(), data },
                 })
             }
@@ -227,10 +237,31 @@ macro_rules! ws_body {
 }
 pub(crate) use ws_body;
 
-/// `data` as an object: one that is absent or `null` is empty. Standard
-/// types decode through it (a `ping` or `pong` may leave its `data` out),
-/// and every frame is encoded through it.
-pub(crate) fn known_data(data: serde_json::Value) -> serde_json::Value {
+/// The `data` of a standard type, which must be an object (§7.1): one
+/// that is missing, `null` or of another JSON type is refused, so a
+/// provider answers the command with `bad_request` (an array would
+/// otherwise deserialize into a struct field by field).
+pub(crate) fn object_data(data: serde_json::Value) -> Result<serde_json::Value, serde_json::Error> {
+    match data {
+        serde_json::Value::Object(_) => Ok(data),
+        _ => Err(serde::de::Error::custom("data must be an object")),
+    }
+}
+
+/// A received `ts`: the time it names, or `None` when it is absent, `null`
+/// or not an RFC 3339 string. Providers must ignore a command's `ts`
+/// (§7.1), so a bad one never fails the frame.
+fn lenient_ts<'de, D>(deserializer: D) -> Result<Option<Timestamp>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).ok())
+}
+
+/// `data` as sent: one that is `null` (only an unknown frame received
+/// without `data` holds one) is written as `{}`.
+fn known_data(data: serde_json::Value) -> serde_json::Value {
     match data {
         serde_json::Value::Null => serde_json::Value::Object(serde_json::Map::new()),
         data => data,

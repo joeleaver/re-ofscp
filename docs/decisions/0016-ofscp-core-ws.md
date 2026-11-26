@@ -13,11 +13,22 @@ brings the §7.1 envelope, the commands a client sends and the events a
 provider sends into the shared core, so that Postrinch and this provider
 read and write the same frames.
 
-Spec main (`187acb9`) has `schemas/v0.1/ws/envelope.json` require `id`,
-`type`, `ts` and `data` on every frame. lost-conn/ofscp#27 (open) splits it:
-a base envelope with `ts` optional, a command envelope (`data` an object,
-`ts` optional and ignored by providers) and an event envelope (`ts`
-required). `data` stays required in both.
+lost-conn/ofscp#27 (merged; spec main `24af593`) settled the §7.1
+envelope. `schemas/v0.1/ws/envelope.json` is now the base every frame
+uses, requiring `id`, `type` and `data`. Two direction envelopes build on
+it:
+
+- `ws/command-envelope.json` (client→server): `data` must be an object;
+  `ts` is optional, and a provider must not reject a command for lacking
+  it and must ignore its value. The spec's command samples now leave `ts`
+  out, and `ws-command-ts-ignored.sample.json` sends one that is not a
+  time.
+- `ws/event-envelope.json` (server→client): `ts` is required, an RFC 3339
+  time.
+
+`ping` and `pong`, which either party sends, use the base envelope (a
+provider includes `ts` on its own). `ping.json` now requires an object
+`data`.
 
 ## Decision
 
@@ -37,27 +48,37 @@ required). `data` stays required in both.
 - **A bad `data` keeps its envelope.** `DecodeError::Data` carries the
   frame's `id`, `kind` and `correlationId`, so a provider can answer with
   `error` whose `correlationId` is the command's `id` (§7.1).
+- **A standard type needs an object `data`.** A frame of a standard type
+  whose `data` is missing, `null`, an array or a scalar fails with
+  `DecodeError::Data`, before serde sees it (serde would read a struct
+  from an array field by field). §7.1 requires an object on every
+  standard command, and a provider answers anything else with
+  `bad_request`; every event schema requires one too. Before #27 a `ping`
+  or `pong` without `data` decoded as empty; it no longer does.
 - **`KINDS` track the spec.** `tests/ws_roundtrip.rs` compares
   `Command::KINDS` and `Event::KINDS` with `WsCommandType` and
   `WsEventType` in `schemas/v0.1/ws/types.json`, leaving out only the
   `call.*` events (a later wave).
 - **Encoding is strict, decoding is lenient.**
   - `Envelope::encode` always writes `id`, `type`, `ts` and `data`, so every
-    frame we send validates against spec main's envelope, and also against
-    both envelopes of #27 (which tells providers to ignore a command's
-    `ts`, so sending it is harmless).
+    frame we send validates against the base, command and event envelopes
+    alike. Sending `ts` on a command is harmless, since providers ignore
+    it, and it keeps one encoder for both directions (and for `ping` and
+    `pong`, which a provider must send with `ts`).
   - The crate reads no clock, so `ts` is the caller's: `encode` fails with
     `EncodeError::MissingTs` when it is `None` rather than inventing a time.
   - A `data` of `null` (only an unknown frame received without `data`, or
     with `null`, can hold one) is written as `{}`. An object is the one form
-    valid under every envelope schema, at main and in #27; main also
-    allows `null`, but #27's command envelope does not.
-  - Decoding requires only `id` and `type`. A missing `ts` reads as `None`
-    (legal on commands under #27), and a missing `data` reads as `null`,
-    which a standard type decodes as `{}` (`ping` and `pong`).
+    valid under every envelope schema: the base envelope requires `data`,
+    and the command envelope requires an object.
+  - Decoding requires only `id` and `type` in the envelope. A `ts` that is
+    missing, `null` or not an RFC 3339 string reads as `None` rather than
+    failing the frame, because a provider must ignore a command's `ts`
+    whatever it holds. (On an event a bad `ts` is the sender's fault; a
+    client reading it as `None` loses nothing it could act on.) A missing
+    `data` reads as `null`, which only an unknown type accepts.
   - So an unknown frame round-trips exactly when it carried `ts` and an
-    object `data`, which is every frame valid at spec main. One without
-    them is re-sent in the valid form instead.
+    object `data`. One without them is re-sent in the valid form instead.
 - **Fields the schemas leave out.** `Subscribed.truncated` is optional: the
   §7.1 resume prose recommends it, though `subscribed.json` does not list
   it. `Authenticate.timestamp` is the exact signed string, not a parsed
@@ -71,35 +92,57 @@ required). `data` stays required in both.
   re-encode as they came.
 - **Conformance.** `tests/ws_roundtrip.rs` decodes every `ws-*` sample but
   the call signalling as a known command or event, re-encodes it to the
-  same JSON, and validates the result against `ws/envelope.json` and the
-  schema of its `type` (with `jsonschema`, a dev-dependency only). A
-  listing test fails when the spec gains a `ws-*` sample no list covers.
+  same JSON, and validates the result against the envelope of its
+  direction and the schema of its `type` (with `jsonschema`, a
+  dev-dependency only):
+  - commands against `envelope.json` and `command-envelope.json`, events
+    against `envelope.json` and `event-envelope.json`, and `ping`/`pong`
+    (decoded both as a command and as an event) against all three;
+  - `ts` is compared only where the sample has a valid one. A command
+    sample without one (or with `ws-command-ts-ignored`'s) decodes with
+    `ts` = `None` and is encoded with a fixed time; the rest of the frame
+    must still match exactly;
+  - the spec's invalid `ws-*` frames are checked as well: no `id` is
+    `DecodeError::Envelope`, a `data` that is not an object is
+    `DecodeError::Data` with the `id` to answer, and an event without `ts`
+    is read but cannot be encoded (`MissingTs`). Each must still fail its
+    schema, so the validator stays live;
+  - listing tests fail when the spec gains a `ws-*` sample or invalid
+    frame no list covers.
 
-## Answered by the OFSCP oracle (lost-conn/ofscp#27, head 194b3b2)
+## The rules of lost-conn/ofscp#27 (merged, spec main `24af593`)
 
-- **`ts` is always sent.** On commands a provider must not reject a
-  missing `ts` and must ignore its value, so our lenient decode stands.
-  If #27's command samples leave `ts` out, they decode but no longer
-  re-encode byte-for-byte; the roundtrip test must then compare `ts` only
-  where the sample has one, not drop the check.
-- **The `data` key is always present, and `{}` is always safe.** A re-sent
-  unknown frame passes a non-null `data` through untouched; only `null`
-  (or no `data`) becomes `{}`. That is what `known_data` does.
+These were first answered by the OFSCP oracle on the open PR; they are
+now spec text (§2.3, §7.1 *WebSocket message envelope*, *WebSocket message
+types*, *Authentication*).
+
+- **A command's `ts` is optional and ignored.** A provider must not reject
+  a command for lacking `ts`, and must ignore its value. We always send
+  one; we read any (see the lenient decode above).
+- **`data` is required, and an object on every standard command.** A
+  re-sent unknown frame passes a non-null `data` through untouched; only
+  `null` (or no `data`) becomes `{}`, when `Envelope::encode` writes it.
 - **How a provider answers bad frames** (the server, decision 0010, follows
-  these; `tests/ws.rs` covers each):
-  - a standard command whose `data` fails its schema: `error`
+  these; `crates/re-ofscp-server/tests/ws.rs` covers each):
+  - a standard command other than `authenticate` whose `data` does not
+    match its schema (an object missing, or of the wrong shape): `error`
     `bad_request`, `correlationId` the command's `id`, connection kept;
-  - a malformed `authenticate`: `error` `unauthorized` (401), then close
-    4001 (the server answered `bad_request` before this change);
+  - a malformed `authenticate` (its `data` included): `error`
+    `unauthorized` (401), then close 4001;
   - a command with no `id`: after sign-in, `bad_request` without a
     `correlationId`; before it, close 4001;
-  - a standard command the provider does not implement: `bad_request`;
-    only nonstandard types are ignored (§2.3).
+  - a standard command the provider does not implement: `bad_request`
+    with `correlationId`; only nonstandard types are ignored (§2.3).
 - **A client never replies to an event it cannot read.** A malformed
   known event is a local `DecodeError::Data`, not a frame to answer.
 
 ## Consequences
 
 - `Envelope::encode` returns `EncodeError`, not `serde_json::Error`.
+- The #27 update changed behaviour, not signatures: `Envelope::decode` now
+  refuses a standard type whose `data` is not an object (a `ping` without
+  `data` included), and reads a `ts` that is not a time as `None` instead
+  of failing with `DecodeError::Envelope`. Postrinch, which pins this
+  crate, sees both on its next bump.
 - The server's WebSocket handler (decision 0010) still has its own frame
   types; moving it onto `ofscp_core::ws` is separate work.

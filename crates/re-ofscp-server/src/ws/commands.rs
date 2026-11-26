@@ -10,8 +10,10 @@
 //! be replayed), the replayed events, and then the live events kept
 //! meanwhile. Topics that are not readable, or do not exist, are refused
 //! together in one `not_found` error naming them, so a subscribe cannot
-//! tell a private channel from a missing one
-//! (docs/decisions/0010-websocket.md).
+//! tell a private channel from a missing one. The subscription cap counts
+//! only the readable channels, all or none: past it, nothing is subscribed
+//! and the one answer is `subscription_limit` (§7.1 *Subscriptions*,
+//! docs/decisions/0010-websocket.md).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -23,7 +25,7 @@ use tokio::sync::mpsc;
 
 use super::Hub;
 use super::protocol::{self, ACCESS_REVOKED, Command, ErrorEvent as _, MAX_ID_LEN, WsError};
-use super::registry::{ConnId, ConnShared, Ended};
+use super::registry::{ConnId, ConnShared, Ended, OverCap};
 use super::seams::TopicAccess;
 
 /// An authenticated connection, as its commands see it.
@@ -50,15 +52,13 @@ pub async fn run(session: Session, mut commands: mpsc::Receiver<Command>) {
 }
 
 /// The topics of a command, deduplicated in order, or why they are not
-/// acceptable.
-fn topics(channels: Vec<String>, cap: usize) -> Result<Vec<String>, WsError> {
+/// acceptable. There is no per-command count limit (§7.1 names none): the
+/// frame-size cap bounds a command, and `subscribe` is bounded by the
+/// subscription cap, counted after this dedupe
+/// ([`super::registry::Registry::hold_new`]).
+fn topics(channels: Vec<String>) -> Result<Vec<String>, WsError> {
     if channels.is_empty() {
         return Err(WsError::bad_request("channels must not be empty"));
-    }
-    if channels.len() > cap {
-        return Err(WsError::subscription_limit(format!(
-            "at most {cap} channels per connection"
-        )));
     }
     let mut seen = HashSet::new();
     let mut out = Vec::with_capacity(channels.len());
@@ -95,6 +95,13 @@ impl Session {
         self.send(e.to_event(Some(correlation), self.hub.now()));
     }
 
+    /// Answer a `subscribe` that would pass the subscription cap.
+    fn over_cap(&self, correlation: &str) {
+        let cap = self.hub.registry.limits().max_subscriptions;
+        let e = WsError::subscription_limit(format!("at most {cap} channels per connection"));
+        self.error(correlation, &e);
+    }
+
     async fn subscribe(&self, cmd: &Command) {
         let hub = &self.hub;
         let parsed = serde_json::from_value::<Subscribe>(cmd.data.clone())
@@ -104,18 +111,24 @@ impl Session {
                 )
             })
             .and_then(|d| {
-                let t = topics(d.channels, hub.registry.limits().max_subscriptions)?;
-                Ok((t, d.include, d.since.unwrap_or_default()))
+                Ok((topics(d.channels)?, d.include, d.since.unwrap_or_default()))
             });
         let (topics, include, since) = match parsed {
             Ok(p) => p,
             Err(e) => return self.error(&cmd.id, &e),
         };
         let include = include.map(|kinds| Arc::new(kinds.into_iter().collect::<HashSet<_>>()));
-        let Some(holds) = hub.registry.hold_new(self.id, &topics, include) else {
-            let cap = hub.registry.limits().max_subscriptions;
-            let e = WsError::subscription_limit(format!("at most {cap} channels per connection"));
-            return self.error(&cmd.id, &e);
+        // More distinct channels than the whole cap: they would not fit
+        // even if all were readable, so the answer is the limit, without
+        // checking any access. A list within the cap goes through the
+        // readable-only count below, even if it is longer than the room
+        // left (§7.1 *Subscriptions*; the early answer is the MAY clause of
+        // lost-conn/ofscp#29, in review; docs/decisions/0010-websocket.md).
+        let holds = match hub.registry.hold_new(self.id, &topics, include.clone()) {
+            Some(Ok(holds)) => holds,
+            Some(Err(OverCap)) => return self.over_cap(&cmd.id),
+            // The connection is gone.
+            None => return,
         };
         let mut granted = Vec::new();
         let mut truncated = HashSet::new();
@@ -157,7 +170,7 @@ impl Session {
             }
         }
         let now = hub.now();
-        let acked = hub.registry.grant(self.id, &granted, |live| {
+        let granted_now = hub.registry.grant(self.id, &granted, include, |live| {
             let ack = Subscribed {
                 channels: live.to_vec(),
                 truncated: live
@@ -173,6 +186,18 @@ impl Session {
             }
             texts
         });
+        if !revoked.is_empty() {
+            let data = Unsubscribed {
+                channels: revoked,
+                reason: Some(ACCESS_REVOKED.to_owned()),
+            };
+            self.send(protocol::event("unsubscribed", None, data.to_value(), now));
+        }
+        // Past the cap: nothing subscribed, and the one answer is the limit
+        // (no `not_found` for the refused channels, §7.1).
+        let Ok(acked) = granted_now else {
+            return self.over_cap(&cmd.id);
+        };
         // Granted, but ended by a re-check before it could be
         // acknowledged: refused like any other unreadable channel, so the
         // command still gets its answer (an existing one was also told
@@ -183,13 +208,6 @@ impl Session {
                 .map(|(t, _)| t)
                 .filter(|t| !acked.contains(t)),
         );
-        if !revoked.is_empty() {
-            let data = Unsubscribed {
-                channels: revoked,
-                reason: Some(ACCESS_REVOKED.to_owned()),
-            };
-            self.send(protocol::event("unsubscribed", None, data.to_value(), now));
-        }
         if !refused.is_empty() {
             let e = WsError::not_found("no such channel, or it cannot be read")
                 .with_detail("channels", json!(refused));
@@ -244,7 +262,7 @@ impl Session {
             .map_err(|_| {
                 WsError::bad_request("unsubscribe needs channels, an array of channel ids")
             })
-            .and_then(|d| topics(d.channels, hub.registry.limits().max_subscriptions));
+            .and_then(|d| topics(d.channels));
         let topics = match parsed {
             Ok(t) => t,
             Err(e) => return self.error(&cmd.id, &e),
@@ -270,16 +288,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn topics_are_deduplicated_and_bounded() {
-        let t = topics(vec!["a".into(), "b".into(), "a".into()], 5).unwrap();
+    fn topics_are_deduplicated_and_checked() {
+        let t = topics(vec!["a".into(), "b".into(), "a".into()]).unwrap();
         assert_eq!(t, ["a", "b"]);
-        assert_eq!(topics(vec![], 5).unwrap_err().code, "bad_request");
+        // No count limit: many copies of one channel are one topic.
+        assert_eq!(topics(vec!["a".into(); 1000]).unwrap(), ["a"]);
+        assert_eq!(topics(vec![]).unwrap_err().code, "bad_request");
+        assert_eq!(topics(vec![String::new()]).unwrap_err().code, "bad_request");
         assert_eq!(
-            topics(vec!["a".into(); 6], 5).unwrap_err().code,
-            "subscription_limit"
-        );
-        assert_eq!(
-            topics(vec![String::new()], 5).unwrap_err().code,
+            topics(vec!["x".repeat(MAX_ID_LEN + 1)]).unwrap_err().code,
             "bad_request"
         );
     }

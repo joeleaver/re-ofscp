@@ -195,6 +195,24 @@ async fn failed_handshakes_close_4001() {
         (4001, &json!("unauthorized"), &json!(401))
     );
     assert_eq!(events[0]["correlationId"], id);
+
+    // So is one whose data is not an object, even an array serde could
+    // read field by field (§7.1).
+    for data in [json!([ALICE, KEY_ID, "t", "s"]), Value::Null] {
+        let mut c = p.client("10.0.0.1").await;
+        c.event().await;
+        let id = c.command("authenticate", data.clone()).await;
+        let (code, events) = c.closed().await;
+        assert_eq!(
+            (
+                code,
+                &events[0]["data"]["code"],
+                &events[0]["correlationId"]
+            ),
+            (4001, &json!("unauthorized"), &json!(id)),
+            "{data}"
+        );
+    }
 }
 
 /// An `authenticate` captured from one connection is worthless on another:
@@ -291,6 +309,82 @@ async fn client_pings_are_answered_with_pongs() {
     assert_valid("pong.json", &pong);
     assert_eq!(pong["type"], "pong");
     assert_eq!(pong["correlationId"], "cli_ping");
+}
+
+/// A command's `ts` is optional, and its value is ignored: a provider must
+/// not reject a command for lacking it, nor for what it holds (§7.1).
+#[tokio::test]
+async fn a_command_ts_is_optional_and_ignored() {
+    let p = provider().await;
+    let mut c = p.alice("10.0.0.1").await;
+    let no_ts = json!({"id": "cli_p1", "type": "ping", "data": {}});
+    assert_valid("command-envelope.json", &no_ts);
+    for (i, ts) in [
+        None,
+        Some(json!("not a timestamp")),
+        Some(json!(5)),
+        Some(Value::Null),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = format!("cli_ts{i}");
+        let mut ping = json!({"id": id, "type": "ping", "data": {}});
+        if let Some(ts) = &ts {
+            ping["ts"] = ts.clone();
+        }
+        c.send_raw(&ping.to_string()).await;
+        let pong = c.event().await;
+        assert_eq!(
+            (&pong["type"], &pong["correlationId"]),
+            (&json!("pong"), &json!(id)),
+            "{ts:?}"
+        );
+        assert_valid("pong.json", &pong);
+    }
+    // A subscribe is answered as usual (here not_found: no channels exist),
+    // not refused as malformed.
+    let mut sub = spec_json("ws-subscribe.sample.json");
+    assert!(sub.get("ts").is_none());
+    sub["ts"] = json!("yesterday");
+    c.send_raw(&sub.to_string()).await;
+    let e = c.event().await;
+    assert_eq!(
+        (&e["correlationId"], &e["data"]["code"]),
+        (&sub["id"], &json!("not_found"))
+    );
+}
+
+/// `data` must be an object on every standard command (§7.1): one missing,
+/// `null` or of another type gets `bad_request` with the command's id, and
+/// the connection stays open. An unknown type is ignored whatever it holds.
+#[tokio::test]
+async fn standard_commands_need_object_data() {
+    let p = provider().await;
+    let mut c = p.alice("10.0.0.1").await;
+    let invalid = spec_json("ws-ping.data-not-object.invalid.json");
+    let mut frames = vec![invalid.clone()];
+    frames.extend([
+        json!({"id": "cli_d1", "type": "ping"}),
+        json!({"id": "cli_d2", "type": "pong", "data": []}),
+        json!({"id": "cli_d3", "type": "subscribe", "data": [["chn_1"]]}),
+        json!({"id": "cli_d4", "type": "unsubscribe", "data": "chn_1"}),
+        json!({"id": "cli_d5", "type": "typing.start", "data": null}),
+    ]);
+    for frame in frames {
+        c.send_raw(&frame.to_string()).await;
+        let e = c.event().await;
+        assert_valid("error.json", &e);
+        assert_eq!(
+            (&e["correlationId"], &e["data"]["code"]),
+            (&frame["id"], &json!("bad_request")),
+            "{frame}"
+        );
+    }
+    c.send_raw(r#"{"id": "cli_d6", "type": "x.future", "data": 3}"#)
+        .await;
+    let ping = c.command("ping", json!({})).await;
+    assert_eq!(c.event().await["correlationId"], ping);
 }
 
 /// Presence (§7.5) sees the provider's own authenticated connections.
