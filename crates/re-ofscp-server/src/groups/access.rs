@@ -142,13 +142,17 @@ fn open_to_anyone(tier: Tier) -> bool {
 
 /// Whether a role listed in `listed` grants the caller an exact-membership
 /// action (§5.2): the owner always; a member iff their role is listed and
-/// known to the group; an outsider never.
+/// known to the group; an outsider never. A membership claiming the role
+/// `owner` holds nothing: only [`Standing::Owner`] is the owner (memberships
+/// refuse that role, and this keeps a bad row from mattering).
 fn granted(standing: &Standing, group: &GroupPolicy, listed: Option<&Vec<String>>) -> bool {
     match standing {
         Standing::Owner => true,
         Standing::Outsider => false,
         Standing::Member(role) => {
-            group.knows_role(role) && listed.is_some_and(|roles| roles.iter().any(|r| r == role))
+            role != roles::OWNER
+                && group.knows_role(role)
+                && listed.is_some_and(|roles| roles.iter().any(|r| r == role))
         }
     }
 }

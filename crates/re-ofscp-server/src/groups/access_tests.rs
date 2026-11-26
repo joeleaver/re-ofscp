@@ -171,3 +171,16 @@ fn private_groups_are_invite_only_whatever_their_join_policy() {
         JoinGate::InviteOnly
     );
 }
+
+#[test]
+fn a_membership_claiming_the_owner_role_holds_nothing() {
+    let mut perms = PermissionMap::new();
+    perms.insert("manage".into(), vec!["owner".into()]);
+    let g = GroupPolicy::new(Tier::Group, JoinPolicy::Invite, perms, None);
+    let impostor = member("owner");
+    assert!(!may(&impostor, &g, actions::MANAGE));
+    assert!(may(&Standing::Owner, &g, actions::MANAGE));
+    let only_owner = channel(Tier::Group, Some(&["owner"]));
+    assert!(!can_read_channel(&impostor, &g, &only_owner));
+    assert!(can_read_channel(&Standing::Owner, &g, &only_owner));
+}

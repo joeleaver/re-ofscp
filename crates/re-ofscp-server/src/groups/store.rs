@@ -1,5 +1,13 @@
-//! Groups, channels and memberships in rhypedb (`Group`, `Channel`,
-//! `Membership` in `schema.rhype`). Every query goes through [`Ql`].
+//! Groups and channels in rhypedb (`Group` and `Channel` in
+//! `schema.rhype`; memberships are in `members.rs`). Every query goes
+//! through [`Ql`].
+//!
+//! Without transactions, a row that belongs to a group is written
+//! `pending` (invisible to every read), and made `active` only once its
+//! writer has confirmed that the group is still active. Purging a group
+//! removes its rows in either state, and [`GroupStore::expire_pending`]
+//! removes pending rows a crashed or failed writer left behind. So no row
+//! outlives its group, whatever a writer's timing.
 
 use std::sync::Arc;
 
@@ -12,12 +20,14 @@ use serde::Deserialize;
 use super::model::{ChannelFields, GroupFields, StoredChannel, StoredGroup};
 use crate::db::{Db, DbError, Ql};
 
-/// `Group.status` values.
-mod status {
+/// `status` values (`Group`, `Channel`, `Membership`).
+pub(super) mod status {
     /// Visible and usable.
     pub const ACTIVE: &str = "active";
-    /// Being deleted: invisible everywhere, children being removed.
+    /// A group being deleted: invisible everywhere, children being removed.
     pub const DELETING: &str = "deleting";
+    /// A channel or membership written but not yet confirmed: invisible.
+    pub const PENDING: &str = "pending";
 }
 
 #[derive(Deserialize)]
@@ -79,11 +89,6 @@ impl ChannelRow {
 }
 
 #[derive(Deserialize)]
-struct RoleRow {
-    role: String,
-}
-
-#[derive(Deserialize)]
 struct GroupIdRow {
     group_id: String,
 }
@@ -116,15 +121,10 @@ where
     }
 }
 
-/// The membership key: one row per (group, actor).
-fn member_key(group_id: &str, actor: &Actor) -> String {
-    format!("{group_id} {actor}")
-}
-
 /// Group, channel and membership storage.
 #[derive(Debug, Clone)]
 pub struct GroupStore {
-    db: Arc<Db>,
+    pub(super) db: Arc<Db>,
 }
 
 impl GroupStore {
@@ -187,10 +187,12 @@ impl GroupStore {
         }
     }
 
-    /// How many groups `owner` owns, counting at most `cap`.
+    /// How many active groups `owner` owns, counting at most `cap`.
     pub async fn owned_count(&self, owner: &Actor, cap: usize) -> Result<usize, DbError> {
         let q = Ql::new("Group.filter(.owner == ")
             .str(&owner.to_string())
+            .raw(" && .status == ")
+            .str(status::ACTIVE)
             .raw(").limit(")
             .uint(cap as u64)
             .raw(")");
@@ -241,8 +243,8 @@ impl GroupStore {
         Ok(!self.db.write_rows(&q).await?.into_objects().is_empty())
     }
 
-    /// Remove a group being deleted: its channels, its memberships, then
-    /// the group row. Each step is idempotent, so an interrupted purge is
+    /// Remove a group being deleted: its channels and memberships (pending
+    /// or active), then the group row. Each step is idempotent, so an interrupted purge is
     /// simply run again.
     pub async fn purge_group(&self, group_id: &str) -> Result<(), DbError> {
         let channels = Ql::new("Channel.filter(.group_id == ")
@@ -277,7 +279,8 @@ impl GroupStore {
             .collect())
     }
 
-    /// Create a channel in `group_id`. The caller has checked the group.
+    /// Write a `pending` channel in `group_id`; [`Self::activate_channel`]
+    /// makes it visible. The caller has checked the group.
     pub async fn create_channel(
         &self,
         group_id: &str,
@@ -294,6 +297,8 @@ impl GroupStore {
                 .str(kind.as_str())
                 .raw(", tier: ")
                 .str(fields.tier.as_str())
+                .raw(", status: ")
+                .str(status::PENDING)
                 .raw(", revision: 0, doc: ")
                 .str(&json(&fields.doc)?)
                 .raw(", created_at: ")
@@ -312,7 +317,38 @@ impl GroupStore {
         ))
     }
 
-    /// Up to `limit` channels of `group_id`, oldest first.
+    /// Make a pending channel visible. `false` if it is gone (its group
+    /// was purged, or it expired).
+    pub async fn activate_channel(
+        &self,
+        group_id: &str,
+        channel_id: &str,
+    ) -> Result<bool, DbError> {
+        let q = Ql::new("Channel.filter(.channel_id == ")
+            .str(channel_id)
+            .raw(" && .group_id == ")
+            .str(group_id)
+            .raw(" && .status == ")
+            .str(status::PENDING)
+            .raw(").update({ status: ")
+            .str(status::ACTIVE)
+            .raw(" })");
+        Ok(!self.db.write_rows(&q).await?.into_objects().is_empty())
+    }
+
+    /// Remove the pending channels and memberships written before `cutoff`
+    /// (unix seconds): their writers failed or died before confirming them.
+    pub async fn expire_pending(&self, cutoff: i64) -> Result<(), DbError> {
+        let channels = Ql::new("Channel.filter(.status == ")
+            .str(status::PENDING)
+            .raw(" && .created_at < ")
+            .unix_seconds(cutoff)
+            .raw(").delete()");
+        self.db.execute(&channels).await?;
+        self.expire_pending_members(cutoff).await
+    }
+
+    /// Up to `limit` active channels of `group_id`, oldest first.
     pub async fn channels(
         &self,
         group_id: &str,
@@ -320,6 +356,8 @@ impl GroupStore {
     ) -> Result<Vec<StoredChannel>, DbError> {
         let q = Ql::new("Channel.filter(.group_id == ")
             .str(group_id)
+            .raw(" && .status == ")
+            .str(status::ACTIVE)
             .raw(").limit(")
             .uint(limit as u64)
             .raw(")");
@@ -334,7 +372,8 @@ impl GroupStore {
         Ok(channels)
     }
 
-    /// How many channels `group_id` has, counting at most `cap`.
+    /// How many channels `group_id` has, pending ones included (so the
+    /// limit is conservative), counting at most `cap`.
     pub async fn channel_count(&self, group_id: &str, cap: usize) -> Result<usize, DbError> {
         let q = Ql::new("Channel.filter(.group_id == ")
             .str(group_id)
@@ -344,7 +383,7 @@ impl GroupStore {
         Ok(self.db.fetch::<serde::de::IgnoredAny>(&q).await?.len())
     }
 
-    /// Channel `channel_id` of `group_id`, if any.
+    /// Active channel `channel_id` of `group_id`, if any.
     pub async fn channel(
         &self,
         group_id: &str,
@@ -354,6 +393,8 @@ impl GroupStore {
             .str(channel_id)
             .raw(" && .group_id == ")
             .str(group_id)
+            .raw(" && .status == ")
+            .str(status::ACTIVE)
             .raw(")");
         match self.db.fetch::<ChannelRow>(&q).await?.into_iter().next() {
             Some(row) => row.data.decode().map(Some),
@@ -373,6 +414,8 @@ impl GroupStore {
             .str(&channel.id)
             .raw(" && .group_id == ")
             .str(&channel.group_id)
+            .raw(" && .status == ")
+            .str(status::ACTIVE)
             .raw(" && .revision == ")
             .int(channel.revision)
             .raw(").update({ tier: ")
@@ -387,76 +430,13 @@ impl GroupStore {
         decode_updated(self.db.write_rows(&q).await?, ChannelRow::decode)
     }
 
-    /// Delete channel `channel_id` of `group_id` (a no-op if it is gone).
+    /// Delete channel `channel_id` of `group_id`, pending or active (a
+    /// no-op if it is gone).
     pub async fn delete_channel(&self, group_id: &str, channel_id: &str) -> Result<(), DbError> {
         let q = Ql::new("Channel.filter(.channel_id == ")
             .str(channel_id)
             .raw(" && .group_id == ")
             .str(group_id)
-            .raw(").delete()");
-        self.db.execute(&q).await
-    }
-
-    /// `actor`'s role in `group_id`, if they are a (non-owner) member.
-    pub async fn role_of(&self, group_id: &str, actor: &Actor) -> Result<Option<String>, DbError> {
-        let q = Ql::new("Membership.filter(.key == ")
-            .str(&member_key(group_id, actor))
-            .raw(")");
-        Ok(self
-            .db
-            .fetch::<RoleRow>(&q)
-            .await?
-            .into_iter()
-            .next()
-            .map(|r| r.data.role))
-    }
-
-    /// Record `actor` as a member of `group_id` with `role`. `false` if
-    /// they already are one. Used by membership (§5.7) and invites (§5.6).
-    pub async fn add_member(
-        &self,
-        group_id: &str,
-        actor: &Actor,
-        role: &str,
-        now: i64,
-    ) -> Result<bool, DbError> {
-        let q = Ql::new("Membership.create({ key: ")
-            .str(&member_key(group_id, actor))
-            .raw(", group_id: ")
-            .str(group_id)
-            .raw(", actor: ")
-            .str(&actor.to_string())
-            .raw(", role: ")
-            .str(role)
-            .raw(", joined_at: ")
-            .unix_seconds(now)
-            .raw(" })");
-        match self.db.execute(&q).await {
-            Ok(()) => Ok(true),
-            Err(DbError::Conflict(_)) => Ok(false),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Change `actor`'s role in `group_id`. `false` if not a member.
-    pub async fn set_role(
-        &self,
-        group_id: &str,
-        actor: &Actor,
-        role: &str,
-    ) -> Result<bool, DbError> {
-        let q = Ql::new("Membership.filter(.key == ")
-            .str(&member_key(group_id, actor))
-            .raw(").update({ role: ")
-            .str(role)
-            .raw(" })");
-        Ok(!self.db.write_rows(&q).await?.into_objects().is_empty())
-    }
-
-    /// End `actor`'s membership of `group_id` (a no-op if there is none).
-    pub async fn remove_member(&self, group_id: &str, actor: &Actor) -> Result<(), DbError> {
-        let q = Ql::new("Membership.filter(.key == ")
-            .str(&member_key(group_id, actor))
             .raw(").delete()");
         self.db.execute(&q).await
     }

@@ -1,6 +1,6 @@
 //! Group and channel operations (§5.5), independent of HTTP. Every read
 //! goes through [`Groups::read_group`] or [`Groups::read_channel`], which
-//! apply the [`access`](super::access) rule; later surfaces (history,
+//! apply the [`access`] rule; later surfaces (history,
 //! subscriptions, notifications, discovery samples) use the same two.
 
 use re_ofscp_types::Actor;
@@ -9,7 +9,7 @@ use re_ofscp_types::groups::{
     GroupUpdateRequest,
 };
 
-use super::access::{self, Standing, actions};
+use super::access::{self, Standing, actions, roles};
 use super::model::{self, StoredChannel, StoredGroup};
 use super::validate::Invalid;
 use super::{AccessChange, Caller, Groups, MAX_CHANNELS_PER_GROUP, MAX_GROUPS_PER_OWNER};
@@ -94,7 +94,11 @@ impl Groups {
         channel_id: &str,
     ) -> Result<(ReadableGroup, StoredChannel), GroupError> {
         let g = match self.read_group(caller, group_id).await {
-            Err(GroupError::Forbidden(_)) => return Err(GroupError::NotFound(NO_CHANNEL)),
+            // A missing group and an unreadable one answer exactly as a
+            // missing channel: the same `404` body in every case.
+            Err(GroupError::Forbidden(_) | GroupError::NotFound(_)) => {
+                return Err(GroupError::NotFound(NO_CHANNEL));
+            }
             other => other?,
         };
         let channel = self
@@ -251,8 +255,8 @@ impl Groups {
         req: ChannelCreateRequest,
         now: i64,
     ) -> Result<Channel, GroupError> {
-        let (kind, fields) = model::new_channel(req)?;
         self.group_for(actor, group_id, actions::MANAGE).await?;
+        let (kind, fields) = model::new_channel(req)?;
         if self.channel_count(group_id).await? >= MAX_CHANNELS_PER_GROUP {
             return Err(GroupError::Forbidden(CHANNEL_LIMIT));
         }
@@ -268,13 +272,30 @@ impl Groups {
             self.store.delete_channel(group_id, &channel.id).await?;
             return Err(GroupError::Forbidden(CHANNEL_LIMIT));
         }
-        // The group may have been deleted while this channel was being
-        // written; then the channel must not outlive it.
+        self.confirm_channel(group_id, &channel.id).await?;
+        Ok(channel.to_wire())
+    }
+
+    /// Make a channel just written `pending` visible, once its group is
+    /// known to be still active. A purge of the group that runs at any
+    /// moment of this removes the channel, pending or active, so the
+    /// channel never outlives its group (see `store.rs`).
+    async fn confirm_channel(&self, group_id: &str, channel_id: &str) -> Result<(), GroupError> {
         if self.store.group(group_id).await?.is_none() {
-            self.store.delete_channel(group_id, &channel.id).await?;
+            self.store.delete_channel(group_id, channel_id).await?;
             return Err(GroupError::NotFound(NO_GROUP));
         }
-        Ok(channel.to_wire())
+        if self.store.activate_channel(group_id, channel_id).await? {
+            return Ok(());
+        }
+        // The pending row is gone: the group was purged meanwhile, or the
+        // sweeper expired it (an exceptionally slow create).
+        if self.store.group(group_id).await?.is_none() {
+            return Err(GroupError::NotFound(NO_GROUP));
+        }
+        Err(GroupError::Conflict(
+            "the channel could not be created; retry",
+        ))
     }
 
     /// `GET /api/groups/{groupId}/channels/{channelId}`.
@@ -342,4 +363,76 @@ impl Groups {
             channel_id: channel_id.to_owned(),
         });
     }
+
+    /// Record `actor` as a member of `group_id` with `role` (the §5.7
+    /// seam). `Ok(false)` if they already belong to the group (the owner
+    /// included). The role `owner` is refused: ownership is the group's
+    /// `owner` field, never a membership. Announces the change.
+    pub async fn add_member(
+        &self,
+        group_id: &str,
+        actor: &Actor,
+        role: &str,
+        now: i64,
+    ) -> Result<bool, GroupError> {
+        member_role(role)?;
+        let group = self
+            .store
+            .group(group_id)
+            .await?
+            .ok_or(GroupError::NotFound(NO_GROUP))?;
+        if group.owner == *actor || !self.store.add_member(group_id, actor, role, now).await? {
+            return Ok(false);
+        }
+        // Confirm as for channels: a membership never outlives its group.
+        if self.store.group(group_id).await?.is_none() {
+            self.store.remove_member(group_id, actor).await?;
+            return Err(GroupError::NotFound(NO_GROUP));
+        }
+        if !self.store.activate_member(group_id, actor).await? {
+            if self.store.group(group_id).await?.is_none() {
+                return Err(GroupError::NotFound(NO_GROUP));
+            }
+            return Err(GroupError::Conflict(
+                "the membership could not be recorded; retry",
+            ));
+        }
+        self.member_changed(group_id, actor);
+        Ok(true)
+    }
+
+    /// Change a member's role (the §5.7 seam). `Ok(false)` if not a
+    /// member. The role `owner` is refused, as for [`Self::add_member`].
+    /// Announces the change.
+    pub async fn set_role(
+        &self,
+        group_id: &str,
+        actor: &Actor,
+        role: &str,
+    ) -> Result<bool, GroupError> {
+        member_role(role)?;
+        let set = self.store.set_role(group_id, actor, role).await?;
+        if set {
+            self.member_changed(group_id, actor);
+        }
+        Ok(set)
+    }
+
+    /// End a membership (the §5.7 seam). Announces the change.
+    pub async fn remove_member(&self, group_id: &str, actor: &Actor) -> Result<(), GroupError> {
+        self.store.remove_member(group_id, actor).await?;
+        self.member_changed(group_id, actor);
+        Ok(())
+    }
+}
+
+/// A role a membership may hold: anything but `owner` (which would make
+/// `Standing::Member("owner")`, holding whatever a map grants `owner`).
+fn member_role(role: &str) -> Result<(), GroupError> {
+    if role == roles::OWNER {
+        return Err(GroupError::Invalid(Invalid(
+            "`owner` is the group's owner field, not a membership role".to_owned(),
+        )));
+    }
+    Ok(())
 }

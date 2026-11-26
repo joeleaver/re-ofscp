@@ -85,8 +85,10 @@ fn group_id(id: &str) -> Result<(), Problem> {
     local_id(id, "no such group")
 }
 
+/// Both ids of a single-channel route. Any bad one is answered as a
+/// missing channel, the one `404` body these routes give (§11.3).
 fn channel_ids(g: &str, c: &str) -> Result<(), Problem> {
-    group_id(g)?;
+    local_id(g, "no such channel")?;
     local_id(c, "no such channel")
 }
 

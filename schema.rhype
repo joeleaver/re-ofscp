@@ -155,6 +155,9 @@ type Channel {
     // "text" or "call"; immutable.
     kind: String
     tier: String
+    // "pending" (written, not yet confirmed: invisible) or "active"; the
+    // sweeper removes pending rows older than groups::PENDING_TTL.
+    status: String @indexed
     revision: i64
     // JSON: name, topic, tags, permissions, metadata (model::ChannelDoc).
     doc: String
@@ -171,5 +174,7 @@ type Membership {
     group_id: String @indexed
     actor: String @indexed
     role: String
+    // "pending" or "active", as for Channel.status.
+    status: String @indexed
     joined_at: DateTime
 }

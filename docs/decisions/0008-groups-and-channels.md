@@ -80,12 +80,15 @@ receiver that lags must re-check everything it holds.
 | Unsigned `GET` | anonymous viewer, never `401` |
 
 The channel answers follow lost-conn/ofscp#26 (Joe's decision, via the
-oracle), which is still open; the code cites it where the behaviour
+oracle; merged as 7fa0817), which the code cites where the behaviour
 depends on it. A `403` on a channel route would let an outsider tell real
-channel ids from made-up ones. Later channel surfaces (history, replies,
-subscribe, follows, read markers) get the same `404` by going through
-`read_channel`. A channel listing omits
-the channels the caller cannot read.
+channel ids from made-up ones, so every single-channel `404` (missing
+group, unreadable group, missing or hidden channel) carries the same body.
+Later channel surfaces (history, replies, subscribe, follows, read
+markers) get the same `404` by going through `read_channel`. A channel
+listing omits the channels the caller cannot read. Authorization comes
+before body validation, so a caller without `manage` gets `403` whatever
+it sends.
 
 ### Identity and signers
 
@@ -111,7 +114,9 @@ the channels the caller cannot read.
   most one membership per group without a transaction.
 - The owner is `Group.owner`, not a `Membership` row. §5.7 must keep that
   rule: an ownership transfer creates a membership for the former owner
-  and removes the new owner's.
+  and removes the new owner's. A membership can never hold the role
+  `owner` (`add_member`/`set_role` refuse it, and the access rule grants
+  such a row nothing), and the owner is never also a member.
 - The fields only ever read back as a whole (description, permissions,
   roles, metadata; name, topic, tags, permissions, metadata for channels)
   are one JSON `doc` column. The fields queries filter on are their own
@@ -129,11 +134,20 @@ the channels the caller cannot read.
   and row are purged, and an `AccessChange::Group` is announced.
 - A sweeper task (`Groups::sweep_forever`, every 300 s, stopped at
   shutdown) finishes any purge a crash interrupted.
-- A channel create re-checks that its group still exists after writing,
-  and takes the channel back if not. The remaining case: a process dying
-  between those two statements while the group is being deleted can leave
-  an unreachable channel row. Nothing can read it (every read goes through
-  an active group), and it costs one row.
+- **No row outlives its group.** A channel or membership is written with
+  `status: "pending"`, which every read ignores. Its writer then checks
+  that the group is still active, and only then makes the row `active`
+  (a conditional update on `pending`). A purge deletes the group's rows
+  in either state. So whenever a purge runs relative to a create, either
+  the create sees the group gone and takes its row back, or the purge
+  deletes the row (pending or active), and the create's activation fails
+  cleanly (`404`, or `409` to retry).
+- A writer that dies or fails before confirming leaves a pending row. The
+  sweeper deletes pending rows older than `PENDING_TTL` (600 s), so they
+  never accumulate, and this relies on no request taking any particular
+  time: a create slower than that finds its row gone and fails cleanly.
+- A sweeper pass carries on past a group whose purge fails, logging it,
+  and leaves it for the next pass.
 
 ### Limits
 
@@ -151,7 +165,9 @@ the channels the caller cannot read.
 | Path ids | `[A-Za-z0-9_-]{1,128}`, otherwise `404` |
 
 Count limits are checked before a write and again after it, and a create
-that finds itself over the limit takes back what it wrote. Concurrent
+that finds itself over the limit takes back what it wrote. The channel
+count includes pending rows, so it errs on the safe side; the group count
+includes only active groups, so a deletion frees its place at once. Concurrent
 creates therefore never leave more than the limit, though a burst at the
 limit may all be refused. A channel listing fetches up to twice the limit,
 so channels about to be taken back cannot crowd real ones out.
@@ -163,6 +179,11 @@ so channels about to be taken back cannot crowd real ones out.
 - Unknown request fields, `owner` included, are ignored (§2.3).
 - A channel's `type` is required on create. A `PATCH` may repeat it but
   not change it (`400`).
+- Because `null` is refused, a `PATCH` cannot remove an optional field
+  (`description`, `topic`, `tags`, `permissions`, `metadata`). It can set
+  one to an empty value instead (`""`, `[]`, `{}`); an empty channel
+  `permissions` map removes `view`. If the spec later defines `null` as
+  "clear", that is where to change it.
 - Defaults: a group is `private` with `joinPolicy: invite`; a channel is
   `private` (the spec's RECOMMENDED default).
 

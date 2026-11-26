@@ -1,14 +1,14 @@
 //! The §5.5 group and channel endpoints over a real rhypedb-server:
 //! creation and defaults, validation, updates, deletion, channels, tiers.
 //! Every success body is validated against the spec's JSON Schemas.
-//! (The access matrix and remote actors are in tests/groups_access.rs.)
+//! (The access matrix and remote actors are in tests/groups_access.rs;
+//! limits, the sweeper and pending rows in tests/groups_lifecycle.rs.)
 
 mod common;
 
 use axum::http::StatusCode;
 use common::groups::{
     Env, call, create_channel, create_group, env_with_remotes, group_body, id, join, local, remote,
-    request,
 };
 use common::harness::send;
 use common::{assert_valid, schema};
@@ -153,6 +153,21 @@ async fn unknown_and_malformed_ids_are_not_found() {
     assert_eq!(s, StatusCode::NOT_FOUND);
     let (s, _) = call(&env, Some(&alice), "DELETE", "/api/groups/grp_nope", None).await;
     assert_eq!(s, StatusCode::NOT_FOUND);
+
+    // Every single-channel `404` is the same, whichever id is wrong (§11.3).
+    let gid = id(&create_group(&env, &alice, group_body("G", "public")).await);
+    let mut bodies = Vec::new();
+    for path in [
+        format!("/api/groups/{gid}/channels/chn_nope"),
+        "/api/groups/grp_nope/channels/chn_nope".to_owned(),
+        "/api/groups/bad%20id/channels/chn_nope".to_owned(),
+        format!("/api/groups/{gid}/channels/bad%20id"),
+    ] {
+        let (s, p) = call(&env, Some(&alice), "GET", &path, None).await;
+        assert_eq!(s, StatusCode::NOT_FOUND, "{path}");
+        bodies.push(p);
+    }
+    assert!(bodies.windows(2).all(|w| w[0] == w[1]), "{bodies:?}");
 }
 
 #[tokio::test]
@@ -291,32 +306,6 @@ async fn only_the_owner_deletes_and_everything_goes_with_the_group() {
 }
 
 #[tokio::test]
-async fn the_sweeper_finishes_an_interrupted_deletion() {
-    let env = env().await;
-    let alice = local(&env, "alice").await;
-    let g = create_group(&env, &alice, group_body("G", "public")).await;
-    let gid = id(&g);
-    let c = create_channel(&env, &alice, &gid, json!({"type": "text"})).await;
-    let groups = &env.state.groups;
-    // As if the process died between marking the group and purging it.
-    assert!(groups.store.mark_deleting(&gid).await.unwrap());
-    let (s, _) = call(
-        &env,
-        Some(&alice),
-        "GET",
-        &format!("/api/groups/{gid}"),
-        None,
-    )
-    .await;
-    assert_eq!(s, StatusCode::NOT_FOUND);
-    assert!(groups.store.channel(&gid, &id(&c)).await.unwrap().is_some());
-    assert_eq!(groups.sweep_deleting().await.unwrap(), 1);
-    assert!(groups.store.channel(&gid, &id(&c)).await.unwrap().is_none());
-    assert!(groups.store.deleting(10).await.unwrap().is_empty());
-    assert_eq!(groups.sweep_deleting().await.unwrap(), 0);
-}
-
-#[tokio::test]
 async fn channels_are_created_read_updated_and_deleted_by_managers() {
     let env = env().await;
     let alice = local(&env, "alice").await;
@@ -399,39 +388,6 @@ async fn channels_are_created_read_updated_and_deleted_by_managers() {
     assert_eq!(s, StatusCode::NOT_FOUND);
     let (s, _) = call(&env, Some(&alice), "DELETE", &path, None).await;
     assert_eq!(s, StatusCode::NOT_FOUND);
-}
-
-#[tokio::test]
-async fn a_group_holds_a_bounded_number_of_channels() {
-    let env = env().await;
-    let alice = local(&env, "alice").await;
-    let gid = id(&create_group(&env, &alice, group_body("G", "group")).await);
-    let max = re_ofscp_server::groups::MAX_CHANNELS_PER_GROUP;
-    let path = format!("/api/groups/{gid}/channels");
-    for _ in 0..max {
-        create_channel(&env, &alice, &gid, json!({"type": "text"})).await;
-    }
-    let (s, p) = call(
-        &env,
-        Some(&alice),
-        "POST",
-        &path,
-        Some(json!({"type": "text"})),
-    )
-    .await;
-    assert_eq!(s, StatusCode::FORBIDDEN, "{p}");
-    // A burst at the limit cannot push past it either.
-    let mut burst = tokio::task::JoinSet::new();
-    for _ in 0..5 {
-        let req = request(Some(&alice), "POST", &path, Some(&json!({"type": "text"})));
-        let app = env.app.clone();
-        burst.spawn(async move { send(&app, req).await.0 });
-    }
-    while let Some(s) = burst.join_next().await {
-        assert_eq!(s.unwrap(), StatusCode::FORBIDDEN);
-    }
-    let (_, list) = call(&env, Some(&alice), "GET", &path, None).await;
-    assert_eq!(list["items"].as_array().unwrap().len(), max);
 }
 
 #[tokio::test]

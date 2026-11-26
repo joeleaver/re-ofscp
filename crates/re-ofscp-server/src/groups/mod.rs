@@ -2,16 +2,18 @@
 //!
 //! - [`access`]: the one effective-read-access and permission rule.
 //! - [`model`]: stored shapes and request → state.
-//! - [`store`]: rhypedb queries.
+//! - [`store`]: rhypedb queries for groups and channels; `members.rs` for
+//!   memberships.
 //! - [`ops`]: the operations the endpoints (and later surfaces) call.
 //! - [`routes`]: the §5.5 HTTP endpoints and `GET /api/tiers`.
 //!
 //! Membership is minimal here: the owner is the group's `owner` field and
-//! every other member is a `Membership` row ([`store::GroupStore::add_member`]
-//! and friends), which full membership (§5.7), invites (§5.6) and guests
-//! (§4.8) build on.
+//! every other member is a `Membership` row ([`Groups::add_member`],
+//! [`Groups::set_role`], [`Groups::remove_member`]), which full membership
+//! (§5.7), invites (§5.6) and guests (§4.8) build on.
 
 pub mod access;
+mod members;
 pub mod model;
 pub mod ops;
 pub mod routes;
@@ -25,6 +27,7 @@ use re_ofscp_types::{Actor, Authority};
 use tokio::sync::broadcast;
 
 use crate::db::{Db, DbError};
+use crate::signing::Clock;
 use access::Standing;
 use model::StoredGroup;
 use store::GroupStore;
@@ -35,7 +38,11 @@ pub const MAX_GROUPS_PER_OWNER: usize = 100;
 pub const MAX_CHANNELS_PER_GROUP: usize = 200;
 /// How often the sweeper finishes interrupted group deletions.
 pub const SWEEP_INTERVAL: Duration = Duration::from_secs(300);
-/// Groups the sweeper purges per pass.
+/// How long a pending channel or membership may stay unconfirmed before
+/// the sweeper removes it. Far longer than any create takes; a writer that
+/// is slower still finds its row gone and fails cleanly.
+pub const PENDING_TTL: Duration = Duration::from_secs(600);
+/// Groups the sweeper purges per batch.
 const SWEEP_BATCH: usize = 100;
 /// Buffered [`AccessChange`]s per receiver before it lags.
 const CHANGE_BUFFER: usize = 1024;
@@ -135,43 +142,6 @@ impl Groups {
         })
     }
 
-    /// Record `actor` as a member with `role` (§5.7 seam). `false` if they
-    /// already are one.
-    pub async fn add_member(
-        &self,
-        group_id: &str,
-        actor: &Actor,
-        role: &str,
-        now: i64,
-    ) -> Result<bool, DbError> {
-        let added = self.store.add_member(group_id, actor, role, now).await?;
-        if added {
-            self.member_changed(group_id, actor);
-        }
-        Ok(added)
-    }
-
-    /// Change a member's role (§5.7 seam). `false` if not a member.
-    pub async fn set_role(
-        &self,
-        group_id: &str,
-        actor: &Actor,
-        role: &str,
-    ) -> Result<bool, DbError> {
-        let set = self.store.set_role(group_id, actor, role).await?;
-        if set {
-            self.member_changed(group_id, actor);
-        }
-        Ok(set)
-    }
-
-    /// End a membership (§5.7 seam).
-    pub async fn remove_member(&self, group_id: &str, actor: &Actor) -> Result<(), DbError> {
-        self.store.remove_member(group_id, actor).await?;
-        self.member_changed(group_id, actor);
-        Ok(())
-    }
-
     fn member_changed(&self, group_id: &str, actor: &Actor) {
         self.changed(AccessChange::Member {
             group_id: group_id.to_owned(),
@@ -179,34 +149,45 @@ impl Groups {
         });
     }
 
-    /// Finish every group deletion that was interrupted (a crash or a
-    /// database fault between marking a group and purging it).
-    pub async fn sweep_deleting(&self) -> Result<usize, DbError> {
+    /// One sweeper pass at `now` (unix seconds): finish the group
+    /// deletions a crash or a database fault interrupted, and expire the
+    /// pending channels and memberships whose writers never confirmed them
+    /// (older than [`PENDING_TTL`]). A group whose purge fails is logged
+    /// and left for the next pass; the rest of the pass goes on.
+    pub async fn sweep(&self, now: i64) -> Result<usize, DbError> {
+        self.store
+            .expire_pending(now.saturating_sub(PENDING_TTL.as_secs() as i64))
+            .await?;
         let mut purged = 0;
         loop {
             let batch = self.store.deleting(SWEEP_BATCH).await?;
-            if batch.is_empty() {
-                return Ok(purged);
-            }
             let full = batch.len() == SWEEP_BATCH;
+            let mut failed = false;
             for id in batch {
-                self.store.purge_group(&id).await?;
-                purged += 1;
+                match self.store.purge_group(&id).await {
+                    Ok(()) => purged += 1,
+                    Err(e) => {
+                        tracing::warn!(group = %id, error = %e, "purging a deleted group failed");
+                        failed = true;
+                    }
+                }
             }
-            if !full {
+            // A failed purge leaves its group in the next batch: stop
+            // rather than retry it at once.
+            if !full || failed {
                 return Ok(purged);
             }
         }
     }
 
-    /// Run [`Groups::sweep_deleting`] now and every [`SWEEP_INTERVAL`],
-    /// until the task is dropped.
-    pub async fn sweep_forever(self: Arc<Self>) {
+    /// Run [`Groups::sweep`] now and every [`SWEEP_INTERVAL`], reading
+    /// the time from `clock`, until the task is dropped.
+    pub async fn sweep_forever(self: Arc<Self>, clock: Arc<dyn Clock>) {
         let mut tick = tokio::time::interval(SWEEP_INTERVAL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            match self.sweep_deleting().await {
+            match self.sweep(clock.now().unix_timestamp()).await {
                 Ok(0) => {}
                 Ok(n) => tracing::info!(groups = n, "finished interrupted group deletions"),
                 Err(e) => tracing::warn!(error = %e, "sweeping deleted groups failed"),
