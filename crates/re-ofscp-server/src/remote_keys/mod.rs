@@ -30,6 +30,7 @@ pub mod document;
 pub mod fetch;
 mod grouped;
 mod known;
+mod reconfirm;
 mod state;
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -42,7 +43,9 @@ use self::state::{Flight, MAX_ENTRIES, Tables};
 use crate::federation::{Decision, UNKNOWN_RETRY_SECS};
 use crate::outbound::{OutboundClient, OutboundError, Reservation};
 use crate::registrable::has_unknown_suffix;
-use crate::signing::{Clock, KeyError, KeyFuture, KeyResolver, Requester, Resolved, Signer};
+use crate::signing::{
+    Clock, KeyError, KeyFuture, KeyResolver, Lifetime, ReconfirmFuture, Requester, Resolved, Signer,
+};
 
 pub use self::budget::{CLIENT_BURST, CLIENT_PER_MINUTE, DOMAIN_BURST, DOMAIN_PER_MINUTE};
 pub use self::state::REFETCH_INTERVAL_SECS;
@@ -69,6 +72,17 @@ struct Inner {
     /// it, so requests naming random handles or key ids at one domain
     /// cannot make us hammer it, nor one client spend its whole budget.
     budgets: Budgets,
+}
+
+/// Why a fetch was not started.
+enum Blocked {
+    /// Our outbound rules forbid it (§4.6 "No fetch is allowed").
+    Refused(String),
+    /// A limit or budget stopped it; retrying later may succeed.
+    Limited { retry_after: u64, why: &'static str },
+    /// The federation policy forbids it, or has not loaded: answered as
+    /// is, never from the cache.
+    Policy(KeyError),
 }
 
 /// What to do for a lookup, decided under the lock.
@@ -111,6 +125,20 @@ impl KeyResolver for RemoteKeys {
             }
         })
     }
+
+    fn reconfirm<'a>(
+        &'a self,
+        signer: &'a Signer,
+        key_id: &'a str,
+        key: &'a ed25519_dalek::VerifyingKey,
+        held: Lifetime,
+        requester: &'a Requester,
+    ) -> ReconfirmFuture<'a> {
+        Box::pin(
+            self.inner
+                .reconfirm(Source::of(signer), key_id, key, held, requester),
+        )
+    }
 }
 
 impl Inner {
@@ -135,26 +163,57 @@ impl Inner {
         }
         let now = self.now();
         let mut tables = self.tables();
-        if !fresh && let Some(keys) = tables.live(source, now) {
-            return Plan::Answer(Ok(Resolved::cached(keys.get(key_id).copied())));
+        if !fresh && let Some((keys, expires)) = tables.live_entry(source, now) {
+            return Plan::Answer(Ok(
+                Resolved::cached(keys.get(key_id).copied()).lasting(Lifetime::Until(expires))
+            ));
         }
+        match self.begin(&mut tables, source, fresh, requester, now) {
+            Ok(flight) => Plan::Wait(flight),
+            Err(Blocked::Policy(refusal)) => Plan::Answer(Err(refusal)),
+            Err(Blocked::Refused(why)) => {
+                Plan::Answer(fallback(&tables, source, key_id, now, || {
+                    KeyError::Unresolvable(why)
+                }))
+            }
+            Err(Blocked::Limited { retry_after, why }) => {
+                Plan::Answer(fallback(&tables, source, key_id, now, || {
+                    KeyError::Unavailable {
+                        reason: format!("{why} for {}", source.host()),
+                        retry_after,
+                    }
+                }))
+            }
+        }
+    }
+
+    /// Join the fetch of `source` already under way, or start one, unless
+    /// something forbids or limits it. `fresh`: the fetch is a re-fetch
+    /// after a key miss, subject to the re-fetch interval and charged as
+    /// first-time; otherwise it is an expiry-driven fetch, charged to the
+    /// known budget when `source` is known.
+    fn begin(
+        self: &Arc<Self>,
+        tables: &mut MutexGuard<'_, Tables>,
+        source: &Source,
+        fresh: bool,
+        requester: &Requester,
+        now: i64,
+    ) -> Result<Flight, Blocked> {
         // Join a fetch already under way: its answer is as fresh as ours,
         // and joining it costs no budget.
         if let Some(flight) = tables.flights.get(source) {
-            return Plan::Wait(flight.clone());
+            return Ok(flight.clone());
         }
         // A target refused without any lookup (an IP-literal host) costs no
         // fetch and no budget.
         if let Err(e) = self.client.target(source.host(), &source.path()) {
             if let Some(refusal) = outbound_policy_refusal(&e, source) {
-                return Plan::Answer(Err(refusal));
+                return Err(Blocked::Policy(refusal));
             }
-            let why = match e {
+            return Err(Blocked::Refused(match e {
                 OutboundError::Refused(why) => why,
                 other => other.to_string(),
-            };
-            return Plan::Answer(fallback(&tables, source, key_id, now, || {
-                KeyError::Unresolvable(why)
             }));
         }
         // Under a suffix the PSL does not know, every name would be its own
@@ -163,41 +222,34 @@ impl Inner {
         // on `localhost` or `*.test`) are exempt.
         let host = source.host();
         if has_unknown_suffix(host.as_str()) && !self.client.allows_host_name(host) {
-            return Plan::Answer(fallback(&tables, source, key_id, now, || {
-                KeyError::Unresolvable(format!("{host} is not under a known public suffix"))
-            }));
+            return Err(Blocked::Refused(format!(
+                "{host} is not under a known public suffix"
+            )));
         }
-        let limited = |retry_after: u64, why: &str| {
-            fallback(&tables, source, key_id, now, || KeyError::Unavailable {
-                reason: format!("{why} for {}", source.host()),
-                retry_after,
-            })
-        };
+        let limited = |retry_after: u64, why: &'static str| Blocked::Limited { retry_after, why };
         // Every other reason to refuse comes before the budgets, so a
         // lookup refused for it is charged nothing.
         if fresh && let Some(wait) = tables.refetch_wait(source, now) {
-            return Plan::Answer(limited(wait, "key re-fetch rate-limited"));
+            return Err(limited(wait, "key re-fetch rate-limited"));
         }
         if tables.flights.len() >= MAX_ENTRIES {
-            return Plan::Answer(limited(1, "too many key fetches in flight"));
+            return Err(limited(1, "too many key fetches in flight"));
         }
         // The target's in-flight slot is taken before anything is charged,
         // so a busy target costs no budget and starts no re-fetch interval.
         let reservation = match self.client.reserve(host, &source.path()) {
             Ok(reservation) => reservation,
             Err(OutboundError::Busy(_)) => {
-                return Plan::Answer(limited(
+                return Err(limited(
                     FAILURE_RETRY_SECS,
                     "too many requests in flight to the target",
                 ));
             }
             Err(e) => {
                 if let Some(refusal) = outbound_policy_refusal(&e, source) {
-                    return Plan::Answer(Err(refusal));
+                    return Err(Blocked::Policy(refusal));
                 }
-                return Plan::Answer(fallback(&tables, source, key_id, now, || {
-                    KeyError::Unresolvable(e.to_string())
-                }));
+                return Err(Blocked::Refused(e.to_string()));
             }
         };
         // Only an expiry-driven fetch of a known source uses the known
@@ -213,7 +265,7 @@ impl Inner {
             Standing::FirstTime
         };
         if let Err(over) = self.budgets.charge(source, standing, requester, now) {
-            return Plan::Answer(limited(over.retry_after, over.why));
+            return Err(limited(over.retry_after, over.why));
         }
         if fresh {
             tables.note_refetch(source, now);
@@ -224,9 +276,8 @@ impl Inner {
             refetch: fresh,
         };
         tables.flights.insert(source.clone(), flight.clone());
-        drop(tables);
         tokio::spawn(self.clone().run_flight(source.clone(), reservation, tx));
-        Plan::Wait(flight)
+        Ok(flight)
     }
 
     /// Fetch, update the cache, then wake every waiter.
@@ -283,7 +334,9 @@ impl Inner {
         let now = self.now();
         let tables = self.tables();
         match fetched {
-            Fetched::Keys { keys, .. } => Ok(Resolved::authoritative(keys.get(key_id).copied())),
+            Fetched::Keys { keys, expires } => {
+                Ok(Resolved::authoritative(keys.get(key_id).copied()).lasting(lifetime(expires)))
+            }
             Fetched::Failed(reason) => {
                 // A failed re-fetch started the re-fetch interval: retrying
                 // sooner would only be refused by it.
@@ -339,9 +392,14 @@ fn fallback(
     error: impl FnOnce() -> KeyError,
 ) -> Result<Resolved, KeyError> {
     match tables.cached_key(source, key_id, now) {
-        Some(key) => Ok(Resolved::cached(Some(key))),
+        Some((key, expires)) => Ok(Resolved::cached(Some(key)).lasting(Lifetime::Until(expires))),
         None => Err(error()),
     }
+}
+
+/// How long a completed fetch cacheable until `expires` may be relied on.
+fn lifetime(expires: Option<i64>) -> Lifetime {
+    expires.map_or(Lifetime::Uncached, Lifetime::Until)
 }
 
 /// The answer of `flight`.

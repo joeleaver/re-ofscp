@@ -10,7 +10,7 @@ use std::time::Duration;
 use common::harness::new_key;
 use common::key_setup::{Setup, cached, client, fetched, unavailable};
 use common::remote_peer::{DISCOVERY_PATH, RemotePeer, Reply, discovery_doc, keys_doc, keys_path};
-use re_ofscp_server::signing::{KeyError, KeyResolver, Signer};
+use re_ofscp_server::signing::{KeyError, KeyResolver, Lifetime, Signer};
 use re_ofscp_server::timefmt::rfc3339;
 use re_ofscp_types::Actor;
 use serde_json::json;
@@ -323,6 +323,7 @@ async fn concurrent_lookups_share_one_fetch() {
         Reply::json(200, &doc).delayed(Duration::from_millis(200)),
     );
     let alice = s.actor("alice");
+    let lifetime = Lifetime::Until(s.now() + 600);
     let lookups: Vec<_> = (0..16)
         .map(|i| {
             let (keys, alice) = (s.keys.clone(), alice.clone());
@@ -330,7 +331,8 @@ async fn concurrent_lookups_share_one_fetch() {
         })
         .collect();
     for lookup in lookups {
-        assert_eq!(lookup.await.unwrap(), fetched(Some(k)));
+        let expected = fetched(Some(k)).map(|r| r.lasting(lifetime));
+        assert_eq!(lookup.await.unwrap(), expected);
     }
     assert_eq!(s.hits("alice"), 1);
 }

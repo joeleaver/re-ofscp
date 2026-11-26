@@ -84,24 +84,29 @@ impl Tables {
         }
     }
 
-    /// `source`'s keys (empty for a cached negative), if its cache entry
-    /// has not expired at `now`.
-    pub fn live(&self, source: &Source, now: i64) -> Option<&Arc<KeySet>> {
+    /// `source`'s keys (empty for a cached negative) and when its entry
+    /// expires, if it has not expired at `now`.
+    pub fn live_entry(&self, source: &Source, now: i64) -> Option<(&Arc<KeySet>, i64)> {
         let entry = self.cache.get(source).or_else(|| self.negative.get(source));
         match entry {
-            Some((keys, Some(expires))) if now < expires => Some(keys),
+            Some((keys, Some(expires))) if now < expires => Some((keys, expires)),
             _ => None,
         }
     }
 
-    /// The key `key_id` of `source` from an entry still unexpired at `now`.
-    /// Only such a key may stand in for a fetch that failed, was refused or
-    /// was rate-limited: an expired entry never counts (lost-conn/ofscp#20),
-    /// so a revoked key cannot outlive its cache because fetches keep
-    /// failing.
-    pub fn cached_key(&self, source: &Source, key_id: &str, now: i64) -> Option<VerifyingKey> {
-        self.live(source, now)
-            .and_then(|keys| keys.get(key_id).copied())
+    /// The key `key_id` of `source` from an entry still unexpired at `now`,
+    /// with the entry's expiry. Only such a key may stand in for a fetch
+    /// that failed, was refused or was rate-limited: an expired entry never
+    /// counts (lost-conn/ofscp#20), so a revoked key cannot outlive its
+    /// cache because fetches keep failing.
+    pub fn cached_key(
+        &self,
+        source: &Source,
+        key_id: &str,
+        now: i64,
+    ) -> Option<(VerifyingKey, i64)> {
+        self.live_entry(source, now)
+            .and_then(|(keys, expires)| keys.get(key_id).map(|k| (*k, expires)))
     }
 
     /// Record a completed fetch. Cacheable until `expires`, or (for
@@ -178,15 +183,18 @@ mod tests {
         let mut t = Tables::default();
         let s = source(0);
         t.store(&s, Arc::new(KeySet::new()), Some(110), 100);
-        assert!(t.live(&s, 109).is_some());
-        assert!(t.live(&s, 110).is_none(), "expired at its expiry");
+        assert!(t.live_entry(&s, 109).is_some());
+        assert!(t.live_entry(&s, 110).is_none(), "expired at its expiry");
         t.store(&s, Arc::new(KeySet::new()), None, 105);
         assert!(
-            t.live(&s, 106).is_none(),
+            t.live_entry(&s, 106).is_none(),
             "superseded by an uncacheable answer"
         );
         t.store(&s, Arc::new(KeySet::new()), Some(105), 105);
-        assert!(t.live(&s, 105).is_none(), "already expired: not stored");
+        assert!(
+            t.live_entry(&s, 105).is_none(),
+            "already expired: not stored"
+        );
     }
 
     #[test]
@@ -257,7 +265,7 @@ mod tests {
         assert_eq!(t.known.len(), MAX_ENTRIES);
         assert_eq!(t.refetched.group_len("workers.dev"), rest);
         for p in &peer {
-            assert!(t.live(p, 3).is_some(), "{p:?} still cached");
+            assert!(t.live_entry(p, 3).is_some(), "{p:?} still cached");
             assert!(t.is_known(p), "{p:?} still known");
             assert!(t.refetch_wait(p, 3).is_some(), "{p:?} still timed");
         }
@@ -275,12 +283,12 @@ mod tests {
         // An expired entry goes first, whatever its group.
         t.store(&source(3), keys(), Some(1000), 60);
         assert!(t.cache.get(&source(0)).is_none(), "expired entry dropped");
-        assert!(t.live(&source(1), 60).is_some());
+        assert!(t.live_entry(&source(1), 60).is_some());
         // Then the oldest entry of the largest group.
         t.store(&source(4), keys(), Some(1000), 61);
         assert!(t.cache.get(&source(1)).is_none(), "p1.example was cut back");
         for s in [&sub, &source(2), &source(3), &source(4)] {
-            assert!(t.live(s, 62).is_some(), "{s:?}");
+            assert!(t.live_entry(s, 62).is_some(), "{s:?}");
         }
         t.cache.assert_consistent();
     }
@@ -290,12 +298,12 @@ mod tests {
         let mut t = Tables::default();
         let s = source(0);
         t.store(&s, Arc::new(KeySet::new()), Some(110), 100);
-        assert!(t.live(&s, 109).is_some_and(|k| k.is_empty()));
+        assert!(t.live_entry(&s, 109).is_some_and(|(k, _)| k.is_empty()));
         assert!(t.negative.contains(&s) && !t.cache.contains(&s));
-        assert!(t.live(&s, 110).is_none(), "a negative expires too");
+        assert!(t.live_entry(&s, 110).is_none(), "a negative expires too");
         t.store(&s, keys(), Some(200), 101);
         assert!(t.cache.contains(&s) && !t.negative.contains(&s));
-        assert_eq!(t.live(&s, 150).map(|k| k.len()), Some(1));
+        assert_eq!(t.live_entry(&s, 150).map(|(k, _)| k.len()), Some(1));
         t.store(&s, Arc::new(KeySet::new()), Some(300), 102);
         assert!(t.negative.contains(&s) && !t.cache.contains(&s));
         t.store(&s, keys(), None, 103);
@@ -324,7 +332,7 @@ mod tests {
         assert!(
             users
                 .iter()
-                .all(|u| t.live(u, 3).is_some_and(|k| k.len() == 1))
+                .all(|u| t.live_entry(u, 3).is_some_and(|(k, _)| k.len() == 1))
         );
         assert_eq!(
             t.negative.group_len("victim.example"),

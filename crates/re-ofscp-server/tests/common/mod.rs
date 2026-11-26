@@ -8,6 +8,7 @@ pub mod key_setup;
 pub mod profiles;
 pub mod remote_peer;
 pub mod rhypedb;
+pub mod ws;
 
 use std::path::PathBuf;
 
