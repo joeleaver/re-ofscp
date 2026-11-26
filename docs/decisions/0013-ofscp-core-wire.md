@@ -2,12 +2,12 @@
 
 - **Status:** accepted
 - **Date:** 2026-11-26
-- **Builds on:** 0011 (the `ofscp-core` crate), 0012 (ids, strict
+- **Builds on:** 0011 (the `ofscp-core` crate), 0015 (ids, strict
   identifiers, `jiff`)
 
 ## Context
 
-Pull request 2 of the port described in 0012 brings Postrinch's REST wire
+Pull request 2 of the port described in 0015 brings Postrinch's REST wire
 types into `ofscp-core`. Three sets of definitions already existed:
 `ofscp_core::auth` and `ofscp_core::discovery` (from 0011),
 `re_ofscp_types::profile` (decision 0009), and Postrinch's `wire`. Each
