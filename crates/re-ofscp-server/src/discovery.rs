@@ -16,7 +16,7 @@ use re_ofscp_types::OFSCP_VERSION;
 use re_ofscp_types::auth::RegistrationMode;
 use re_ofscp_types::discovery::{
     Authentication, Capabilities, DiscoveryCapabilities, DiscoveryDocument, FederationCapabilities,
-    ProviderInfo, Software,
+    ProviderInfo, RealtimeDelivery, Software,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -35,16 +35,14 @@ pub const SOFTWARE_NAME: &str = "re-ofscp";
 /// The document for `config`.
 pub fn document(config: &Config) -> DiscoveryDocument {
     let base = format!("https://{}", config.domain);
-    let registration_endpoint = match config.registration {
-        // A closed provider SHOULD omit the endpoint (§4.1.1).
-        RegistrationMode::Closed => None,
-        RegistrationMode::Open | RegistrationMode::Invite => {
-            Some(format!("{base}/api/auth/register"))
-        }
-    };
+    // A closed provider SHOULD omit the endpoint (§4.1.1). The
+    // configuration only ever holds a known mode.
+    let registration_endpoint = (config.registration == RegistrationMode::Open
+        || config.registration == RegistrationMode::Invite)
+        .then(|| format!("{base}/api/auth/register"));
     DiscoveryDocument {
         provider: ProviderInfo {
-            domain: config.domain.to_string(),
+            domain: config.domain.clone(),
             protocol_version: OFSCP_VERSION.to_owned(),
             software: Software {
                 name: SOFTWARE_NAME.to_owned(),
@@ -54,23 +52,28 @@ pub fn document(config: &Config) -> DiscoveryDocument {
             authentication: Authentication {
                 login_endpoint: format!("{base}/api/auth/login"),
                 registration_endpoint,
-                registration: Some(config.registration),
+                registration: Some(config.registration.clone()),
             },
             public_keys: config.provider_key.public_entries(),
         },
+        // Every capability this provider has an answer for is stated
+        // explicitly, even when the answer is "none".
         capabilities: Capabilities {
             // No message, channel or group APIs yet.
-            message_types: Vec::new(),
-            tiers: Vec::new(),
+            message_types: Some(Vec::new()),
+            tiers: Some(Vec::new()),
+            metadata_schemas: None,
+            limits: None,
             // No WebSocket endpoint yet (§8.5).
-            federation: FederationCapabilities {
-                realtime_delivery: "none".to_owned(),
-            },
-            discovery: DiscoveryCapabilities {
-                shares_known_providers: false,
-                discover_feed: false,
-            },
+            federation: Some(FederationCapabilities {
+                realtime_delivery: Some(RealtimeDelivery::None),
+            }),
+            discovery: Some(DiscoveryCapabilities {
+                shares_known_providers: Some(false),
+                discover_feed: Some(false),
+            }),
         },
+        endpoints: None,
     }
 }
 
@@ -171,7 +174,7 @@ mod tests {
     fn invite_provider_advertises_endpoint_mode_and_key() {
         let c = config(&[]);
         let doc = document(&c);
-        assert_eq!(doc.provider.domain, "social.example:8443");
+        assert_eq!(doc.provider.domain.as_str(), "social.example:8443");
         let auth = &doc.provider.authentication;
         assert_eq!(
             auth.login_endpoint,

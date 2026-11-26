@@ -9,8 +9,8 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::SigningKey;
-use re_ofscp_types::auth::ED25519;
 use re_ofscp_types::discovery::ProviderPublicKey;
+use re_ofscp_types::wire::KeyAlgorithm;
 use sha2::{Digest as _, Sha256};
 
 use crate::signing::canonical::encode_public_key;
@@ -69,7 +69,7 @@ impl ProviderKey {
             .into_iter()
             .map(|(key_id, key)| ProviderPublicKey {
                 key_id,
-                algorithm: ED25519.to_owned(),
+                algorithm: KeyAlgorithm::Ed25519,
                 public_key: encode_public_key(&key),
                 created_at: None,
             })
@@ -112,7 +112,7 @@ mod tests {
         assert_eq!(entry.key_id, key.key_id());
         let decoded = decode_public_key(&entry.public_key).unwrap();
         assert_eq!(decoded, key.signing_key().verifying_key());
-        assert_eq!(entry.algorithm, "Ed25519");
+        assert_eq!(entry.algorithm, KeyAlgorithm::Ed25519);
         let shown = format!("{key:?}");
         assert!(shown.contains(key.key_id()));
         assert!(!shown.contains("signing"));
