@@ -15,6 +15,7 @@ use serde::Deserialize;
 use crate::accounts::store::status;
 use crate::db::{Db, DbError, Ql};
 use crate::timefmt::unix;
+use rhypedb_client::Row;
 
 /// The defaults for an account that has never saved privacy settings
 /// (docs/decisions/0008; the same as Forumall's).
@@ -272,13 +273,18 @@ impl ProfileStore {
     }
 
     /// Apply `changes` to the active account `handle` in one update and
-    /// stamp the change time. `None` if there is no such active account.
+    /// stamp the change time (nothing is written if nothing changes). `None` if there is no such active account.
     pub async fn update_profile(
         &self,
         handle: &str,
         changes: &ProfileChanges,
         now: i64,
     ) -> Result<Option<StoredProfile>, DbError> {
+        // Nothing to change: `updatedAt` is the time of the last change
+        // (§6.3), so an empty update writes nothing.
+        if *changes == ProfileChanges::default() {
+            return self.profile(handle).await;
+        }
         let mut q = Ql::new("User.filter(.handle == ")
             .str(handle)
             .raw(" && .status == ")
@@ -299,8 +305,7 @@ impl ProfileStore {
         }
         let q = q.raw(" })");
         match self
-            .db
-            .write_many::<ProfileRow>(&q)
+            .write_one_object::<ProfileRow>(&q)
             .await?
             .into_iter()
             .next()
@@ -321,78 +326,83 @@ impl ProfileStore {
         }
     }
 
-    /// Apply `changes` to `handle`'s privacy settings and return the result.
+    /// Apply `changes` to `handle`'s privacy settings, which were `seen`
+    /// when `changes` was validated, and return the result.
     ///
-    /// Only the changed fields are written, in one update, so concurrent
-    /// updates of different fields both take effect. The first save creates
-    /// the row from the defaults; if a concurrent first save wins the
-    /// `@unique` race, the update is retried against its row.
+    /// Only the changed fields are written, in one single-object update, so
+    /// concurrent updates of different visibility fields both take effect.
+    /// A change to either list writes both, as the pair validated against
+    /// `seen`: an object's update is one transaction, so the stored lists
+    /// are always a pair that passed the no-actor-on-both-lists check, and
+    /// of two concurrent list changes the later wins whole. (A guard in the
+    /// filter would not help: rhypedb evaluates the filter on a snapshot and
+    /// updates each object in a transaction of its own.)
+    ///
+    /// The first save creates the row from `seen` (the defaults). `None`
+    /// if a concurrent first save created it meanwhile: re-read,
+    /// re-validate and call again.
     pub async fn update_privacy(
         &self,
         handle: &str,
         changes: &PrivacyChanges,
+        seen: &StoredPrivacy,
         now: i64,
-    ) -> Result<StoredPrivacy, DbError> {
-        for _ in 0..2 {
-            let mut q = Ql::new("PrivacySettings.filter(.handle == ")
-                .str(handle)
-                .raw(").update({ updated_at: ")
-                .unix_seconds(now);
-            if let Some(v) = changes.presence {
-                q = q.raw(", presence_visibility: ").str(v.as_str());
-            }
-            if let Some(v) = changes.profile {
-                q = q.raw(", profile_visibility: ").str(v.as_str());
-            }
-            if let Some(v) = changes.membership {
-                q = q.raw(", membership_visibility: ").str(v.as_str());
-            }
-            if let Some(list) = &changes.allow {
-                q = q.raw(", allow_list: ").str(&actors_json(list));
-            }
-            if let Some(list) = &changes.deny {
-                q = q.raw(", deny_list: ").str(&actors_json(list));
-            }
-            if let Some(metadata) = &changes.metadata {
-                q = q.raw(", metadata: ").str(&metadata_json(metadata));
-            }
-            let q = q.raw(" })");
-            if let Some(row) = self
-                .db
-                .write_many::<PrivacyRow>(&q)
-                .await?
-                .into_iter()
-                .next()
-            {
-                return row.data.into_privacy();
-            }
-            let new = changes.apply(StoredPrivacy::default());
-            let q = Ql::new("PrivacySettings.create({ handle: ")
-                .str(handle)
-                .raw(", presence_visibility: ")
-                .str(new.presence.as_str())
-                .raw(", profile_visibility: ")
-                .str(new.profile.as_str())
-                .raw(", membership_visibility: ")
-                .str(new.membership.as_str())
-                .raw(", allow_list: ")
-                .str(&actors_json(&new.allow))
-                .raw(", deny_list: ")
-                .str(&actors_json(&new.deny))
-                .raw(", metadata: ")
-                .str(&metadata_json(&new.metadata))
-                .raw(", updated_at: ")
-                .unix_seconds(now)
-                .raw(" })");
-            match self.db.write_one::<PrivacyRow>(&q).await {
-                Ok(row) => return row.data.into_privacy(),
-                Err(DbError::Conflict(_)) => continue,
-                Err(e) => return Err(e),
-            }
+    ) -> Result<Option<StoredPrivacy>, DbError> {
+        let mut q = Ql::new("PrivacySettings.filter(.handle == ")
+            .str(handle)
+            .raw(").update({ updated_at: ")
+            .unix_seconds(now);
+        if let Some(v) = changes.presence {
+            q = q.raw(", presence_visibility: ").str(v.as_str());
         }
-        Err(DbError::Query(
-            "privacy settings row neither updatable nor creatable".to_owned(),
-        ))
+        if let Some(v) = changes.profile {
+            q = q.raw(", profile_visibility: ").str(v.as_str());
+        }
+        if let Some(v) = changes.membership {
+            q = q.raw(", membership_visibility: ").str(v.as_str());
+        }
+        if changes.allow.is_some() || changes.deny.is_some() {
+            let allow = changes.allow.as_ref().unwrap_or(&seen.allow);
+            let deny = changes.deny.as_ref().unwrap_or(&seen.deny);
+            q = q
+                .raw(", allow_list: ")
+                .str(&actors_json(allow))
+                .raw(", deny_list: ")
+                .str(&actors_json(deny));
+        }
+        if let Some(metadata) = &changes.metadata {
+            q = q.raw(", metadata: ").str(&metadata_json(metadata));
+        }
+        let q = q.raw(" })");
+        if let Some(row) = self.write_one_object::<PrivacyRow>(&q).await?.pop() {
+            return row.data.into_privacy().map(Some);
+        }
+        let new = changes.apply(seen.clone());
+        let q = Ql::new("PrivacySettings.create({ handle: ")
+            .str(handle)
+            .raw(", presence_visibility: ")
+            .str(new.presence.as_str())
+            .raw(", profile_visibility: ")
+            .str(new.profile.as_str())
+            .raw(", membership_visibility: ")
+            .str(new.membership.as_str())
+            .raw(", allow_list: ")
+            .str(&actors_json(&new.allow))
+            .raw(", deny_list: ")
+            .str(&actors_json(&new.deny))
+            .raw(", metadata: ")
+            .str(&metadata_json(&new.metadata))
+            .raw(", updated_at: ")
+            .unix_seconds(now)
+            .raw(" })");
+        match self.write_one_object::<PrivacyRow>(&q).await {
+            Ok(mut rows) => match rows.pop() {
+                Some(row) => row.data.into_privacy().map(Some),
+                None => Err(DbError::Decode("create returned nothing".to_owned())),
+            },
+            Err(DbError::Conflict(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// `handle`'s stored presence, if ever set.
@@ -405,8 +415,9 @@ impl ProfileStore {
     }
 
     /// Replace `handle`'s explicit presence (`availability`, `status`,
-    /// `metadata`; `last_seen` is kept). Creates the row on first use, with
-    /// the same `@unique` race handling as [`Self::update_privacy`].
+    /// `metadata`; `last_seen` is kept). Creates the row on first use, and
+    /// retries as an update if a concurrent first use wins the `@unique`
+    /// race.
     pub async fn set_presence(
         &self,
         handle: &str,
@@ -430,8 +441,7 @@ impl ProfileStore {
                 .unix_seconds(now)
                 .raw(" })");
             if let Some(row) = self
-                .db
-                .write_many::<PresenceRow>(&q)
+                .write_one_object::<PresenceRow>(&q)
                 .await?
                 .into_iter()
                 .next()
@@ -449,8 +459,11 @@ impl ProfileStore {
                 .raw(", updated_at: ")
                 .unix_seconds(now)
                 .raw(" })");
-            match self.db.write_one::<PresenceRow>(&q).await {
-                Ok(row) => return row.data.into_presence(),
+            match self.write_one_object::<PresenceRow>(&q).await {
+                Ok(mut rows) => match rows.pop() {
+                    Some(row) => return row.data.into_presence(),
+                    None => return Err(DbError::Decode("create returned nothing".to_owned())),
+                },
                 Err(DbError::Conflict(_)) => continue,
                 Err(e) => return Err(e),
             }
@@ -459,4 +472,32 @@ impl ProfileStore {
             "presence row neither updatable nor creatable".to_owned(),
         ))
     }
+
+    /// Run a write that touches at most one object (a `create`, or an
+    /// `update` filtered on a `@unique` field), and decode what it returned.
+    ///
+    /// Such a write is one rhypedb transaction, so when it loses a
+    /// write-write conflict nothing of it was applied, and it is run again
+    /// on a fresh snapshot, up to [`WRITE_ATTEMPTS`] times with a short
+    /// growing pause (see [`DbError::Contended`]). Never use this for a
+    /// write that may touch several objects.
+    async fn write_one_object<T: serde::de::DeserializeOwned>(
+        &self,
+        q: &Ql,
+    ) -> Result<Vec<Row<T>>, DbError> {
+        let mut attempt = 1;
+        loop {
+            match self.db.write_many::<T>(q).await {
+                Err(DbError::Contended(_)) if attempt < WRITE_ATTEMPTS => {
+                    tokio::time::sleep(std::time::Duration::from_millis(1 << attempt)).await;
+                    attempt += 1;
+                }
+                other => return other,
+            }
+        }
+    }
 }
+
+/// How often [`ProfileStore::write_one_object`] tries a write in all while
+/// it keeps losing write conflicts.
+const WRITE_ATTEMPTS: u32 = 6;

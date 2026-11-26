@@ -162,16 +162,28 @@ pub async fn update_privacy(
 ) -> Result<Json<PrivacySettings>, Problem> {
     let actor = auth.local_actor(&state.config.domain)?;
     let store = &state.profiles.store;
-    let current = store.privacy(actor.handle()).await.map_err(internal)?;
-    let changes =
-        validate::privacy_update(&update, &current.allow, &current.deny).map_err(bad_request)?;
-    let now = state.verifier.now();
-    let privacy = store
-        .update_privacy(actor.handle(), &changes, now)
-        .await
-        .map_err(internal)?;
-    Ok(Json(render_privacy(privacy)))
+    // Validated against what is stored; if a concurrent first save created
+    // the settings meanwhile, validate again against those
+    // (see `ProfileStore::update_privacy`).
+    for _ in 0..PRIVACY_ATTEMPTS {
+        let current = store.privacy(actor.handle()).await.map_err(internal)?;
+        let changes = validate::privacy_update(&update, &current.allow, &current.deny)
+            .map_err(bad_request)?;
+        let now = state.verifier.now();
+        if let Some(privacy) = store
+            .update_privacy(actor.handle(), &changes, &current, now)
+            .await
+            .map_err(internal)?
+        {
+            return Ok(Json(render_privacy(privacy)));
+        }
+    }
+    Err(Problem::conflict().with_detail("privacy settings are being changed concurrently; retry"))
 }
+
+/// How often `PUT /api/me/privacy` re-validates after losing a first-save
+/// race before giving up with `409`.
+const PRIVACY_ATTEMPTS: usize = 4;
 
 /// `GET /api/users/{userRef}/profile` (§6.2).
 pub async fn user_profile(

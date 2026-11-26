@@ -70,6 +70,12 @@ async fn me_patch_and_public_profile_round_trip() {
     assert_eq!(again["metadata"], json!([meta]));
     assert!(again.get("bio").is_none(), "{again}");
 
+    // A PATCH that changes nothing leaves updatedAt alone (§6.3).
+    env.clock.set(SIGNED_AT + time::Duration::seconds(90));
+    let (status, same) = call(&env, &alice, "PATCH", "/api/me/profile", Some(&json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "{same}");
+    assert_eq!(same, again);
+
     // The public profile, as alice sees it and as GET /api/me reports it.
     let (status, public) = call(&env, &alice, "GET", "/api/users/alice/profile", None).await;
     assert_eq!(status, StatusCode::OK, "{public}");

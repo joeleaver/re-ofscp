@@ -417,3 +417,35 @@ async fn purge_never_deletes_a_row_just_made_live() {
     let lost: Vec<_> = accepted.iter().filter(|n| !live.contains(*n)).collect();
     assert!(lost.is_empty(), "accepted but lost: {lost:?}");
 }
+
+/// Concurrent creates of one `@unique` value leave exactly one object; the
+/// others are refused as unique conflicts or, when they lose the race at
+/// commit, as write conflicts. Pins rhypedb's message for the latter.
+#[tokio::test]
+async fn concurrent_unique_creates_are_conflicts_or_contended() {
+    let server = RhypeServer::start();
+    let db = db(&server);
+    let creates: Vec<_> = (0..16)
+        .map(|i| {
+            let db = db.clone();
+            let q = Ql::new("PrivacySettings.create({ handle: \"dupe\", presence_visibility: \"public\", profile_visibility: \"public\", membership_visibility: \"public\", allow_list: \"[]\", deny_list: \"[]\", metadata: \"[]\", updated_at: ")
+                .unix_seconds(i)
+                .raw(" })");
+            tokio::spawn(async move { db.execute(&q).await })
+        })
+        .collect();
+    let mut created = 0;
+    for t in creates {
+        match t.await.unwrap() {
+            Ok(()) => created += 1,
+            Err(DbError::Conflict(_) | DbError::Contended(_)) => {}
+            Err(e) => panic!("{e}"),
+        }
+    }
+    assert_eq!(created, 1);
+    let rows = db
+        .fetch::<serde_json::Value>(&Ql::new("PrivacySettings.filter(.handle == \"dupe\")"))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+}

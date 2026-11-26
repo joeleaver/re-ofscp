@@ -106,6 +106,53 @@ async fn concurrent_first_saves_both_take_effect() {
     assert_eq!(read["profileVisibility"], "nobody");
 }
 
+#[tokio::test]
+async fn concurrent_list_changes_never_put_an_actor_on_both_lists() {
+    let env = env().await;
+    let alice = local(&env, "alice").await;
+    // Both with and without an existing row.
+    for round in 0..2 {
+        let x = format!("xavier{round}@b.com");
+        let allow = json!({ "allowList": [x] });
+        let deny = json!({ "denyList": [x] });
+        let (ra, rd) = tokio::join!(
+            call(&env, &alice, "PUT", "/api/me/privacy", Some(&allow)),
+            call(&env, &alice, "PUT", "/api/me/privacy", Some(&deny)),
+        );
+        // Either the later one sees x on the other list and is refused, or
+        // both land and the later pair wins whole: never x on both lists.
+        for (status, body) in [&ra, &rd] {
+            assert!(
+                [StatusCode::OK, StatusCode::BAD_REQUEST].contains(status),
+                "{status}: {body}"
+            );
+        }
+        let (_, read) = call(&env, &alice, "GET", "/api/me/privacy", None).await;
+        let on = |list: &str| read[list].as_array().unwrap().contains(&json!(x));
+        assert!(on("allowList") || on("denyList"), "{read}");
+        assert!(!(on("allowList") && on("denyList")), "{read}");
+        // And settings stay updatable.
+        put_privacy(&env, &alice, json!({"presenceVisibility": "nobody"})).await;
+    }
+}
+
+#[tokio::test]
+async fn concurrent_first_presence_saves_both_succeed() {
+    let env = env().await;
+    let alice = local(&env, "alice").await;
+    let a = json!({"availability": "away", "status": "a"});
+    let b = json!({"availability": "dnd", "status": "b"});
+    let (ra, rb) = tokio::join!(
+        call(&env, &alice, "PUT", "/api/me/presence", Some(&a)),
+        call(&env, &alice, "PUT", "/api/me/presence", Some(&b)),
+    );
+    assert_eq!(ra.0, StatusCode::OK, "{}", ra.1);
+    assert_eq!(rb.0, StatusCode::OK, "{}", rb.1);
+    // Each write is whole: the stored status is one of the two, intact.
+    let (_, own) = call(&env, &alice, "GET", "/api/users/alice/presence", None).await;
+    assert!(own["status"] == "a" || own["status"] == "b", "{own}");
+}
+
 async fn presence(env: &Env, viewer: &Caller, path: &str) -> Value {
     let (status, p) = call(env, viewer, "GET", path, None).await;
     assert_eq!(status, StatusCode::OK, "{p}");

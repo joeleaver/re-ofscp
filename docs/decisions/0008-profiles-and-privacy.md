@@ -71,7 +71,9 @@ canonical `(handle, domain)` actor.
   extras, today only `bio`. The `UserProfile` is shown whatever
   `profileVisibility` is: §6.1 and §6.2 apply the setting to "profile
   extras (e.g. bio)", and a peer needs the base to render a message
-  author;
+  author. Profile `metadata` is part of the base, so every viewer sees
+  it: clients must not put there anything the user would expect
+  `profileVisibility` to hide;
 - presence answers `{"availability":"offline","metadata":[]}`, the same
   bytes as a user who really is offline (§7.5);
 - groups answer `{"groups":[],"metadata":[]}`.
@@ -86,6 +88,20 @@ So a viewer cannot tell refusal from absence.
   unchanged, `[]` clears a list, `null` is refused. The first save creates
   the row; a concurrent first save that loses the unique-handle race
   retries as an update, so both changes land (tested).
+- **No actor is ever on both lists, even under concurrency.** A change
+  to either list is validated against the stored lists and writes both
+  lists together, as the validated pair. An object's update is one
+  rhypedb transaction, so the stored lists are always a pair that passed
+  the check; of two concurrent list changes the later wins whole (it may
+  undo the other's change to the list it did not name, as a `PUT` of the
+  pair would). A guard in the update's filter would not make this a
+  compare-and-set: rhypedb evaluates the filter on a snapshot and updates
+  each matching object in a transaction of its own (observed, and in
+  `Database::update_with_origin`).
+- **Write conflicts.** rhypedb aborts the loser of a write-write conflict
+  (`DbError::Contended`). The profile, privacy and presence writes each
+  touch one object, so they are run again (up to six tries); a write
+  that may touch several objects must not be retried that way.
 - **List entries** must be actors. They are canonicalized per §2.2
   (`jane@A.COM` → `jane@a.com`, a default port dropped), duplicates are
   dropped, and each list holds at most 500 entries. An actor that would
@@ -98,7 +114,7 @@ So a viewer cannot tell refusal from absence.
   is trimmed, 1–100 characters, no control characters, and cannot be
   removed. `bio` is at most 2000 characters, line breaks and tabs only;
   `""` removes it. `metadata` replaces the list. `updatedAt` is the time of
-  the last change, falling back to the account's creation.
+  the last change (a PATCH that changes nothing writes nothing), falling back to the account's creation.
 - **Avatars wait for media.** §5.1.1 says an avatar SHOULD be a media URL
   this provider serves (§5.8, `POST /api/media`), and no media exists yet.
   Every avatar URL is refused with `400` and a detail that says why;
