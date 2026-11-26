@@ -187,9 +187,10 @@ Disabling an account closes all of its connections with `4003`.
   can neither release nor end the new one.
 - **Acknowledging.** `subscribe` sends its `subscribed` ack, and any
   replay, under the registry lock, for the granted topics that still
-  exist then; their held events follow. A new topic that a re-check ended
+  exist then; their held events follow. A topic that a re-check ended
   while `subscribe` was checking it is refused (`not_found`) rather than
-  acknowledged; an existing one that ended was already told
+  acknowledged, so every requested topic is answered with the command's
+  `correlationId`. If the client already had it, the re-check also sent
   `unsubscribed access_revoked`.
 - **Resume.** A subscription with `since` cursors is held from the start:
   - the ack names which topics are `truncated`;

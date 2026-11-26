@@ -118,7 +118,6 @@ impl Session {
             return self.error(&cmd.id, &e);
         };
         let mut granted = Vec::new();
-        let mut fresh = HashSet::new();
         let mut truncated = HashSet::new();
         let mut replays: HashMap<String, Vec<String>> = HashMap::new();
         let mut refused = Vec::new();
@@ -126,9 +125,6 @@ impl Session {
         let mut unavailable = Vec::new();
         for (topic, hold) in topics.iter().zip(holds) {
             let g = hold.generation;
-            if hold.fresh {
-                fresh.insert(topic.clone());
-            }
             match self
                 .decide(topic, since.get(topic).map(String::as_str))
                 .await
@@ -144,13 +140,12 @@ impl Session {
                     replays.insert(topic.clone(), replay);
                 }
                 // A subscription the client had and can no longer read ends
-                // as access lost, however it was found out. Ended already
-                // (by a re-check, which said so), it needs nothing more.
+                // as access lost. Ended already by a re-check (which sent
+                // its own `unsubscribed`), the command is still answered:
+                // every topic gets a reply carrying its correlationId.
                 Verdict::Refused => match hub.registry.end(self.id, topic, g) {
                     Ended::Active => revoked.push(topic.clone()),
-                    Ended::Pending => refused.push(topic.clone()),
-                    Ended::Missing if hold.fresh => refused.push(topic.clone()),
-                    Ended::Missing => {}
+                    Ended::Pending | Ended::Missing => refused.push(topic.clone()),
                 },
                 Verdict::Unavailable if hold.fresh => {
                     hub.registry.end(self.id, topic, g);
@@ -179,13 +174,14 @@ impl Session {
             texts
         });
         // Granted, but ended by a re-check before it could be
-        // acknowledged: a new one is refused like any other unreadable
-        // channel (an existing one was told `unsubscribed` already).
+        // acknowledged: refused like any other unreadable channel, so the
+        // command still gets its answer (an existing one was also told
+        // `unsubscribed access_revoked` by the re-check).
         refused.extend(
             granted
                 .into_iter()
                 .map(|(t, _)| t)
-                .filter(|t| fresh.contains(t) && !acked.contains(t)),
+                .filter(|t| !acked.contains(t)),
         );
         if !revoked.is_empty() {
             let data = Unsubscribed {
