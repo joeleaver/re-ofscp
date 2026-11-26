@@ -9,6 +9,9 @@ use serde::Deserialize;
 
 use crate::db::{Db, DbError, Ql};
 
+/// Attempts at an account create aborted by a concurrent one (`Contended`).
+const CREATE_PASSES: usize = 4;
+
 /// Account status values stored in `User.status`.
 pub mod status {
     /// Can log in; keys verify.
@@ -151,16 +154,24 @@ impl AccountStore {
             .raw(", created_at: ")
             .unix_seconds(now)
             .raw(" })");
-        match self.db.write_one::<UserRow>(&q).await {
-            Ok(row) => Ok(User {
-                id: row.id,
-                handle: row.data.handle,
-                display_name: row.data.display_name,
-                password_hash: row.data.password_hash,
-                status: row.data.status,
-            }),
-            Err(DbError::Conflict(_)) => Err(StoreError::HandleTaken),
-            Err(e) => Err(e.into()),
+        // A create racing another of the same handle can abort with
+        // `Contended`, which wrote nothing; a retry then succeeds or meets
+        // the winner's `Conflict` (docs/decisions/0012).
+        let mut passes = 0;
+        loop {
+            passes += 1;
+            return match self.db.write_one::<UserRow>(&q).await {
+                Ok(row) => Ok(User {
+                    id: row.id,
+                    handle: row.data.handle,
+                    display_name: row.data.display_name,
+                    password_hash: row.data.password_hash,
+                    status: row.data.status,
+                }),
+                Err(DbError::Conflict(_)) => Err(StoreError::HandleTaken),
+                Err(DbError::Contended(_)) if passes < CREATE_PASSES => continue,
+                Err(e) => Err(e.into()),
+            };
         }
     }
 

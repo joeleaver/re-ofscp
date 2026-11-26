@@ -94,37 +94,53 @@ grant anything (a role landing on an admin who was just disabled).
   `set_totp_pending` stays unserialized: a pending secret left beside an
   enrolled one, or surviving a reset, grants nothing. Only a confirmation
   reads it, and it enrolls exactly the secret its caller proved a code for.
-- **Account invites** (`InviteClaim`, `@unique` on the token hash). Only
-  the claim's creator marks the invite used. Release marks the invite
-  unused, then deletes the claim **by id**, so it never drops a later
-  claim. Registration's in-process lock stays, for its
-  release-before-anyone-looks ordering.
-  - **A lease.** A claim left beside an invite still `used == false` (the
-    holder's update failed, it crashed between the claim and the update,
-    or its release could not delete the claim) would make every later
-    claim conflict, while the invite still listed as usable. So a claim
-    carries `expires_at`, 120 s after it is made (as for epoch claims: the
-    holder's one guarded update times out after 10 s, and the account is
-    created in the next statement). On `Conflict` the claimer reads the
-    claim; if its lease has passed, the invite is still usable and no
-    account has the claim's handle, it was abandoned: the claimer deletes
-    it by id and claims again. A claim whose invite reads used is the
-    record of a registration and is never taken over. An account with the
-    claim's handle, made some other way, also keeps it (conservatively;
-    the owner revokes the invite).
-  - **Why the takeover is race-safe.** As in step 5 above: the winner is
-    decided only by the `@unique` create, never by the read, the checks or
-    the delete. A taker deletes the expired claim by its id, so it cannot
-    delete a fresh claim another taker made meanwhile (that delete is
-    `NotFound`); of any number of takers exactly one create succeeds, and
-    the rest conflict, read the new claim, find it live and lose. The old
-    holder cannot still be writing: its update would have landed or timed
-    out well inside the lease, and a landed update makes the invite read
-    used, which forbids the takeover.
-  - **A failed update** (an error, perhaps with the write landed and its
-    reply lost) drops the claim before returning; no account is made under
-    it. Had the update landed, the invite reads used and the next claimer
-    finds it so.
+- **Account invites** (`InviteRedemption`, `@unique` on the token hash,
+  recording the handle). A registration redeems the invite, by creating
+  that row, before it creates the account. The row is never updated,
+  deleted or taken over, so the invite can only ever make an account with
+  that handle, and handles are `@unique` (accounts are never deleted), so
+  **one invite makes at most one account**, however requests race, stall
+  or crash. This is what makes consumption safe: no lease or takeover
+  decides it.
+  - **Why not a leased claim.** An earlier revision used an `InviteClaim`
+    with a 120 s lease that a later registration could take over. A holder
+    that stalled past the lease before its `used == false` update could
+    then race the taker's update; neither is compare-and-set, so both could
+    apply and both make an account. No re-read or compensation after the
+    update closes that, because the second account already exists. A
+    redemption that is never released has no such window.
+  - **Order.** The invite is checked (unexpired; unused, or used by this
+    same handle), then the handle and password, then the password is
+    hashed, then the redemption is created, then the invite is marked used
+    (`used: true, used_by: handle`), then the account is created. A
+    `Conflict` on the redemption reads it: another handle means the invite
+    is spent (`403 invite_required`, as for a used invite); the same handle
+    resumes it.
+  - **Resuming.** A registration for the redemption's own handle goes on to
+    create the account. If the first request made it, that create fails as
+    the handle is taken (`409`); if it never did, this one makes it. Either
+    way one account. Resuming needs the invite token, which could have
+    redeemed the invite anyway.
+  - **Crash and failure windows.** Each fails closed:
+    - *After the redemption, before marking used:* the invite still reads
+      `used == false`, but every read that calls an invite usable (the
+      admin list, the outstanding-invite cap, registration's own redeem)
+      also checks for a redemption, and revoking it reports it used. Every
+      other handle is refused; its own handle can resume and marks it.
+    - *After marking used, before (or failing) the account create, or an
+      ambiguous create error:* the invite reads used by that handle. Every
+      other handle is refused, and the same handle resumes (or, if the
+      create had landed, finds its account).
+    - *The handle taken between the check and the create* (another
+      invite's registration, or an admin, won it): the redemption stays,
+      so the invite is spent. This is a rare race, and failing closed is
+      acceptable: the admin issues a new invite. Releasing it instead would
+      not be sound, because the account that took the handle may be a
+      resumed registration of this very invite.
+  - **`used` is a mirror** of the redemption, written only by requests
+    holding it (all with the same handle), so its guard (`expires_at >
+    now`) decides nothing. Registration no longer needs an in-process
+    lock: nothing is released, so there is no release to order.
 - **Replay ledger** (`replay/ledger.rs`). Rows are now never updated.
   - **Expired-row reuse:** §4.5 permits reusing a nonce after its window.
     The ledger now persists the clock (at least `now`), deletes the
@@ -160,7 +176,7 @@ grant anything (a role landing on an admin who was just disabled).
 
 - `DeviceKey` revocation (`revoked == false`): idempotent and one-way.
 - `RegistrationInvite` revocation (`expires_at > now`): all racers write
-  the same expiry, and a claim racing it is an in-flight registration.
+  the same expiry, and a redemption racing it is an in-flight registration.
 - `Admin.set_role` (`status == active`): a role landing on an admin just
   disabled grants nothing.
 - `profiles::update_profile` (`status == active`): a change landing on an
@@ -171,7 +187,7 @@ grant anything (a role landing on an admin who was just disabled).
 
 ## Consequences
 
-- **New types, added only.** `AdminClaim` and `InviteClaim` are new types;
+- **New types, added only.** `AdminClaim` and `InviteRedemption` are new types;
   rhypedb applies added types without a migration (its `migrations.md`).
   `ReplayClock` is unchanged in shape; only how its rows are used changed.
 - **A credential change or sign-in costs one more write** (the claim), and
@@ -179,11 +195,13 @@ grant anything (a role landing on an admin who was just disabled).
   paths or ones already doing several writes.
 - **A crash mid-change blocks that admin's next credential change** for up
   to 120 s, until the lease expires.
-- **An invite claimed by a request that crashed before marking it used**
-  is unclaimable for up to 120 s, until its claim's lease ends.
-- **`InviteClaim.expires_at` needs no migration:** the type is new in this
-  change and has never been deployed, so the field is part of it from the
-  start.
+- **An invite redeemed by a request that crashed or failed before making
+  its account** is spent on that handle: only a registration for that
+  handle can finish it. An invite whose handle was taken in the moment
+  between the check and the create is spent outright. The admin issues a
+  new one in either case.
+- **Handles are never reused.** The invite bound relies on accounts never
+  being deleted; a future account deletion must keep the handle reserved.
 - **New code that needs a conditional write follows the pattern.** Code
   review rejects a guard used as compare-and-set. Example: a
   revision-guarded PATCH (`If-Match: rev`) claims `{object}:{rev + 1}`

@@ -29,21 +29,19 @@
   2. No invite, or one that is unknown, expired, used, or pinned to another
      handle → `403 invite_required`. The body is identical in every case.
   3. Invalid handle or password → `400`. Handle taken → `409`.
-  4. Hash, then claim the invite and create the account. Both run under one
-     in-process lock: the claim is a `@unique` `InviteClaim` row, and only
-     its creator marks the invite used (decision 0012; a conditional update
-     on `used == false` alone is not atomic in rhypedb). A claim whose
-     account can't be created is released. The invite therefore stays usable after a
-     failed registration, and of two registrations with one invite exactly
-     one succeeds. After an ambiguous storage error the invite is released
-     only if the account is confirmed absent.
+  4. Hash, then redeem the invite and create the account. The redemption
+     is a `@unique` `InviteRedemption` row naming the handle, made before
+     the account and never undone (decision 0012; a conditional update on
+     `used == false` alone is not atomic in rhypedb). Of any number of
+     registrations with one invite, in any number of processes, at most
+     one account results. A registration that fails after redeeming leaves
+     the invite spent on its handle: a retry for that handle finishes it,
+     any other handle gets `403 invite_required`.
   5. `201` with a bootstrap token.
 - **Display name:** starts as the handle; the registration request carries
   none.
 - **`recoveryEmail`** is accepted and ignored: there's no email channel yet
   (see "Not here yet").
-- **Single instance:** the lock assumes one server process, as the replay
-  store already does.
 
 ### Passwords (§4.1.4)
 

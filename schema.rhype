@@ -58,17 +58,16 @@ type RegistrationInvite {
     used_by: String
 }
 
-// The claim on an invite (docs/decisions/0012): a `RegistrationInvite` is
-// marked used only by the request that created this row, so one invite
-// makes one account however many registrations race. Deleted when a failed
-// registration releases the invite.
-type InviteClaim {
+// The redemption of an invite (docs/decisions/0012): created before the
+// account, and never updated, deleted or taken over. The `@unique` create
+// decides which registration redeems a `RegistrationInvite`, and `handle`
+// is the only account it can ever make, so one invite makes at most one
+// account however requests race, stall or crash. `RegistrationInvite.used`
+// mirrors it.
+type InviteRedemption {
     token_hash: String @unique
     handle: String
-    claimed_at: DateTime
-    // A lease: once past, a claim beside an invite still unused, whose
-    // handle has no account, was abandoned and may be taken over.
-    expires_at: DateTime
+    redeemed_at: DateTime
 }
 
 // The persistent replay ledger (spec §4.5 "Restarts"; docs/decisions/0001).

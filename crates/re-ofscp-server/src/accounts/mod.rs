@@ -108,8 +108,6 @@ pub struct Accounts {
     /// Serializes device-key registration, so the per-account key cap holds
     /// exactly (registration is rare).
     pub key_registration: Mutex<()>,
-    /// Serializes claiming an invite with creating its account.
-    registration_lock: Mutex<()>,
     revocations: broadcast::Sender<Revocation>,
 }
 
@@ -146,7 +144,6 @@ impl Accounts {
             // 5 free failures, then 60 s doubling to 1 h.
             login_backoff: FailureBackoff::new(5, 60, 3600, 100_000),
             key_registration: Mutex::new(()),
-            registration_lock: Mutex::new(()),
             revocations,
         }
     }

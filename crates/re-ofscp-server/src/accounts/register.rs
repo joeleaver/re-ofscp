@@ -9,7 +9,7 @@
 use re_ofscp_types::auth::{RegistrationMode, RegistrationRequest};
 
 use super::invites::{
-    DEFAULT_INVITE_TTL_SECS, InviteClaim, IssuedInvite, MAX_INVITE_TTL_SECS, new_token, token_hash,
+    DEFAULT_INVITE_TTL_SECS, IssuedInvite, MAX_INVITE_TTL_SECS, new_token, token_hash,
 };
 use super::password::check_length;
 use super::{Accounts, CreateError, PasswordError, StoreError, User, check_new_handle};
@@ -145,10 +145,20 @@ impl Accounts {
             .ok_or(RegisterError::InviteRequired)?;
         let invite = self
             .invites
-            .find_usable(&hash, now)
+            .find_live(&hash, now)
             .await?
             .ok_or(RegisterError::InviteRequired)?;
         if invite.handle.as_deref().is_some_and(|h| h != req.handle) {
+            return Err(RegisterError::InviteRequired);
+        }
+        // A used invite is spent, except to resume its own handle's
+        // registration when that never made the account (its request
+        // crashed or failed after redeeming; docs/decisions/0012). The
+        // lookup only answers a caller holding this invite, for the handle
+        // it was redeemed for.
+        if let Some(by) = &invite.used_by
+            && (by != &req.handle || self.store.find_user(&req.handle).await?.is_some())
+        {
             return Err(RegisterError::InviteRequired);
         }
 
@@ -160,52 +170,18 @@ impl Accounts {
         }
         let password_hash = self.passwords.hash(&req.password).await?;
 
-        // 3. Claim the invite and create the account, serialized, so of two
-        // registrations with one invite exactly one claims it, and a claim
-        // whose account cannot be created is released before anyone else
-        // looks.
-        let _serial = self.registration_lock.lock().await;
-        let Some(claim) = self.invites.claim(&hash, &req.handle, now).await? else {
+        // 3. Redeem the invite for this handle, then create the account.
+        // The redemption is never undone (docs/decisions/0012): the invite
+        // can then only ever make the account `req.handle`, and handles are
+        // unique, so however requests race, stall or crash, it makes one
+        // account at most. A failure from here on leaves it spent on this
+        // handle; a retry for the same handle resumes it.
+        if !self.invites.redeem(&hash, &req.handle, now).await? {
             return Err(RegisterError::InviteRequired);
-        };
-        match self
+        }
+        Ok(self
             .store
             .create_user(&req.handle, &req.handle, &password_hash, now)
-            .await
-        {
-            Ok(user) => Ok(user),
-            Err(StoreError::HandleTaken) => {
-                self.release_invite(&claim, &req.handle).await;
-                Err(RegisterError::HandleTaken)
-            }
-            Err(e) => {
-                // Ambiguous: the write may have landed (say, a timeout after
-                // the row was stored). Release only if the account is
-                // certainly absent, or one invite could create two accounts.
-                match self.store.find_user(&req.handle).await {
-                    Ok(None) => self.release_invite(&claim, &req.handle).await,
-                    Ok(Some(_)) => {}
-                    Err(check) => tracing::error!(
-                        error = %check,
-                        handle = %req.handle,
-                        "could not tell whether a failed registration stored its account; \
-                         the invite stays spent"
-                    ),
-                }
-                Err(e.into())
-            }
-        }
-    }
-
-    async fn release_invite(&self, claim: &InviteClaim, handle: &str) {
-        if let Err(e) = self.invites.release(claim).await {
-            tracing::error!(
-                error = %e,
-                handle = %handle,
-                "could not release an invite after a failed registration; \
-                 the invite stays spent (or, if only its claim was left, \
-                 usable again once the claim's lease ends)"
-            );
-        }
+            .await?)
     }
 }

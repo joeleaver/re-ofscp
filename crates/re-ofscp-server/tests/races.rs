@@ -8,8 +8,8 @@ use std::future::Future;
 use std::sync::Arc;
 
 use common::rhypedb::RhypeServer;
-use re_ofscp_server::accounts::AccountStore;
-use re_ofscp_server::accounts::invites::{INVITE_CLAIM_LEASE_SECS, InviteStore};
+use re_ofscp_server::accounts::invites::InviteStore;
+use re_ofscp_server::accounts::{AccountStore, Revoked, StoreError};
 use re_ofscp_server::admin::claims::{self, Claims};
 use re_ofscp_server::admin::{Admin, AdminStore, NewAdmin};
 use re_ofscp_server::db::{Db, DbConfig, Ql};
@@ -306,147 +306,155 @@ async fn the_persisted_replay_clock_never_goes_down_under_racing_purges() {
     assert_eq!(rows.len(), 1);
 }
 
-/// One single-use invite presented by many registrations at once: claimed
-/// once. Released (the account could not be created), it can be claimed
-/// again, once.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_invite_is_claimed_exactly_once_under_concurrency() {
-    let server = RhypeServer::start();
-    let invites = Arc::new(InviteStore::new(db(&server)));
-    let hash = "a".repeat(64);
+/// Redeem `hash` for `handle` and, if that succeeds, create the account,
+/// as registration does. Whether an account was made.
+async fn register(
+    invites: &InviteStore,
+    accounts: &AccountStore,
+    hash: &str,
+    handle: &str,
+    now: i64,
+) -> bool {
+    if !invites.redeem(hash, handle, now).await.unwrap() {
+        return false;
+    }
+    match accounts
+        .create_user(handle, handle, "$argon2id$placeholder", now)
+        .await
+    {
+        Ok(_) => true,
+        Err(StoreError::HandleTaken) => false,
+        Err(e) => panic!("{e}"),
+    }
+}
+
+async fn accounts_made(db: &Db) -> usize {
+    db.fetch::<Any>(&Ql::new("User")).await.unwrap().len()
+}
+
+async fn new_invite(invites: &InviteStore, hash: &str) {
     invites
-        .create(&hash, None, "owner", NOW, NOW + 3_600)
+        .create(hash, None, "owner", NOW, NOW + 3_600)
         .await
         .unwrap();
+}
+
+/// One single-use invite presented by many registrations at once, each for
+/// its own handle: redeemed once, one account. It stays spent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_invite_is_redeemed_exactly_once_under_concurrency() {
+    let server = RhypeServer::start();
+    let db = db(&server);
+    let invites = Arc::new(InviteStore::new(db.clone()));
+    let accounts = Arc::new(AccountStore::new(db.clone()));
+    let hash = "a".repeat(64);
+    new_invite(&invites, &hash).await;
     for round in 0..2 {
         let results = race(|i| {
-            let (invites, hash) = (invites.clone(), hash.clone());
+            let (invites, accounts, hash) = (invites.clone(), accounts.clone(), hash.clone());
             async move {
-                let handle = format!("user{i}");
-                invites.claim(&hash, &handle, NOW + 1).await.unwrap()
+                let handle = format!("r{round}user{i}");
+                register(&invites, &accounts, &hash, &handle, NOW + 1).await
             }
         })
         .await;
-        let won: Vec<_> = results.into_iter().flatten().collect();
-        assert_eq!(won.len(), 1, "round {round}: {won:?}");
-        if round == 0 {
-            invites.release(&won[0]).await.unwrap();
-        }
+        let expected = usize::from(round == 0);
+        assert_eq!(winners(&results), expected, "round {round}");
     }
+    assert_eq!(accounts_made(&db).await, 1);
     assert!(invites.find_usable(&hash, NOW + 2).await.unwrap().is_none());
-    // An expired invite is never claimed, and leaves no claim behind.
-    let old = "b".repeat(64);
-    invites
-        .create(&old, None, "owner", NOW, NOW + 10)
-        .await
-        .unwrap();
-    assert!(
-        invites
-            .claim(&old, "late", NOW + 10)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    let db = db(&server);
-    let claims = db.fetch::<Any>(&Ql::new("InviteClaim")).await.unwrap();
-    assert_eq!(claims.len(), 1);
+    assert!(invites.list_usable(NOW + 2, 10).await.unwrap().is_empty());
+    let rows = db.fetch::<Any>(&Ql::new("InviteRedemption")).await.unwrap();
+    assert_eq!(rows.len(), 1);
 }
 
-/// Leave a claim by `handle` on `hash`, claimed at `at`, as a registration
-/// that crashed after claiming (or whose update failed, or whose release
-/// could not drop it) leaves it: beside an invite still unused.
-async fn strand_claim(db: &Db, hash: &str, handle: &str, at: i64) {
-    let q = Ql::new("InviteClaim.create({ token_hash: ")
-        .str(hash)
-        .raw(", handle: ")
-        .str(handle)
-        .raw(", claimed_at: ")
-        .unix_seconds(at)
-        .raw(", expires_at: ")
-        .unix_seconds(at + INVITE_CLAIM_LEASE_SECS)
+/// Many registrations on one invite, several per handle, so redeemers race
+/// resumers of the same redemption: still exactly one account.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_32_way_race_on_one_invite_makes_one_account() {
+    let server = RhypeServer::start();
+    let db = db(&server);
+    let invites = Arc::new(InviteStore::new(db.clone()));
+    let accounts = Arc::new(AccountStore::new(db.clone()));
+    for round in 0..4u8 {
+        let hash = char::from(b'b' + round).to_string().repeat(64);
+        new_invite(&invites, &hash).await;
+        let results = race(|i| {
+            let (invites, accounts, hash) = (invites.clone(), accounts.clone(), hash.clone());
+            async move {
+                let handle = format!("r{round}user{}", i % 4);
+                register(&invites, &accounts, &hash, &handle, NOW + 1).await
+            }
+        })
+        .await;
+        assert_eq!(winners(&results), 1, "round {round}: {results:?}");
+        assert_eq!(accounts_made(&db).await, usize::from(round) + 1);
+    }
+}
+
+/// The original redeemer stalls (past any lease), while others arrive: one
+/// for another handle is refused, one for the same handle resumes. Then
+/// both go on to create the account: one account, and the invite stays
+/// spent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stalled_redeemer_cannot_let_a_second_account_through() {
+    let server = RhypeServer::start();
+    let db = db(&server);
+    let invites = InviteStore::new(db.clone());
+    let accounts = AccountStore::new(db.clone());
+    let hash = "f".repeat(64);
+    new_invite(&invites, &hash).await;
+    // A redeems, then stalls before creating its account.
+    assert!(invites.redeem(&hash, "alice", NOW).await.unwrap());
+    let later = NOW + 600;
+    assert!(!invites.redeem(&hash, "bob", later).await.unwrap());
+    // B, for the same handle, resumes; both create the account at once.
+    assert!(invites.redeem(&hash, "alice", later).await.unwrap());
+    let create = |at| accounts.create_user("alice", "alice", "$argon2id$placeholder", at);
+    let (a, b) = tokio::join!(create(NOW), create(later));
+    assert_eq!(
+        usize::from(a.is_ok()) + usize::from(b.is_ok()),
+        1,
+        "{a:?} {b:?}"
+    );
+    assert!(matches!(a.err().or(b.err()), Some(StoreError::HandleTaken)));
+    // Still spent on alice: no other handle gets through, now or later.
+    assert!(!register(&invites, &accounts, &hash, "carol", later + 1).await);
+    assert_eq!(accounts_made(&db).await, 1);
+}
+
+/// A request that crashed after redeeming, before marking the invite used
+/// or making the account: the invite reads spent everywhere (it is not
+/// listed, and revoking it says used), refuses every other handle, and the
+/// same handle can still finish.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_redemption_stranded_by_a_crash_fails_closed_but_resumes_its_handle() {
+    let server = RhypeServer::start();
+    let db = db(&server);
+    let invites = InviteStore::new(db.clone());
+    let accounts = AccountStore::new(db.clone());
+    let hash = "g".repeat(64);
+    new_invite(&invites, &hash).await;
+    let spare = "h".repeat(64);
+    new_invite(&invites, &spare).await;
+    let q = Ql::new("InviteRedemption.create({ token_hash: ")
+        .str(&hash)
+        .raw(", handle: \"dave\", redeemed_at: ")
+        .unix_seconds(NOW)
         .raw(" })");
     db.execute(&q).await.unwrap();
-}
-
-async fn race_claims(invites: &Arc<InviteStore>, hash: &str, now: i64) -> usize {
-    let results = race(|i| {
-        let (invites, hash) = (invites.clone(), hash.to_owned());
-        async move {
-            let handle = format!("user{i}");
-            invites.claim(&hash, &handle, now).await.unwrap()
-        }
-    })
-    .await;
-    results.iter().filter(|c| c.is_some()).count()
-}
-
-/// A claim stranded beside an unused invite blocks it only until its lease
-/// ends. Then many registrations take it over at once, and exactly one
-/// wins; the invite is used once.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_stranded_invite_claim_is_taken_over_exactly_once_after_its_lease() {
-    let server = RhypeServer::start();
-    let db = db(&server);
-    let invites = Arc::new(InviteStore::new(db.clone()));
-    let hash = "c".repeat(64);
-    invites
-        .create(&hash, None, "owner", NOW, NOW + 3_600)
-        .await
-        .unwrap();
-    strand_claim(&db, &hash, "crashed", NOW).await;
-    // Within the lease: it may still be in flight, so nobody takes it.
-    let lease_end = NOW + INVITE_CLAIM_LEASE_SECS;
-    assert_eq!(race_claims(&invites, &hash, lease_end - 1).await, 0);
-    assert!(
-        invites
-            .find_usable(&hash, lease_end)
-            .await
-            .unwrap()
-            .is_some()
-    );
-    // Expired: exactly one taker wins, and the invite is then used.
-    for round in 0..3 {
-        let now = lease_end + round * (INVITE_CLAIM_LEASE_SECS + 1);
-        let won = race_claims(&invites, &hash, now).await;
-        if round == 0 {
-            assert_eq!(won, 1, "round {round}");
-        } else {
-            // Used: the winner's claim is the record, never taken over.
-            assert_eq!(won, 0, "round {round}");
-        }
-    }
-    assert!(
-        invites
-            .find_usable(&hash, lease_end)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    let claims = db.fetch::<Any>(&Ql::new("InviteClaim")).await.unwrap();
-    assert_eq!(claims.len(), 1);
-}
-
-/// An expired claim whose handle has an account is kept: that holder may
-/// have made it, so the invite is not reopened.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_expired_invite_claim_with_an_account_is_not_taken_over() {
-    let server = RhypeServer::start();
-    let db = db(&server);
-    let invites = Arc::new(InviteStore::new(db.clone()));
-    let hash = "d".repeat(64);
-    invites
-        .create(&hash, None, "owner", NOW, NOW + 3_600)
-        .await
-        .unwrap();
-    strand_claim(&db, &hash, "made", NOW).await;
-    AccountStore::new(db.clone())
-        .create_user("made", "made", "$argon2id$placeholder", NOW)
-        .await
-        .unwrap();
-    let later = NOW + INVITE_CLAIM_LEASE_SECS + 1;
-    assert_eq!(race_claims(&invites, &hash, later).await, 0);
-    let claims = db.fetch::<Any>(&Ql::new("InviteClaim")).await.unwrap();
-    assert_eq!(claims.len(), 1);
+    let live = invites.find_live(&hash, NOW + 1).await.unwrap().unwrap();
+    assert_eq!(live.used_by, None, "marking used is what the crash skipped");
+    assert!(invites.find_usable(&hash, NOW + 1).await.unwrap().is_none());
+    let listed = invites.list_usable(NOW + 1, 1).await.unwrap();
+    assert_eq!(listed.len(), 1, "fetched past the redeemed one");
+    assert_eq!(listed[0].token_hash, spare);
+    assert!(!register(&invites, &accounts, &hash, "erin", NOW + 1).await);
+    assert!(register(&invites, &accounts, &hash, "dave", NOW + 2).await);
+    let live = invites.find_live(&hash, NOW + 3).await.unwrap().unwrap();
+    assert_eq!(live.used_by.as_deref(), Some("dave"));
+    assert_eq!(invites.revoke(&hash, NOW + 3).await.unwrap(), Revoked::Used);
+    assert_eq!(accounts_made(&db).await, 1);
 }
 
 /// The persisted clock is the highest row even when there are more rows
