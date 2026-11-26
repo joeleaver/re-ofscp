@@ -55,9 +55,10 @@
 - SHA-1, 6 digits, 30-second steps, one step of skew either way. These are
   the parameters every authenticator app supports.
 - **Every sign-in needs a code** once enrolled. Each step is accepted at most
-  once: the login does a conditional update `totp_last_step < step`, so even
-  concurrent sign-ins can't reuse a code. Reset keeps the last used step, so
-  old codes stay dead.
+  once: the login claims the step with a `@unique` `AdminClaim` row before
+  accepting it, so even concurrent sign-ins can't reuse a code (decision
+  0012; a conditional update `totp_last_step < step` is not enough in
+  rhypedb). Reset keeps the highest used step, so old codes stay dead.
 - **Sealed at rest:** secrets are encrypted with XChaCha20-Poly1305 under
   `ADMIN_SECRET_KEY`, with the username as associated data (a sealed secret
   copied to another row doesn't open). Format `v1:` + base64(nonce ‖
@@ -102,9 +103,9 @@ change the password, and log out; everything else is 403 and audited as a
   sign-in that read the admin before the change but stored its session
   after the deletion (its password check takes ~100 ms) would survive,
   and a password-only session would then count as a full one once TOTP is
-  enrolled. So `Admin.credential_epoch` is bumped, by a conditional update
-  on its old value, whenever TOTP is confirmed or reset or the password
-  changes. Each session stores the epoch it was opened under, and a session
+  enrolled. So `Admin.credential_epoch` is bumped, by the holder of a
+  `@unique` claim on the next value (decision 0012), whenever TOTP is
+  confirmed or reset or the password changes. Each session stores the epoch it was opened under, and a session
   whose epoch differs from its admin's is dead. The session that made the
   change is re-stamped with the new epoch. A stale session is refused
   but not deleted on sight (the change deletes the admin's other sessions

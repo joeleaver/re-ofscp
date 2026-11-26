@@ -23,6 +23,17 @@ type User {
     // The profile's metadata list (§5.4), as a JSON array.
     profile_metadata: String
     profile_updated_at: DateTime
+    // A registration in flight (docs/decisions/0012). Registration creates
+    // the account first, with `pending: true`, so the `@unique` handle is
+    // the first thing it holds; it then redeems the invite and activates the
+    // account by setting `pending` to false (never back). A pending account
+    // is invisible: it cannot log in, has no keys or profile, and the admin
+    // lists mark it. `invite_hash` is the invite it registers with, and
+    // `pending_key` (random) names its `AccountSettlement`. Accounts created
+    // by admins, or before this field existed, have none of the three.
+    pending: Bool
+    invite_hash: String
+    pending_key: String
 }
 
 // A device key (§4.3.2), owned by the account with `handle`. Keys are found
@@ -43,8 +54,9 @@ type DeviceKey {
 
 // An account invite (§4.1.1, lost-conn/ofscp#18): single-use, time-limited,
 // optionally pinned to a handle. Only the token's SHA-256 is stored.
-// `used_at` and `used_by` describe the use only while `used` is true (a
-// registration that fails after claiming the invite releases it again).
+// `used_at` and `used_by` describe the use only while `used` is true
+// (`used` mirrors the `InviteRedemption`; an earlier version could set it
+// back to false).
 type RegistrationInvite {
     token_hash: String @unique
     // The pinned handle, absent when the invite is for any handle.
@@ -56,6 +68,31 @@ type RegistrationInvite {
     used: Bool
     used_at: DateTime
     used_by: String
+}
+
+// The redemption of an invite (docs/decisions/0012): created by the
+// registration holding the (pending) account for `handle`, before it is
+// activated, and never updated, deleted or taken over. The `@unique` create
+// decides which registration redeems a `RegistrationInvite`, and `handle`
+// is the only account it can ever make, so one invite makes at most one
+// account however requests race, stall or crash. `RegistrationInvite.used`
+// mirrors it.
+type InviteRedemption {
+    token_hash: String @unique
+    handle: String
+    redeemed_at: DateTime
+}
+
+// How a pending account was settled (docs/decisions/0012): `key` is its
+// `User.pending_key`, `outcome` is "activate" or "discard". Created once,
+// never updated or deleted. Only the creator of "activate" (or anyone
+// finishing it) clears `User.pending`; only "discard" lets anyone delete the
+// pending row. So a row being activated is never deleted, however late
+// either write lands.
+type AccountSettlement {
+    key: String @unique
+    outcome: String
+    settled_at: DateTime
 }
 
 // The persistent replay ledger (spec §4.5 "Restarts"; docs/decisions/0001).
@@ -72,9 +109,14 @@ type ReplayNonce {
     expires_at: DateTime @indexed
 }
 
-// The replay store's clock, persisted when the ledger is purged, so a nonce
-// purged as expired stays expired after a restart even if the wall clock had
-// stepped forward and was corrected (docs/decisions/0001). One row, "replay".
+// The replay store's clock, persisted before the ledger deletes anything, so
+// a nonce purged as expired stays expired after a restart even if the wall
+// clock had stepped forward and was corrected (docs/decisions/0001). The
+// type holds only this clock: one row per persisted value ("replay@{secs}";
+// the first deployments kept a single row, "replay"), and the clock is the
+// highest. Rows are created, never updated, and those below the newest are
+// deleted, so the clock never goes down however writers race
+// (docs/decisions/0012).
 type ReplayClock {
     name: String @unique
     high_water: DateTime
@@ -96,18 +138,34 @@ type Admin {
     totp_secret: String
     // A secret awaiting confirmation (sealed likewise), or empty.
     totp_pending: String
-    // The last accepted TOTP time step; a code is accepted only for a later
-    // step, so each code works once.
+    // The highest TOTP time step used; a code is accepted only for a later
+    // step. Each code works once because using it first claims its step in
+    // `AdminClaim` (docs/decisions/0012); this field also refuses older
+    // steps once their claims are gone.
     totp_last_step: i64
     // Set when another admin chose the password.
     password_change_required: Bool
     // Bumped whenever the admin's credentials change (TOTP confirmed or
     // reset, password changed). Each session records the value it was
-    // opened under and ends once it differs.
+    // opened under and ends once it differs. Only the holder of the
+    // `AdminClaim` on the next value may write it (docs/decisions/0012).
     credential_epoch: i64
     // The admin who created this one, or "setup".
     created_by: String
     created_at: DateTime
+}
+
+// A claim that serializes competing admin writes (docs/decisions/0012):
+// rhypedb's filtered updates are not compare-and-set, but a `@unique` create
+// is, so only the request that creates the claim proceeds. Keys are
+// "totp-step:{username}:{step}" (each TOTP code is accepted once) and
+// "epoch:{username}:{epoch}" (one credential change per epoch). Claims are
+// never updated; expired ones may be taken over, and are purged.
+type AdminClaim {
+    key: String @unique
+    username: String @indexed
+    created_at: DateTime
+    expires_at: DateTime @indexed
 }
 
 // A signed-in admin's session. Only the token's SHA-256 is stored.
@@ -132,6 +190,74 @@ type AdminAudit {
     outcome: String
     source: String
     detail: String
+}
+
+// A group (spec §5.2), hosted here. Channels and memberships refer to it by
+// `group_id` (its local id), not by a relation field: rhypedb at the pinned
+// commit cannot link inside `create`, so a relation would make every channel
+// create two non-atomic statements (docs/decisions/0014). Groups are deleted
+// in two steps: `status` goes to "deleting" (the group disappears from every
+// surface at once), then its channels, memberships and finally the group row
+// are removed; a sweeper finishes any deletion a crash interrupted.
+type Group {
+    group_id: String @unique
+    // The owner's canonical actor (`handle@domain`, §2.2).
+    owner: String @indexed
+    name: String
+    tier: String
+    join_policy: String
+    // "active" or "deleting".
+    status: String @indexed
+    // Bumped by every update. Only the edit holding the `GroupClaim` on the
+    // next revision writes it (docs/decisions/0014).
+    revision: i64
+    // JSON: description, permissions, roles, metadata (model::GroupDoc).
+    doc: String
+    created_at: DateTime
+    updated_at: DateTime
+}
+
+// A channel of a group (spec §5.2, §5.2.1).
+type Channel {
+    channel_id: String @unique
+    group_id: String @indexed
+    // "text" or "call"; immutable.
+    kind: String
+    tier: String
+    // "pending" (written, not yet confirmed: invisible) or "active"; the
+    // sweeper removes pending rows older than groups::PENDING_TTL.
+    status: String @indexed
+    // As Group.revision: written only under its `GroupClaim`.
+    revision: i64
+    // JSON: name, topic, tags, permissions, metadata (model::ChannelDoc).
+    doc: String
+    created_at: DateTime
+    updated_at: DateTime
+}
+
+// A non-owner member of a group (spec §5.7). The owner is `Group.owner` and
+// has no row here. `key` is `group_id` + " " + the canonical actor, so one
+// actor holds at most one membership per group. Actors may be remote
+// (§8.2): identity is the full `handle@domain` (security requirement 1).
+type Membership {
+    key: String @unique
+    group_id: String @indexed
+    actor: String @indexed
+    role: String
+    // "pending" or "active", as for Channel.status.
+    status: String @indexed
+    joined_at: DateTime
+}
+
+// A claim on the next revision of a group or channel (docs/decisions/0014):
+// rhypedb's filtered updates are not compare-and-set, but a `@unique` create
+// is, so only the edit that creates the claim writes that revision. Keys are
+// "group:{group_id}:{revision}" and "channel:{channel_id}:{revision}".
+// Claims are never updated; expired ones may be taken over, and are purged.
+type GroupClaim {
+    key: String @unique
+    created_at: DateTime
+    expires_at: DateTime @indexed
 }
 
 // The federation policy's mode (spec §8 Authorization,

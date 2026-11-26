@@ -132,7 +132,11 @@ pub async fn reset_totp(
     ctx.require(&state, AdminRole::Owner, "admin.totp_reset", &username)
         .await?;
     let entry = ctx.begin(&state, "admin.totp_reset", &username, "").await?;
-    match state.admins.reset_totp(&ctx.admin, &username).await {
+    match state
+        .admins
+        .reset_totp(&ctx.admin, &username, ctx.now)
+        .await
+    {
         Ok(()) => {
             entry.ok("").await;
             Ok(StatusCode::NO_CONTENT)

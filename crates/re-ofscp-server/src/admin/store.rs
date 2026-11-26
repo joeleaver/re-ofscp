@@ -1,11 +1,17 @@
 //! Admins in rhypedb (`Admin` in `schema.rhype`). Every query goes through
 //! [`Ql`]. Optional text fields are stored as `""`, never null.
+//!
+//! A filtered `update` is not compare-and-set in rhypedb, so a guard in a
+//! filter (`.credential_epoch == e`) only narrows which rows are written; it
+//! does not stop two concurrent writers. Writes whose race matters are
+//! serialized by a claim first ([`super::claims`], docs/decisions/0012).
 
 use std::sync::Arc;
 
 use re_ofscp_types::admin::AdminRole;
 use serde::Deserialize;
 
+use super::claims::{self, Claims};
 use crate::db::{Db, DbError, Ql};
 
 /// Admin status values stored in `Admin.status`.
@@ -132,12 +138,36 @@ pub struct NewAdmin<'a> {
 #[derive(Debug, Clone)]
 pub struct AdminStore {
     db: Arc<Db>,
+    claims: Claims,
 }
 
 impl AdminStore {
     /// A store over `db`.
     pub fn new(db: Arc<Db>) -> Self {
-        Self { db }
+        Self {
+            claims: Claims::new(db.clone()),
+            db,
+        }
+    }
+
+    /// Claim the move of `admin` from its credential epoch to the next one.
+    /// Every write of `credential_epoch` holds this claim, so of several
+    /// changes read at one epoch exactly one applies: the guarded update
+    /// that follows has no competitor. `false` if another change holds it.
+    async fn claim_next_epoch(&self, admin: &Admin, now: i64) -> Result<bool, DbError> {
+        self.claims
+            .claim(
+                &claims::epoch_key(&admin.username, admin.credential_epoch + 1),
+                &admin.username,
+                now + claims::EPOCH_LEASE_SECS,
+                now,
+            )
+            .await
+    }
+
+    /// Delete claims expired by `now` (see [`Claims::purge`]).
+    pub async fn purge_claims(&self, now: i64) -> Result<(), DbError> {
+        self.claims.purge(now).await
     }
 
     /// Whether any admin exists, active or not.
@@ -202,8 +232,17 @@ impl AdminStore {
 
     /// Replace the password hash, clear the change requirement and bump
     /// the credential epoch, provided the epoch is still `admin`'s (no
-    /// credential changed since it was read). `false` if it changed.
-    pub async fn set_password(&self, admin: &Admin, password_hash: &str) -> Result<bool, DbError> {
+    /// credential changed since it was read). `false` if it changed, or
+    /// another change of it is under way.
+    pub async fn set_password(
+        &self,
+        admin: &Admin,
+        password_hash: &str,
+        now: i64,
+    ) -> Result<bool, DbError> {
+        if !self.claim_next_epoch(admin, now).await? {
+            return Ok(false);
+        }
         let q = Ql::new("Admin.filter(.username == ")
             .str(&admin.username)
             .raw(" && .credential_epoch == ")
@@ -217,6 +256,10 @@ impl AdminStore {
     }
 
     /// Set the role of an active admin. `false` if it is not active.
+    ///
+    /// Not serialized: racing [`AdminStore::disable`], the role may land on
+    /// an admin just disabled, which is harmless (disabling is final, and a
+    /// disabled admin's role grants nothing).
     pub async fn set_role(&self, username: &str, role: AdminRole) -> Result<bool, DbError> {
         let q = Ql::new("Admin.filter(.username == ")
             .str(username)
@@ -240,6 +283,13 @@ impl AdminStore {
 
     /// Store a sealed secret awaiting confirmation, replacing any earlier
     /// one, provided no secret is enrolled yet. `false` if one is.
+    ///
+    /// Not serialized, deliberately: racing a confirmation or a reset, a
+    /// pending secret may be left beside an enrolled one, or survive a
+    /// reset. Neither grants anything. Only [`AdminStore::confirm_totp`]
+    /// reads it, under its epoch claim, and it enrolls exactly the secret
+    /// its caller proved a code for; a reset leaves the admin to enroll
+    /// again, which replaces it.
     pub async fn set_totp_pending(&self, username: &str, sealed: &str) -> Result<bool, DbError> {
         let q = Ql::new("Admin.filter(.username == ")
             .str(username)
@@ -249,11 +299,18 @@ impl AdminStore {
         Ok(!self.db.write_rows(&q).await?.into_objects().is_empty())
     }
 
-    /// Promote `admin`'s pending secret to the enrolled one, with `step` as
-    /// its last used step, and bump the credential epoch. `false` if the
-    /// pending secret or the epoch changed meanwhile, or a secret is
-    /// already enrolled.
-    pub async fn confirm_totp(&self, admin: &Admin, step: i64) -> Result<bool, DbError> {
+    /// Promote `admin`'s pending secret to the enrolled one, with `step`
+    /// (already claimed with [`AdminStore::use_totp_step`]) as its last
+    /// used step, and bump the credential epoch. `false` if the pending
+    /// secret or the epoch changed meanwhile, a secret is already enrolled,
+    /// or another credential change is under way.
+    pub async fn confirm_totp(&self, admin: &Admin, step: i64, now: i64) -> Result<bool, DbError> {
+        if !self.claim_next_epoch(admin, now).await? {
+            return Ok(false);
+        }
+        // The secret and the epoch change only under an epoch claim, which
+        // we hold; the pending secret may still change (see
+        // `set_totp_pending`), and we enroll the one the caller proved.
         let q = Ql::new("Admin.filter(.username == ")
             .str(&admin.username)
             .raw(" && .credential_epoch == ")
@@ -270,10 +327,34 @@ impl AdminStore {
         Ok(!self.db.write_rows(&q).await?.into_objects().is_empty())
     }
 
-    /// Record `step` as used, if it is later than the last used step: one
-    /// conditional update, so each code is accepted at most once even
-    /// under concurrent sign-ins. `false` if it was not later.
-    pub async fn use_totp_step(&self, username: &str, step: i64) -> Result<bool, DbError> {
+    /// Use `username`'s TOTP step `step` (a code that just verified):
+    /// claim it, so of any number of concurrent requests carrying the code
+    /// exactly one gets `true`, then raise the highest used step to it.
+    /// `false` if the step was used before. Claim only after the code
+    /// verified, or anyone could burn the current step.
+    pub async fn use_totp_step(
+        &self,
+        username: &str,
+        step: i64,
+        now: i64,
+    ) -> Result<bool, DbError> {
+        if !self
+            .claims
+            .claim(
+                &claims::totp_step_key(username, step),
+                username,
+                now + claims::TOTP_CLAIM_SECS,
+                now,
+            )
+            .await?
+        {
+            return Ok(false);
+        }
+        // Advisory, so not serialized: it lets `totp::verify` refuse steps
+        // older than the highest used, after their claims are purged. Two
+        // sign-ins with different codes may race it and leave the lower
+        // step, which only makes that refusal less strict; each code still
+        // works once, by its claim.
         let q = Ql::new("Admin.filter(.username == ")
             .str(username)
             .raw(" && .totp_last_step < ")
@@ -281,14 +362,19 @@ impl AdminStore {
             .raw(").update({ totp_last_step: ")
             .int(step)
             .raw(" })");
-        Ok(!self.db.write_rows(&q).await?.into_objects().is_empty())
+        self.db.execute(&q).await?;
+        Ok(true)
     }
 
     /// Remove `admin`'s TOTP enrollment (they enroll again at next
     /// sign-in) and bump the credential epoch, ending every session. The
-    /// last used step is kept, so old codes stay dead. `false` if the epoch
-    /// changed since `admin` was read.
-    pub async fn reset_totp(&self, admin: &Admin) -> Result<bool, DbError> {
+    /// highest used step is kept, so old codes stay dead. `false` if the
+    /// epoch changed since `admin` was read, or another credential change
+    /// is under way.
+    pub async fn reset_totp(&self, admin: &Admin, now: i64) -> Result<bool, DbError> {
+        if !self.claim_next_epoch(admin, now).await? {
+            return Ok(false);
+        }
         let q = Ql::new("Admin.filter(.username == ")
             .str(&admin.username)
             .raw(" && .credential_epoch == ")

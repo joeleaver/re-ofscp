@@ -11,6 +11,7 @@ pub mod cors;
 pub mod db;
 pub mod discovery;
 pub mod federation;
+pub mod groups;
 pub mod outbound;
 pub mod privacy;
 pub mod problem;
@@ -40,6 +41,7 @@ use admin::{AdminSecrets, Admins, ConsoleOrigins};
 use db::{Db, DbConfig, DbError};
 use federation::FederationPolicy;
 use federation::store::PolicyStore;
+use groups::Groups;
 use outbound::{OutboundClient, OutboundConfig};
 use privacy::{Contacts, GroupMemberships, Liveness, Relationships};
 use profiles::Profiles;
@@ -65,6 +67,8 @@ pub struct AppState {
     pub accounts: Arc<Accounts>,
     /// Admin identity, sessions and the audit log.
     pub admins: Arc<Admins>,
+    /// Groups, channels and membership (§5.2, §5.5).
+    pub groups: Arc<Groups>,
     /// Verifies every signed request, REST and federation alike, against the
     /// one provider-wide replay store.
     pub verifier: Arc<Verifier>,
@@ -105,6 +109,7 @@ pub struct AppStateBuilder {
     ledger: Option<Arc<dyn NonceLedger>>,
     clock: Arc<dyn Clock>,
     relationships: Relationships,
+    group_memberships: Option<Arc<dyn GroupMemberships>>,
     liveness: Option<Arc<dyn Liveness>>,
     ws_config: WsConfig,
     ws_seams: Seams,
@@ -144,10 +149,10 @@ impl AppStateBuilder {
     }
 
     /// Answer the `sharedGroups` tier and membership listings (§6.1, §6.5)
-    /// from `groups` instead of [`privacy::NoGroupsHosted`].
+    /// from `groups` instead of this provider's own groups (tests).
     #[must_use]
     pub fn group_memberships(mut self, groups: Arc<dyn GroupMemberships>) -> Self {
-        self.relationships.groups = groups;
+        self.group_memberships = Some(groups);
         self
     }
 
@@ -239,6 +244,16 @@ impl AppStateBuilder {
                 setup_token: config.admin_setup_token.as_ref().map(|t| t.0.clone()),
             },
         ));
+        let groups = Arc::new(Groups::new(
+            config.domain.clone(),
+            db.clone(),
+            self.clock.clone(),
+        ));
+        let mut relationships = self.relationships;
+        relationships.groups = match self.group_memberships {
+            Some(g) => g,
+            None => groups.clone(),
+        };
         let keys: Arc<dyn KeyResolver> = self.keys.unwrap_or_else(|| accounts.keys.clone());
         let verifier = Arc::new(Verifier::new(
             config.domain.clone(),
@@ -261,7 +276,7 @@ impl AppStateBuilder {
         let profiles = Arc::new(Profiles::new(
             config.domain.clone(),
             db.clone(),
-            self.relationships,
+            relationships,
             liveness,
         ));
         Ok(AppState {
@@ -269,6 +284,7 @@ impl AppStateBuilder {
             db,
             accounts,
             admins,
+            groups,
             verifier,
             discovery,
             federation,
@@ -289,6 +305,7 @@ impl AppState {
             ledger: None,
             clock: Arc::new(SystemClock),
             relationships: Relationships::default(),
+            group_memberships: None,
             liveness: None,
             ws_config: WsConfig::default(),
             ws_seams: Seams::default(),
@@ -370,6 +387,24 @@ pub fn router(state: AppState) -> Router {
             "/.well-known/ofscp/users/{handle}/keys",
             get(accounts::routes::user_keys),
         )
+        .route("/api/groups", post(groups::routes::create_group))
+        .route(
+            "/api/groups/{group_id}",
+            get(groups::routes::get_group)
+                .patch(groups::routes::update_group)
+                .delete(groups::routes::delete_group),
+        )
+        .route(
+            "/api/groups/{group_id}/channels",
+            get(groups::routes::list_channels).post(groups::routes::create_channel),
+        )
+        .route(
+            "/api/groups/{group_id}/channels/{channel_id}",
+            get(groups::routes::get_channel)
+                .patch(groups::routes::update_channel)
+                .delete(groups::routes::delete_channel),
+        )
+        .route("/api/tiers", get(groups::routes::tiers))
         .route("/api/me", get(profiles::routes::me))
         .route(
             "/api/me/profile",

@@ -3,9 +3,11 @@
 
 pub mod accounts;
 pub mod admin;
+pub mod groups;
 pub mod harness;
 pub mod key_setup;
 pub mod profiles;
+pub mod races;
 pub mod remote_peer;
 pub mod rhypedb;
 pub mod ws;

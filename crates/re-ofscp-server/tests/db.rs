@@ -362,16 +362,56 @@ async fn an_expired_unpurged_row_is_replaced_not_a_replay() {
     let live = ledger.load(1_500).await.unwrap().nonces;
     assert_eq!(live.len(), 1);
     assert_eq!(live[0].expires, 2_000);
-    // In place: the same object, so no moment existed without a covering row.
+    // Replaced by a new row (rows are never updated, decision 0012)...
     let after = db.fetch::<Any>(&Ql::new("ReplayNonce")).await.unwrap();
     assert_eq!(before.len(), 1);
     assert_eq!(after.len(), 1);
-    assert_eq!(before[0].id, after[0].id);
+    assert_ne!(before[0].id, after[0].id);
+    // ...after the clock was persisted past the old row's expiry, so the
+    // old use stays expired after a restart even had the row been lost.
+    assert_eq!(ledger.load(0).await.unwrap().clock, Some(1_500));
+}
+
+/// The first deployments kept the replay clock in one row, `"replay"`,
+/// raised in place. It still counts, and is pruned once a higher clock is
+/// persisted.
+#[tokio::test]
+async fn a_legacy_replay_clock_row_is_honoured_then_pruned() {
+    let server = RhypeServer::start();
+    let db = db(&server);
+    let q = Ql::new("ReplayClock.create({ name: \"replay\", high_water: ")
+        .unix_seconds(5_000)
+        .raw(" })");
+    db.execute(&q).await.unwrap();
+    let ledger = RhypeLedger::new(db.clone());
+    assert_eq!(ledger.load(0).await.unwrap().clock, Some(5_000));
+    ledger.purge(4_000).await.unwrap();
+    assert_eq!(ledger.load(0).await.unwrap().clock, Some(5_000));
+    ledger.purge(6_000).await.unwrap();
+    assert_eq!(ledger.load(0).await.unwrap().clock, Some(6_000));
+    #[derive(Deserialize)]
+    struct Name {
+        name: String,
+    }
+    let rows = db.fetch::<Name>(&Ql::new("ReplayClock")).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].data.name, "replay@6000");
+}
+
+/// A write naming an object id that no longer exists is `Vanished`, which
+/// the ledger and the admin claims treat as "already deleted".
+#[tokio::test]
+async fn deleting_a_missing_object_is_vanished() {
+    let server = RhypeServer::start();
+    let db = db(&server);
+    let q = Ql::new("ReplayNonce.get(").uint(987_654).raw(").delete()");
+    assert!(matches!(db.execute(&q).await, Err(DbError::Vanished(_))));
 }
 
 /// A purge racing re-persists of the same (expired) nonces must not delete
 /// a row a re-persist just made live. The reviewer's reproduction lost 5 of
-/// 900 before the purge gate.
+/// 900 before the fix (an in-process gate then; rows that are never updated
+/// now, decision 0012).
 #[tokio::test]
 async fn purge_never_deletes_a_row_just_made_live() {
     let server = RhypeServer::start();
@@ -448,4 +488,20 @@ async fn concurrent_unique_creates_are_conflicts_or_contended() {
         .await
         .unwrap();
     assert_eq!(rows.len(), 1);
+}
+
+/// A write to an object that is gone is [`DbError::Vanished`] (a filtered
+/// `update` meets this when the object it matched is deleted before the
+/// write). Pins rhypedb's message for it.
+#[tokio::test]
+async fn writing_a_deleted_object_is_vanished() {
+    let server = RhypeServer::start();
+    let db = db(&server);
+    let q = Ql::new("GroupClaim.get(")
+        .uint(987_654)
+        .raw(").update({ key: \"x\" })");
+    match db.execute(&q).await {
+        Err(DbError::Vanished(_)) => {}
+        other => panic!("{other:?}"),
+    }
 }

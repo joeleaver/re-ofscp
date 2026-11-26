@@ -18,6 +18,7 @@ use re_ofscp_types::discovery::{
     Authentication, Capabilities, DiscoveryCapabilities, DiscoveryDocument, FederationCapabilities,
     ProviderInfo, RealtimeDelivery, Software,
 };
+use re_ofscp_types::groups::Tier;
 use sha2::{Digest as _, Sha256};
 
 use crate::{AppState, Config, Problem};
@@ -59,9 +60,14 @@ pub fn document(config: &Config) -> DiscoveryDocument {
         // Every capability this provider has an answer for is stated
         // explicitly, even when the answer is "none".
         capabilities: Capabilities {
-            // No message, channel or group APIs yet.
+            // No message APIs yet.
             message_types: Some(Vec::new()),
-            tiers: Some(Vec::new()),
+            tiers: Some(
+                Tier::ALL
+                    .iter()
+                    .map(|t| re_ofscp_types::wire::Tier::from(t.as_str()))
+                    .collect(),
+            ),
             metadata_schemas: None,
             limits: None,
             // No WebSocket endpoint yet (§8.5).

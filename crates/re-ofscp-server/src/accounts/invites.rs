@@ -6,10 +6,19 @@
 //! is stored (`RegistrationInvite` in `schema.rhype`), and tokens are never
 //! logged.
 //!
-//! Claiming is one conditional update (`used == false && expires_at > now`)
-//! made while registration is serialized (see `Accounts::register`), so of
-//! two registrations presenting the same invite exactly one claims it.
+//! Redeeming creates an `InviteRedemption` row, `@unique` on the token
+//! hash and recording the handle, after registration holds the handle (a
+//! pending account, [`super::pending`]) and before it activates it
+//! (docs/decisions/0012). The row is never updated, deleted or taken over:
+//! whatever happens to the registration, that invite can only ever make an
+//! account with that handle, and handles are unique, so one invite makes at
+//! most one account. A registration for the same handle may resume a
+//! redemption whose account was never made (its request crashed or
+//! failed); one for any other handle is refused. `RegistrationInvite.used`
+//! mirrors the redemption, and every read that says an invite is usable
+//! also checks that no redemption exists.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use base64::Engine as _;
@@ -24,17 +33,25 @@ pub const INVITE_PREFIX: &str = "ai_";
 
 pub use re_ofscp_types::admin::{DEFAULT_INVITE_TTL_SECS, MAX_INVITE_TTL_SECS};
 
+/// Attempts at one redemption before giving up (failing closed).
+const REDEEM_PASSES: usize = 4;
+
+/// Token hashes per query when checking invites for redemptions.
+const REDEMPTION_CHECK_CHUNK: usize = 50;
+
 /// Longest token accepted from a client. Ours are 46 characters; anything
 /// much longer is not one of ours and is refused without a lookup.
 const MAX_TOKEN_LEN: usize = 128;
 
-/// A usable invite, as read from the store.
+/// An unexpired invite, as read from the store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Invite {
     /// SHA-256 of the token, hex.
     pub token_hash: String,
     /// The pinned handle, if any.
     pub handle: Option<String>,
+    /// The handle it was redeemed for, if it is marked used.
+    pub used_by: Option<String>,
 }
 
 /// What [`InviteStore::revoke`] found.
@@ -42,7 +59,7 @@ pub struct Invite {
 pub enum Revoked {
     /// It was usable and is now expired.
     Revoked,
-    /// It was already used (or claimed by a registration in flight); it is
+    /// It was already used (or redeemed by a registration in flight); it is
     /// expired now regardless.
     Used,
     /// No unexpired invite has that id.
@@ -79,10 +96,19 @@ pub struct InviteSummary {
 }
 
 #[derive(Deserialize)]
+struct RedemptionRow {
+    token_hash: String,
+    handle: String,
+}
+
+#[derive(Deserialize)]
 struct InviteRow {
     token_hash: String,
     #[serde(default)]
     handle: Option<String>,
+    used: bool,
+    #[serde(default)]
+    used_by: Option<String>,
 }
 
 /// The stored form of `token`: SHA-256, hex. `None` if `token` cannot be
@@ -143,11 +169,13 @@ impl InviteStore {
         self.db.write_one::<InviteRow>(&q).await.map(|_| ())
     }
 
-    /// The invite with `token_hash`, if it is unused and unexpired at `now`.
-    pub async fn find_usable(&self, token_hash: &str, now: i64) -> Result<Option<Invite>, DbError> {
+    /// The invite with `token_hash`, if it is unexpired at `now`, used or
+    /// not. Registration reads this first: an unused invite, or one used by
+    /// the registering handle (which may resume it), goes on.
+    pub async fn find_live(&self, token_hash: &str, now: i64) -> Result<Option<Invite>, DbError> {
         let q = Ql::new("RegistrationInvite.filter(.token_hash == ")
             .str(token_hash)
-            .raw(" && .used == false && .expires_at > ")
+            .raw(" && .expires_at > ")
             .unix_seconds(now)
             .raw(")");
         Ok(self
@@ -159,47 +187,182 @@ impl InviteStore {
             .map(|r| Invite {
                 token_hash: r.data.token_hash,
                 handle: r.data.handle,
+                // `used_by` outlives a release by an earlier version, which
+                // set `used` back to false; only `used` says it is spent.
+                used_by: r.data.used.then_some(r.data.used_by).flatten(),
             }))
     }
 
-    /// Mark the invite used by `handle`, if it is still unused and
-    /// unexpired at `now`. `false` if it was not (used meanwhile, expired).
-    pub async fn claim(&self, token_hash: &str, handle: &str, now: i64) -> Result<bool, DbError> {
+    /// The invite with `token_hash`, if it is unused and unexpired at `now`
+    /// and has no redemption.
+    pub async fn find_usable(&self, token_hash: &str, now: i64) -> Result<Option<Invite>, DbError> {
+        match self.find_live(token_hash, now).await? {
+            Some(i) if i.used_by.is_none() && self.redeemed_by(token_hash).await?.is_none() => {
+                Ok(Some(i))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Redeem the invite with `token_hash` for `handle` at `now`: `true` if
+    /// the caller may now create the account `handle` under it, `false` if
+    /// the invite is spent on another handle, expired or revoked.
+    ///
+    /// The `used == false` guard alone is not compare-and-set (decision
+    /// 0012), so the redemption is an `InviteRedemption` row, `@unique` on
+    /// the token hash: of any number of registrations presenting the
+    /// invite, in this process or another, exactly one creates it, and it
+    /// names the only handle the invite can ever make an account for. It is
+    /// never deleted, so a slow or crashed request can never let a second
+    /// handle through. A registration for the same handle finding it
+    /// resumes it (`true`): it holds that handle's pending account (made or
+    /// joined, [`super::pending`]), and handles are unique, so either way
+    /// one account at most.
+    pub async fn redeem(&self, token_hash: &str, handle: &str, now: i64) -> Result<bool, DbError> {
+        let create = Ql::new("InviteRedemption.create({ token_hash: ")
+            .str(token_hash)
+            .raw(", handle: ")
+            .str(handle)
+            .raw(", redeemed_at: ")
+            .unix_seconds(now)
+            .raw(" })");
+        // Several passes: a create aborted by a concurrent one (`Contended`:
+        // nothing written) before that one is visible.
+        for _ in 0..REDEEM_PASSES {
+            match self.db.execute(&create).await {
+                Ok(()) => return self.mark_used(token_hash, handle, now).await,
+                Err(DbError::Conflict(_) | DbError::Contended(_)) => {}
+                Err(e) => return Err(e),
+            }
+            match self.redeemed_by(token_hash).await? {
+                Some(by) if by == handle => return self.mark_used(token_hash, handle, now).await,
+                Some(_) => return Ok(false),
+                None => {}
+            }
+        }
+        // Never decided: neither ours nor a visible holder's. Fail closed.
+        Err(DbError::Contended(
+            "invite redemption stayed contended".to_owned(),
+        ))
+    }
+
+    /// Mark the invite used by `handle`, the handle of its redemption, if it
+    /// is unexpired at `now`. `false` if it expired or was revoked (the
+    /// redemption stays: the invite is dead anyway).
+    ///
+    /// Only callers holding the redemption for `handle` write here, and a
+    /// redemption's handle never changes, so concurrent writers (a resumed
+    /// registration beside the first) all write the same `used_by`; the
+    /// `expires_at` guard narrows, it decides no race.
+    async fn mark_used(&self, token_hash: &str, handle: &str, now: i64) -> Result<bool, DbError> {
         let q = Ql::new("RegistrationInvite.filter(.token_hash == ")
             .str(token_hash)
-            .raw(" && .used == false && .expires_at > ")
+            .raw(" && .expires_at > ")
             .unix_seconds(now)
             .raw(").update({ used: true, used_at: ")
             .unix_seconds(now)
             .raw(", used_by: ")
             .str(handle)
             .raw(" })");
-        Ok(!self.db.write_rows(&q).await?.into_objects().is_empty())
+        // A concurrent write to the invite (a resumer marking it too, or a
+        // revocation) can abort ours with `Contended`, which wrote nothing:
+        // write again.
+        for _ in 0..REDEEM_PASSES {
+            match self.db.write_rows(&q).await {
+                Ok(rows) => return Ok(!rows.into_objects().is_empty()),
+                Err(DbError::Contended(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Err(DbError::Contended(
+            "marking an invite used stayed contended".to_owned(),
+        ))
     }
 
-    /// Up to `limit` invites usable at `now`, in no particular order.
-    pub async fn list_usable(&self, now: i64, limit: usize) -> Result<Vec<InviteSummary>, DbError> {
-        let q = Ql::new("RegistrationInvite.filter(.used == false && .expires_at > ")
-            .unix_seconds(now)
-            .raw(").limit(")
-            .uint(limit as u64)
+    /// The handle the invite with `token_hash` was redeemed for, if any.
+    async fn redeemed_by(&self, token_hash: &str) -> Result<Option<String>, DbError> {
+        let q = Ql::new("InviteRedemption.filter(.token_hash == ")
+            .str(token_hash)
             .raw(")");
         Ok(self
             .db
-            .fetch::<InviteSummary>(&q)
+            .fetch::<RedemptionRow>(&q)
             .await?
             .into_iter()
-            .map(|r| r.data)
-            .collect())
+            .next()
+            .map(|r| r.data.handle))
+    }
+
+    /// Which of `hashes` have a redemption. A redemption is created before
+    /// its invite is marked used, so an invite can read unused with one
+    /// beside it (its request crashed in between); this is what keeps the
+    /// usable lists exact.
+    async fn redeemed(&self, hashes: &[&str]) -> Result<HashSet<String>, DbError> {
+        let mut found = HashSet::new();
+        for chunk in hashes.chunks(REDEMPTION_CHECK_CHUNK) {
+            let Some((first, rest)) = chunk.split_first() else {
+                continue;
+            };
+            let mut q = Ql::new("InviteRedemption.filter(.token_hash == ").str(first);
+            for h in rest {
+                q = q.raw(" || .token_hash == ").str(h);
+            }
+            let q = q.raw(")");
+            found.extend(
+                self.db
+                    .fetch::<RedemptionRow>(&q)
+                    .await?
+                    .into_iter()
+                    .map(|r| r.data.token_hash),
+            );
+        }
+        Ok(found)
+    }
+
+    /// Up to `limit` invites usable at `now` (unused, unexpired, and with no
+    /// redemption), in no particular order.
+    pub async fn list_usable(&self, now: i64, limit: usize) -> Result<Vec<InviteSummary>, DbError> {
+        // Redeemed invites still reading unused are rare (a crash between
+        // two statements); fetch past them until `limit` usable ones are
+        // found or there are no more.
+        let mut want = limit;
+        loop {
+            let q = Ql::new("RegistrationInvite.filter(.used == false && .expires_at > ")
+                .unix_seconds(now)
+                .raw(").limit(")
+                .uint(want as u64)
+                .raw(")");
+            let candidates: Vec<InviteSummary> = self
+                .db
+                .fetch::<InviteSummary>(&q)
+                .await?
+                .into_iter()
+                .map(|r| r.data)
+                .collect();
+            let fetched = candidates.len();
+            let hashes: Vec<&str> = candidates.iter().map(|i| i.token_hash.as_str()).collect();
+            let redeemed = self.redeemed(&hashes).await?;
+            let mut usable: Vec<InviteSummary> = candidates
+                .into_iter()
+                .filter(|i| !redeemed.contains(&i.token_hash))
+                .collect();
+            if usable.len() >= limit || fetched < want || redeemed.is_empty() {
+                usable.truncate(limit);
+                return Ok(usable);
+            }
+            want = fetched + redeemed.len();
+        }
     }
 
     /// Revoke the invite with `token_hash` by expiring it at `now`.
     /// [`Revoked::Unknown`] if no unexpired invite has that hash.
     ///
-    /// The invite is expired even when it is claimed: a registration in
-    /// flight may still complete, but if it fails and releases the claim the
-    /// invite stays dead. ([`Revoked::Used`] then says it was already used
-    /// or being used.)
+    /// The invite is expired even when it is redeemed: a registration in
+    /// flight may still complete (a revocation racing it is too late), and
+    /// [`Revoked::Used`] then says it was already used or being used.
+    ///
+    /// The `expires_at > now` guard is not compare-and-set (decision 0012),
+    /// and needs not be: concurrent revocations all write the same expiry.
     pub async fn revoke(&self, token_hash: &str, now: i64) -> Result<Revoked, DbError> {
         #[derive(Deserialize)]
         struct UsedRow {
@@ -216,17 +379,9 @@ impl InviteStore {
         Ok(match rows.first() {
             None => Revoked::Unknown,
             Some(r) if r.data.used => Revoked::Used,
+            Some(_) if self.redeemed_by(token_hash).await?.is_some() => Revoked::Used,
             Some(_) => Revoked::Revoked,
         })
-    }
-
-    /// Undo [`InviteStore::claim`] after the account could not be created,
-    /// so the invite stays usable.
-    pub async fn release(&self, token_hash: &str) -> Result<(), DbError> {
-        let q = Ql::new("RegistrationInvite.filter(.token_hash == ")
-            .str(token_hash)
-            .raw(" && .used == true).update({ used: false })");
-        self.db.write_rows(&q).await.map(|_| ())
     }
 }
 

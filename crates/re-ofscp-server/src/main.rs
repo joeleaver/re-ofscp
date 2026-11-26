@@ -76,8 +76,9 @@ async fn main() -> anyhow::Result<()> {
         state
             .admins
             .clone()
-            .purge_sessions_forever(std::sync::Arc::new(re_ofscp_server::signing::SystemClock)),
+            .purge_expired_forever(std::sync::Arc::new(re_ofscp_server::signing::SystemClock)),
     );
+    let sweep_groups = tokio::spawn(state.groups.clone().sweep_forever());
     let ws_recheck = tokio::spawn(state.ws.clone().recheck_forever());
     let hub = state.ws.clone();
     let app = router(state);
@@ -97,6 +98,7 @@ async fn main() -> anyhow::Result<()> {
         task.abort();
     }
     purge_sessions.abort();
+    sweep_groups.abort();
     Ok(())
 }
 

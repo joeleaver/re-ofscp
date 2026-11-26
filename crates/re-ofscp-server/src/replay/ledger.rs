@@ -10,6 +10,12 @@
 //! A nonce the ledger cannot write fails closed with `503`: the in-memory
 //! entry stays (the nonce remains burned) and the client re-signs and
 //! retries, as §4.5 requires for any `503`.
+//!
+//! rhypedb's filtered `update`/`delete` is not compare-and-set (decision
+//! 0012), so the ledger never relies on a guard: rows are created under a
+//! `@unique` key and deleted, never updated. A filter over them is then
+//! exact, and every outcome below holds however many writers race, in this
+//! process or another.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -162,14 +168,7 @@ impl NonceLedger for NoLedger {
 pub struct RhypeLedger {
     db: Arc<Db>,
     page: u64,
-    /// rhypedb's filtered `update`/`delete` is not compare-and-set: the
-    /// filter selects ids, then each id is written in its own transaction
-    /// without re-checking the filter, and queries run in parallel. A purge
-    /// batch could therefore delete a row that `persist` had just overwritten
-    /// with a live nonce. Purge batches hold this exclusively; the overwrite
-    /// path holds it shared (docs/decisions/0003). In-process only: two
-    /// processes sharing one ledger are not supported (decision 0001).
-    purge_gate: Arc<tokio::sync::RwLock<()>>,
+    clock_page: u64,
 }
 
 /// Rows read per page when restoring.
@@ -181,8 +180,9 @@ const LOAD_PAGE: u64 = 5_000;
 const PURGE_BATCH: u64 = 1_000;
 const PURGE_MAX_BATCHES: usize = 100;
 
-/// The `ReplayClock` row's name.
-const CLOCK_NAME: &str = "replay";
+/// Clock rows read per statement (pruning keeps one or two, so a full page
+/// is logged as pruning lagging).
+const CLOCK_PAGE: u64 = 1_000;
 
 #[derive(Deserialize)]
 struct NonceRow {
@@ -198,6 +198,11 @@ struct NonceRow {
 #[derive(Deserialize)]
 struct ClockRow {
     high_water: String,
+}
+
+#[derive(Deserialize)]
+struct ExpiryRow {
+    expires_at: String,
 }
 
 /// Any row (only its existence matters).
@@ -221,12 +226,13 @@ impl RhypeLedger {
     }
 
     /// As [`RhypeLedger::new`], reading `page` rows per query when restoring
-    /// (tests use small pages to exercise paging).
+    /// nonces and clock rows (tests use small pages to exercise paging).
     pub fn with_page_size(db: Arc<Db>, page: u64) -> Self {
+        let page = page.max(1);
         Self {
             db,
-            page: page.max(1),
-            purge_gate: Arc::new(tokio::sync::RwLock::new(())),
+            page,
+            clock_page: page.min(CLOCK_PAGE),
         }
     }
 
@@ -251,61 +257,83 @@ impl RhypeLedger {
         self.db.execute(&q).await
     }
 
-    /// The persisted replay clock, if any.
-    async fn read_clock(&self) -> Result<Option<(u64, i64)>, LedgerError> {
-        // (id, high_water)
-        let q = Ql::new("ReplayClock.filter(.name == ")
-            .str(CLOCK_NAME)
+    /// The persisted replay clock, if any: the highest `ReplayClock` row.
+    ///
+    /// rhypedb has no sort, so the maximum is found by raising a floor
+    /// rather than by paging with `offset`: a prune deleting rows between
+    /// two `offset` pages shifts the rest down, and the highest row could
+    /// fall into a page already read. Each statement reads one snapshot,
+    /// and every snapshot holds the highest row (a prune deletes only rows
+    /// below a value whose row exists). So a page that is not full holds
+    /// every row above the floor, and its maximum is the clock; a full page
+    /// raises the floor to its maximum and the next statement reads only
+    /// rows above it. The floor only rises, so this ends.
+    async fn read_clock(&self) -> Result<Option<i64>, LedgerError> {
+        let mut clock: Option<i64> = None;
+        let mut warned = false;
+        loop {
+            let q = match clock {
+                None => Ql::new("ReplayClock.limit("),
+                Some(floor) => Ql::new("ReplayClock.filter(.high_water > ")
+                    .unix_seconds(floor)
+                    .raw(").limit("),
+            }
+            .uint(self.clock_page)
             .raw(")");
-        let rows = self.db.fetch::<ClockRow>(&q).await.map_err(unavailable)?;
-        match rows.first() {
-            Some(r) => Ok(Some((r.id, unix(&r.data.high_water)?))),
-            None => Ok(None),
+            let rows = self.db.fetch::<ClockRow>(&q).await.map_err(unavailable)?;
+            let full = rows.len() as u64 >= self.clock_page;
+            for r in rows {
+                let t = unix(&r.data.high_water)?;
+                clock = Some(clock.map_or(t, |c| c.max(t)));
+            }
+            if !full {
+                return Ok(clock);
+            }
+            if !warned {
+                // Pruning keeps one or two rows; a full page means it lags.
+                tracing::warn!(
+                    page = self.clock_page,
+                    "replay clock has a page or more of rows; pruning lags"
+                );
+                warned = true;
+            }
         }
     }
 
-    /// Persist the replay clock as at least `clock`. The conditional update
-    /// never lowers it within one process (purges run one at a time); rhypedb
-    /// has no compare-and-set, so two processes racing could, which is one
-    /// reason a ledger is single-process (decision 0001).
+    /// Persist the replay clock as at least `clock`. A new row is created
+    /// for each value and rows below it are deleted afterwards, so the
+    /// highest row only ever rises: no update can lower it, and a delete
+    /// removes only rows below a value whose row exists.
     async fn advance_clock(&self, clock: i64) -> Result<(), LedgerError> {
-        for _ in 0..2 {
-            let q = Ql::new("ReplayClock.filter(.name == ")
-                .str(CLOCK_NAME)
-                .raw(" && .high_water < ")
-                .unix_seconds(clock)
-                .raw(").update({ high_water: ")
-                .unix_seconds(clock)
-                .raw(" })");
-            if !self
-                .db
-                .write_rows(&q)
-                .await
-                .map_err(unavailable)?
-                .into_objects()
-                .is_empty()
-            {
-                return Ok(());
-            }
-            if self.read_clock().await?.is_some() {
-                // Already at or past `clock`.
-                return Ok(());
-            }
-            let q = Ql::new("ReplayClock.create({ name: ")
-                .str(CLOCK_NAME)
-                .raw(", high_water: ")
-                .unix_seconds(clock)
-                .raw(" })");
-            match self.db.execute(&q).await {
-                Ok(()) => return Ok(()),
-                // Created concurrently: raise that row on the next pass.
-                Err(DbError::Conflict(_)) => continue,
-                Err(e) => return Err(unavailable(e)),
-            }
+        if self.read_clock().await?.is_some_and(|c| c >= clock) {
+            return Ok(());
         }
-        Err(LedgerError::Unavailable(
-            "replay clock row could not be created or raised".to_owned(),
-        ))
+        let q = Ql::new("ReplayClock.create({ name: ")
+            .str(&format!("replay@{clock}"))
+            .raw(", high_water: ")
+            .unix_seconds(clock)
+            .raw(" })");
+        match self.db.execute(&q).await {
+            // Created concurrently with the same value: equally persisted.
+            Ok(()) | Err(DbError::Conflict(_)) => {}
+            // Aborted by a concurrent create (nothing written): once more.
+            Err(DbError::Contended(_)) => match self.db.execute(&q).await {
+                Ok(()) | Err(DbError::Conflict(_)) => {}
+                Err(e) => return Err(unavailable(e)),
+            },
+            Err(e) => return Err(unavailable(e)),
+        }
+        // Tidying only: the clock is persisted. Rows are never updated, so
+        // this deletes exactly rows below `clock`, never the highest.
+        let prune = Ql::new("ReplayClock.filter(.high_water < ")
+            .unix_seconds(clock)
+            .raw(").delete()");
+        match self.db.execute(&prune).await {
+            // A concurrent prune deleted a row first.
+            Ok(()) | Err(DbError::Vanished(_) | DbError::Contended(_)) => {}
+            Err(e) => tracing::warn!(error = %e, "pruning old replay clock rows failed"),
+        }
+        Ok(())
     }
 }
 
@@ -315,66 +343,58 @@ impl NonceLedger for RhypeLedger {
             let key = n.ledger_key();
             match self.create(n, &key).await {
                 Ok(()) => return Ok(()),
-                Err(DbError::Conflict(_)) => {}
+                // A concurrent create of the same identity may abort ours
+                // (`Contended`, nothing written); either way, look.
+                Err(DbError::Conflict(_) | DbError::Contended(_)) => {}
                 Err(e) => return Err(unavailable(e)),
             }
             // Same identity already stored. Live: a replay. Expired but not
             // yet purged (a client reusing a nonce after its window, which
-            // §4.5 permits): overwrite it in place, in one conditional
-            // update, so there is never a moment without a row covering
-            // this identity (a delete-then-create could lose it to a crash
-            // or a failed create, and a restart would then reopen it).
-            // Held shared against purge batches (see `purge_gate`).
-            let _gate = self.purge_gate.read().await;
-            for _ in 0..2 {
-                let q = Ql::new("ReplayNonce.filter(.key == ")
-                    .str(&key)
-                    .raw(" && .expires_at <= ")
-                    .unix_seconds(now)
-                    .raw(").update({ signer: ")
-                    .str(&n.signer)
-                    .raw(", domain: ")
-                    .str(&n.domain)
-                    .raw(", signed_at: ")
-                    .unix_seconds(n.signed_at)
-                    .raw(", expires_at: ")
-                    .unix_seconds(n.expires)
-                    .raw(" })");
-                let replaced = self
-                    .db
-                    .write_rows(&q)
-                    .await
-                    .map_err(unavailable)?
-                    .into_objects();
-                if !replaced.is_empty() {
-                    return Ok(());
-                }
-                // Nothing expired to overwrite: either the row is live (a
-                // replay) or it was purged since our create failed.
+            // §4.5 permits): delete that row and create ours.
+            //
+            // - Persisting the clock (at least `now`, so at least the row's
+            //   expiry) first keeps the earlier use expired after a restart
+            //   even if a crash lost the row before our create, exactly as a
+            //   purge does. Our own use is not accepted until our create
+            //   succeeds, so it needs no cover before then.
+            // - The row is deleted by id. Rows are never updated, so that id
+            //   is exactly the expired row: a purge or a concurrent reuser
+            //   deleting it too changes nothing, and no live row is touched.
+            // - Concurrent reusers (in other processes; this one's in-memory
+            //   store lets only one through) all compete in the `@unique`
+            //   create: one wins, and the others find its live row.
+            for _ in 0..3 {
                 let q = Ql::new("ReplayNonce.filter(.key == ").str(&key).raw(")");
-                if !self
-                    .db
-                    .fetch::<Exists>(&q)
-                    .await
-                    .map_err(unavailable)?
-                    .is_empty()
-                {
-                    return Err(LedgerError::Duplicate);
+                let rows = self.db.fetch::<ExpiryRow>(&q).await.map_err(unavailable)?;
+                if let Some(row) = rows.first() {
+                    if unix(&row.data.expires_at)? > now {
+                        return Err(LedgerError::Duplicate);
+                    }
+                    self.advance_clock(now).await?;
+                    let q = Ql::new("ReplayNonce.get(").uint(row.id).raw(").delete()");
+                    match self.db.execute(&q).await {
+                        // Deleted (or being deleted) by a purge or a concurrent reuser.
+                        Ok(()) | Err(DbError::Vanished(_) | DbError::Contended(_)) => {}
+                        Err(e) => return Err(unavailable(e)),
+                    }
                 }
                 match self.create(n, &key).await {
                     Ok(()) => return Ok(()),
-                    // Recreated concurrently: look again.
-                    Err(DbError::Conflict(_)) => continue,
+                    // Recreated concurrently, or aborted by a concurrent
+                    // create (nothing written): look again.
+                    Err(DbError::Conflict(_) | DbError::Contended(_)) => continue,
                     Err(e) => return Err(unavailable(e)),
                 }
             }
-            Err(LedgerError::Duplicate)
+            Err(LedgerError::Unavailable(
+                "replay ledger row kept changing; retry".to_owned(),
+            ))
         })
     }
 
     fn load(&self, now: i64) -> LedgerFuture<'_, Restored> {
         Box::pin(async move {
-            let clock = self.read_clock().await?.map(|(_, c)| c);
+            let clock = self.read_clock().await?;
             // Live by the later of our clock and the persisted one.
             let cutoff = clock.map_or(now, |c| c.max(now));
             let mut nonces = Vec::new();
@@ -416,15 +436,20 @@ impl NonceLedger for RhypeLedger {
         Box::pin(async move {
             // The clock first: if it cannot be saved, delete nothing.
             self.advance_clock(clock).await?;
+            // Rows are never updated, so the filter's snapshot is exact: a
+            // row it selects stays expired until deleted.
             for _ in 0..PURGE_MAX_BATCHES {
-                // Exclusive against the overwrite path (see `purge_gate`).
-                let _gate = self.purge_gate.write().await;
                 let q = Ql::new("ReplayNonce.filter(.expires_at <= ")
                     .unix_seconds(clock)
                     .raw(").limit(")
                     .uint(PURGE_BATCH)
                     .raw(").delete()");
-                self.db.execute(&q).await.map_err(unavailable)?;
+                match self.db.execute(&q).await {
+                    // A row it selected was deleted meanwhile (by a reuse):
+                    // the statement stopped there; the next batch goes on.
+                    Ok(()) | Err(DbError::Vanished(_) | DbError::Contended(_)) => {}
+                    Err(e) => return Err(unavailable(e)),
+                }
                 let probe = Ql::new("ReplayNonce.filter(.expires_at <= ")
                     .unix_seconds(clock)
                     .raw(").limit(1)");

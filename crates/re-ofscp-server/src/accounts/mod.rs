@@ -9,6 +9,7 @@ pub mod bootstrap;
 pub mod invites;
 pub mod keys;
 pub mod password;
+pub mod pending;
 pub mod register;
 pub mod routes;
 pub mod store;
@@ -23,6 +24,7 @@ pub use bootstrap::{BOOTSTRAP_TTL_SECS, BootstrapTokens, IssueError};
 pub use invites::{InviteStore, InviteSummary, IssuedInvite, Revoked};
 pub use keys::ProviderKeys;
 pub use password::{PasswordError, Passwords};
+pub use pending::{Held, PENDING_LEASE_SECS, PendingAccount, Settlement};
 pub use register::{InviteError, RegisterError};
 pub use store::{AccountStore, AccountSummary, DeviceKey, StoreError, User};
 
@@ -115,8 +117,6 @@ pub struct Accounts {
     /// Serializes device-key registration, so the per-account key cap holds
     /// exactly (registration is rare).
     pub key_registration: Mutex<()>,
-    /// Serializes claiming an invite with creating its account.
-    registration_lock: Mutex<()>,
     listeners: RwLock<Vec<Arc<dyn RevocationListener>>>,
 }
 
@@ -152,7 +152,6 @@ impl Accounts {
             // 5 free failures, then 60 s doubling to 1 h.
             login_backoff: FailureBackoff::new(5, 60, 3600, 100_000),
             key_registration: Mutex::new(()),
-            registration_lock: Mutex::new(()),
             listeners: RwLock::new(Vec::new()),
         }
     }
