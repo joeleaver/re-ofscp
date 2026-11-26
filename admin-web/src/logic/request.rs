@@ -7,6 +7,7 @@ use re_ofscp_types::admin::{
     AdminLoginRequest, CreateAccount, CreateAdmin, CreateInvite, PasswordChange, TotpConfirm,
     UpdateAdmin,
 };
+use re_ofscp_types::federation::{AddFederationRule, SetFederationMode};
 use serde::Serialize;
 
 use super::problem::ApiError;
@@ -33,6 +34,8 @@ pub enum Method {
     Post,
     /// Admin updates.
     Patch,
+    /// Setting a value (the federation mode).
+    Put,
     /// Invite revocation.
     Delete,
 }
@@ -196,6 +199,26 @@ pub fn reset_totp(username: &str) -> ApiCall {
     )
 }
 
+/// `GET /federation`.
+pub fn get_federation() -> ApiCall {
+    ApiCall::new(Method::Get, "/federation")
+}
+
+/// `PUT /federation/mode`.
+pub fn set_federation_mode(req: &SetFederationMode) -> Result<ApiCall, ApiError> {
+    ApiCall::new(Method::Put, "/federation/mode").with_json(req)
+}
+
+/// `POST /federation/rules`.
+pub fn add_federation_rule(req: &AddFederationRule) -> Result<ApiCall, ApiError> {
+    ApiCall::new(Method::Post, "/federation/rules").with_json(req)
+}
+
+/// `DELETE /federation/rules/{id}`.
+pub fn remove_federation_rule(id: &str) -> ApiCall {
+    ApiCall::new(Method::Delete, &format!("/federation/rules/{}", seg(id)))
+}
+
 #[cfg(test)]
 mod tests {
     use re_ofscp_types::admin::AdminRole;
@@ -209,6 +232,7 @@ mod tests {
             list_accounts(None),
             list_invites(),
             list_admins(),
+            get_federation(),
         ] {
             assert_eq!(call.method, Method::Get);
             assert!(!call.is_mutation());
@@ -225,10 +249,23 @@ mod tests {
             disable_account("alice"),
             revoke_invite("x"),
             reset_totp("ops"),
+            remove_federation_rule("fr_1"),
         ] {
             assert!(call.is_mutation(), "{call:?}");
         }
         assert_eq!(revoke_invite("x").method, Method::Delete);
+        let mode = SetFederationMode {
+            mode: re_ofscp_types::federation::FederationMode::Denylist,
+        };
+        let call = set_federation_mode(&mode).unwrap();
+        assert_eq!(call.method, Method::Put);
+        assert!(call.is_mutation());
+        assert_eq!(call.url, "/api/admin/federation/mode");
+        assert_eq!(call.body.as_deref(), Some(r#"{"mode":"denylist"}"#));
+        assert_eq!(
+            remove_federation_rule("fr/../x").url,
+            "/api/admin/federation/rules/fr%2F..%2Fx"
+        );
     }
 
     #[test]

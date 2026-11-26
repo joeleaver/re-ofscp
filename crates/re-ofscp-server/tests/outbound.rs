@@ -10,6 +10,10 @@ use re_ofscp_server::outbound::{OutboundClient, OutboundError};
 use re_ofscp_types::Authority;
 use serde_json::json;
 
+fn open_policy() -> std::sync::Arc<re_ofscp_server::federation::FederationPolicy> {
+    std::sync::Arc::new(re_ofscp_server::federation::FederationPolicy::open())
+}
+
 fn authority(s: &str) -> Authority {
     Authority::parse_canonical(s).unwrap()
 }
@@ -58,8 +62,11 @@ async fn loopback_is_refused_unless_allowed() {
 
 #[tokio::test]
 async fn private_literals_are_refused_without_a_connection() {
-    let client =
-        OutboundClient::new(&re_ofscp_server::outbound::OutboundConfig::new(Vec::new())).unwrap();
+    let client = OutboundClient::new(&re_ofscp_server::outbound::OutboundConfig::new(
+        Vec::new(),
+        open_policy(),
+    ))
+    .unwrap();
     for host in [
         "10.0.0.1",
         "169.254.169.254",
@@ -155,9 +162,10 @@ async fn untrusted_certificates_fail() {
     // Without the test CA, only the Mozilla roots are trusted.
     let peer = RemotePeer::start().await;
     peer.set("/doc", Reply::json(200, &json!({})));
-    let client = OutboundClient::new(&re_ofscp_server::outbound::OutboundConfig::new(vec![
-        peer.authority(),
-    ]))
+    let client = OutboundClient::new(&re_ofscp_server::outbound::OutboundConfig::new(
+        vec![peer.authority()],
+        open_policy(),
+    ))
     .unwrap();
     let err = client.get(&peer.authority(), "/doc").await.unwrap_err();
     assert!(matches!(err, OutboundError::Network(_)), "{err:?}");
@@ -213,7 +221,7 @@ async fn requests_over_the_per_target_cap_fail_at_once() {
 fn free_subdomains_of_a_private_suffix_share_one_per_target_cap() {
     // Reserving touches no network: the cap is taken before anything is
     // resolved or sent.
-    let config = re_ofscp_server::outbound::OutboundConfig::new(Vec::new());
+    let config = re_ofscp_server::outbound::OutboundConfig::new(Vec::new(), open_policy());
     let cap = config.max_in_flight_per_target;
     let client = OutboundClient::new(&config).unwrap();
     let held: Vec<_> = (0..cap)

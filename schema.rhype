@@ -178,3 +178,32 @@ type Membership {
     status: String @indexed
     joined_at: DateTime
 }
+
+// The federation policy's mode (spec §8 Authorization,
+// docs/decisions/0008). One row, "federation"; absent means "open".
+type FederationSetting {
+    name: String @unique
+    // "open", "allowlist" or "denylist".
+    mode: String
+    // The admin who last set it.
+    updated_by: String
+    updated_at: DateTime
+}
+
+// One rule of the federation policy. Both lists are kept whatever the
+// mode; the mode says which is in force. `rule_id` is derived from
+// (list, scope, value), so the same rule cannot be stored twice.
+type FederationRule {
+    rule_id: String @unique
+    // "allow" or "deny".
+    list: String
+    // "authority" (exactly that host[:port]) or "domain" (that name and
+    // every name under it, any port).
+    scope: String
+    // The canonical authority or domain.
+    value: String
+    note: String
+    // The admin who added it.
+    created_by: String
+    created_at: DateTime
+}

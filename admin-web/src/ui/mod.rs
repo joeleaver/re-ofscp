@@ -5,6 +5,7 @@ mod accounts;
 mod admins;
 mod audit;
 mod common;
+mod federation;
 mod invites;
 mod password;
 mod setup;

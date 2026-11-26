@@ -10,6 +10,7 @@ pub mod config;
 pub mod cors;
 pub mod db;
 pub mod discovery;
+pub mod federation;
 pub mod groups;
 pub mod outbound;
 pub mod problem;
@@ -34,7 +35,9 @@ pub use problem::Problem;
 
 use accounts::Accounts;
 use admin::{AdminSecrets, Admins, ConsoleOrigins};
-use db::{Db, DbConfig};
+use db::{Db, DbConfig, DbError};
+use federation::FederationPolicy;
+use federation::store::PolicyStore;
 use groups::Groups;
 use outbound::{OutboundClient, OutboundConfig};
 use remote_keys::RemoteKeys;
@@ -65,6 +68,10 @@ pub struct AppState {
     pub verifier: Arc<Verifier>,
     /// The discovery document (§3.1), serialized once.
     pub discovery: Arc<discovery::Published>,
+    /// The federation allow/deny policy (§8 *Authorization*): stored, and
+    /// in force in the verifier, the remote key resolver and the outbound
+    /// client.
+    pub federation: Arc<PolicyStore>,
 }
 
 /// Why [`AppStateBuilder::build`] failed.
@@ -80,6 +87,10 @@ pub enum BuildError {
 /// account store, remote keys fetched through the SSRF-safe outbound client
 /// configured from `OUTBOUND_ALLOW_HOSTS`, and the rhypedb-backed replay
 /// ledger.
+///
+/// The federation policy in force is the outbound client's: one built here
+/// starts with the policy unknown (federation refused) until
+/// [`AppState::load_federation`] reads it.
 pub struct AppStateBuilder {
     config: Config,
     keys: Option<Arc<dyn KeyResolver>>,
@@ -108,7 +119,7 @@ impl AppStateBuilder {
 
     /// Make outbound requests (remote key fetches) through `client`
     /// instead of one built from the configuration (tests trusting a local
-    /// certificate authority).
+    /// certificate authority). Its federation policy becomes the state's.
     #[must_use]
     pub fn outbound(mut self, client: Arc<OutboundClient>) -> Self {
         self.outbound = Some(client);
@@ -140,12 +151,19 @@ impl AppStateBuilder {
             Some(client) => client,
             None => Arc::new(OutboundClient::new(&OutboundConfig::new(
                 config.outbound_allow_hosts.clone(),
+                Arc::new(FederationPolicy::unloaded_for(config.domain.clone())),
             ))?),
         };
+        let policy = outbound.policy().clone();
         let remote_keys = self
             .remote_keys
             .unwrap_or_else(|| Arc::new(RemoteKeys::new(outbound, self.clock.clone())));
         let db = Arc::new(Db::new(DbConfig::new(config.rhypedb_addr.clone())));
+        let federation = Arc::new(PolicyStore::new(
+            db.clone(),
+            policy.clone(),
+            config.domain.clone(),
+        ));
         let ledger = self
             .ledger
             .unwrap_or_else(|| Arc::new(RhypeLedger::new(db.clone())));
@@ -180,6 +198,7 @@ impl AppStateBuilder {
             replay,
             ledger,
             keys,
+            policy,
             self.clock,
         ));
         Ok(AppState {
@@ -190,6 +209,7 @@ impl AppStateBuilder {
             groups,
             verifier,
             discovery,
+            federation,
         })
     }
 }
@@ -223,6 +243,13 @@ impl AppState {
         let count = store.restore(restored.nonces, now);
         store.end_warm_up();
         Ok(count)
+    }
+
+    /// Read the stored federation policy and put it in force. Call before
+    /// serving; until it succeeds every federation decision fails closed
+    /// (`503` inbound, nothing sent outbound).
+    pub async fn load_federation(&self) -> Result<(), DbError> {
+        self.federation.load().await
     }
 
     /// Delete expired nonces from the ledger, every

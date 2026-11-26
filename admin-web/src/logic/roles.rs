@@ -22,18 +22,27 @@ pub enum Action {
     ViewAudit,
     /// List, create, change and disable admins; reset their TOTP.
     ManageAdmins,
+    /// Read the federation policy.
+    ViewFederation,
+    /// Add and remove federation allow/deny rules.
+    EditFederationRules,
+    /// Switch the federation mode (open, allowlist, denylist).
+    SetFederationMode,
 }
 
 impl Action {
     /// The least role that may do this.
     pub fn required(self) -> AdminRole {
         match self {
-            Self::ViewAccounts | Self::ViewInvites | Self::ViewAudit => AdminRole::ReadOnly,
+            Self::ViewAccounts | Self::ViewInvites | Self::ViewAudit | Self::ViewFederation => {
+                AdminRole::ReadOnly
+            }
             Self::CreateAccount
             | Self::DisableAccount
             | Self::CreateInvite
-            | Self::RevokeInvite => AdminRole::Operator,
-            Self::ManageAdmins => AdminRole::Owner,
+            | Self::RevokeInvite
+            | Self::EditFederationRules => AdminRole::Operator,
+            Self::ManageAdmins | Self::SetFederationMode => AdminRole::Owner,
         }
     }
 }
@@ -70,6 +79,8 @@ pub enum Section {
     Invites,
     /// Admins (owners only).
     Admins,
+    /// The federation allow/deny policy.
+    Federation,
     /// The audit log.
     Audit,
     /// The signed-in admin's own settings.
@@ -77,10 +88,11 @@ pub enum Section {
 }
 
 /// The navigation, in order.
-pub const SECTIONS: [Section; 5] = [
+pub const SECTIONS: [Section; 6] = [
     Section::Accounts,
     Section::Invites,
     Section::Admins,
+    Section::Federation,
     Section::Audit,
     Section::Profile,
 ];
@@ -92,6 +104,7 @@ impl Section {
             Self::Accounts => "Accounts",
             Self::Invites => "Invites",
             Self::Admins => "Admins",
+            Self::Federation => "Federation",
             Self::Audit => "Audit log",
             Self::Profile => "Your password",
         }
@@ -103,6 +116,7 @@ impl Section {
             Self::Accounts => Some(Action::ViewAccounts),
             Self::Invites => Some(Action::ViewInvites),
             Self::Admins => Some(Action::ManageAdmins),
+            Self::Federation => Some(Action::ViewFederation),
             Self::Audit => Some(Action::ViewAudit),
             Self::Profile => None,
         }
@@ -130,11 +144,18 @@ mod tests {
             RevokeInvite,
             ViewAudit,
             ManageAdmins,
+            ViewFederation,
+            EditFederationRules,
+            SetFederationMode,
         ];
         let allowed = |role| all.iter().filter(|a| can(role, **a)).count();
-        assert_eq!(allowed(AdminRole::ReadOnly), 3);
-        assert_eq!(allowed(AdminRole::Operator), 7);
-        assert_eq!(allowed(AdminRole::Owner), 8);
+        assert_eq!(allowed(AdminRole::ReadOnly), 4);
+        assert_eq!(allowed(AdminRole::Operator), 9);
+        assert_eq!(allowed(AdminRole::Owner), 11);
+        assert!(can(AdminRole::ReadOnly, ViewFederation));
+        assert!(can(AdminRole::Operator, EditFederationRules));
+        assert!(!can(AdminRole::ReadOnly, EditFederationRules));
+        assert!(!can(AdminRole::Operator, SetFederationMode));
         assert!(can(AdminRole::ReadOnly, ViewAudit));
         assert!(!can(AdminRole::ReadOnly, CreateInvite));
         assert!(can(AdminRole::Operator, DisableAccount));
@@ -171,6 +192,7 @@ mod tests {
             vec![
                 Section::Accounts,
                 Section::Invites,
+                Section::Federation,
                 Section::Audit,
                 Section::Profile
             ]

@@ -12,6 +12,7 @@ use axum::routing::post;
 use axum::{Router, middleware};
 use ed25519_dalek::SigningKey;
 use http_body_util::BodyExt;
+use re_ofscp_server::federation::FederationPolicy;
 use re_ofscp_server::problem::{self, ProblemBase};
 use re_ofscp_server::replay::{NoLedger, ReplayLimits, ReplayStore};
 use re_ofscp_server::signing::canonical::{CanonicalRequest, content_digest, sign};
@@ -110,6 +111,23 @@ pub fn harness_full(
     limits: ReplayLimits,
     client_ip_header: Option<&str>,
 ) -> Harness {
+    harness_policy(
+        keys,
+        now,
+        limits,
+        client_ip_header,
+        Arc::new(FederationPolicy::open()),
+    )
+}
+
+/// [`harness_full`] under the federation policy `policy`.
+pub fn harness_policy(
+    keys: Arc<dyn KeyResolver>,
+    now: OffsetDateTime,
+    limits: ReplayLimits,
+    client_ip_header: Option<&str>,
+    policy: Arc<FederationPolicy>,
+) -> Harness {
     // The store began 301 s before SIGNED_AT, so its warm-up covers
     // timestamps up to SIGNED_AT - 1.
     let replay = Arc::new(ReplayStore::new(
@@ -124,6 +142,7 @@ pub fn harness_full(
         replay.clone(),
         Arc::new(NoLedger),
         keys,
+        policy,
         Arc::new(FixedClock(now)),
     ));
     let app = Router::new()

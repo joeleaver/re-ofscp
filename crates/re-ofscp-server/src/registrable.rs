@@ -101,9 +101,35 @@ pub fn has_unknown_suffix(authority: &str) -> bool {
     !is_ip_literal(host) && icann_suffix(host).is_none()
 }
 
+/// Whether `host` (a name, no port) is itself a public suffix by the
+/// ICANN section of the PSL (`com`, `co.uk`), so a rule covering it and
+/// every name under it would cover a whole registry. Private-section
+/// suffixes (`github.io`) are not: they are one operator's names. Used to
+/// refuse such federation-policy rules (docs/decisions/0008).
+pub fn is_icann_public_suffix(host: &str) -> bool {
+    !is_ip_literal(host) && icann_suffix(host) == Some(host)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn icann_public_suffixes_are_recognised() {
+        for yes in ["com", "co.uk", "app", "dev"] {
+            assert!(is_icann_public_suffix(yes), "{yes}");
+        }
+        for no in [
+            "example.com",
+            "foo.co.uk",
+            "github.io",
+            "alice.github.io",
+            "10.0.0.1",
+            "zzqq",
+        ] {
+            assert!(!is_icann_public_suffix(no), "{no}");
+        }
+    }
 
     #[test]
     fn registrable_groups_ignore_subdomains_and_ports() {
