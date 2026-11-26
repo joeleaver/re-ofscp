@@ -79,8 +79,8 @@ async fn concurrent_creates_at_the_limit_never_pass_it() {
 
 #[tokio::test]
 async fn deleted_channels_never_make_room_past_the_limit() {
-    // rhypedb c73cc88 counts deleted rows toward a limited index scan, so a
-    // limited count would come back short after deletes (decision 0014).
+    // The channel count is a limited index scan; deleted rows must not
+    // count toward its limit (rhypedb #61, fixed in 7b78190; decision 0014).
     let env = env().await;
     let alice = local(&env, "alice").await;
     let gid = id(&create_group(&env, &alice, group_body("G", "group")).await);

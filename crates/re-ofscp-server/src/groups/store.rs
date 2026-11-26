@@ -447,17 +447,18 @@ impl GroupStore {
     }
 
     /// How many channels `group_id` has, pending and deleting ones
-    /// included (so the limit is conservative).
+    /// included (so the limit is conservative), counting no further than
+    /// `cap`: the answer is `min(count, cap)`.
     ///
-    /// Read whole, with no `.limit`: rhypedb c73cc88 cuts a limited scan of
-    /// an index after N keys *including deleted rows'*, so a limited count
-    /// comes back short once channels have been deleted and would let
-    /// creates past the limit (docs/decisions/0014). The read is bounded
-    /// anyway: the limit itself keeps a group near `MAX_CHANNELS_PER_GROUP`
-    /// rows, plus creates in flight that take theirs back.
-    pub async fn channel_count(&self, group_id: &str) -> Result<usize, DbError> {
+    /// A filter on the one indexed field plus `.limit` is pushed down to an
+    /// index scan. Since rhypedb 7b78190 (#61) that scan counts only live
+    /// rows toward its limit, so deleted channels cannot make the count
+    /// come back short (docs/decisions/0014).
+    pub async fn channel_count(&self, group_id: &str, cap: usize) -> Result<usize, DbError> {
         let q = Ql::new("Channel.filter(.group_id == ")
             .str(group_id)
+            .raw(").limit(")
+            .uint(cap as u64)
             .raw(")");
         Ok(self.db.fetch::<serde::de::IgnoredAny>(&q).await?.len())
     }

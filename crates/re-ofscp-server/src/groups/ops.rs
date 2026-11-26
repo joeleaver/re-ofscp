@@ -420,10 +420,14 @@ impl Groups {
         Ok(())
     }
 
-    /// How many channels `group_id` has (read whole; see
-    /// `GroupStore::channel_count`).
+    /// How many channels `group_id` has, counted up to one past
+    /// [`MAX_CHANNELS_PER_GROUP`]: enough to tell "at the limit" from
+    /// "over it", which is all `create_channel` asks.
     async fn channel_count(&self, group_id: &str) -> Result<usize, GroupError> {
-        Ok(self.store.channel_count(group_id).await?)
+        Ok(self
+            .store
+            .channel_count(group_id, MAX_CHANNELS_PER_GROUP + 1)
+            .await?)
     }
 
     fn channel_changed(&self, group_id: &str, channel_id: &str) {
