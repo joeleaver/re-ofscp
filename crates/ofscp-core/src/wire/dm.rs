@@ -42,6 +42,10 @@ pub struct DmMessageCreate {
     /// Files attached.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attachments: Option<Vec<Attachment>>,
+    /// Who it mentions; authoritative for notifications when present
+    /// (§5.3, §10.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mentions: Option<Vec<Actor>>,
     /// The message it replies to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reference: Option<MessageReference>,

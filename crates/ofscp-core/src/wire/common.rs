@@ -1,10 +1,9 @@
-//! Shapes shared across the payloads: metadata, content, attachments,
-//! paging, tiers, and the key algorithm (`schemas/v0.1/defs`).
+//! Shapes shared across the payloads: metadata, content, paging, tiers,
+//! the key algorithm (`schemas/v0.1/defs`), and the serde helpers for
+//! optional and clearable fields.
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
-
-use crate::LocalId;
 
 use super::open_enum;
 
@@ -39,35 +38,6 @@ pub struct Content {
     pub text: String,
     /// Its IANA media type.
     pub mime: String,
-}
-
-/// A file uploaded to `/api/media` and attached to a message (§5.8).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Attachment {
-    /// The attachment's local id.
-    pub id: LocalId,
-    /// Its IANA media type.
-    pub mime: String,
-    /// Where to fetch it (HTTPS).
-    pub url: String,
-    /// Its size in bytes.
-    pub size: u64,
-    /// The original file name.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub filename: Option<String>,
-    /// A content hash.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hash: Option<String>,
-    /// Width in pixels, for pictures and video.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub width: Option<u32>,
-    /// Height in pixels, for pictures and video.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub height: Option<u32>,
-    /// Length in milliseconds, for audio and video.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub duration_ms: Option<u64>,
 }
 
 /// The cursors of one page of a list (`PagedResponse.page`). Cursors are
@@ -112,5 +82,55 @@ open_enum! {
     pub enum KeyAlgorithm {
         /// Ed25519.
         Ed25519 = "Ed25519",
+    }
+}
+
+/// A present optional field must hold a value: `null` is refused rather
+/// than read as absent (only fields typed [`Patch`] give `null` a meaning).
+pub(crate) fn some<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+    d: D,
+) -> Result<Option<T>, D::Error> {
+    T::deserialize(d).map(Some)
+}
+
+/// A field of a partial update that may also be cleared with `null`.
+/// Give the field `#[serde(default, skip_serializing_if = "Patch::is_keep")]`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Patch<T> {
+    /// Absent: leave it unchanged.
+    #[default]
+    Keep,
+    /// `null`: remove it.
+    Clear,
+    /// A new value.
+    Set(T),
+}
+
+impl<T> Patch<T> {
+    /// Whether the field is left out.
+    pub fn is_keep(&self) -> bool {
+        matches!(self, Self::Keep)
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Patch<T> {
+    // Called only when the field is present (absent fields take the
+    // `Default`, `Keep`), so `null` here means "clear".
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(match Option::<T>::deserialize(d)? {
+            None => Self::Clear,
+            Some(v) => Self::Set(v),
+        })
+    }
+}
+
+impl<T: Serialize> Serialize for Patch<T> {
+    // `Keep` is skipped by `skip_serializing_if`; if it is serialized
+    // anyway it becomes `null`, like `Clear`.
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Keep | Self::Clear => s.serialize_none(),
+            Self::Set(v) => s.serialize_some(v),
+        }
     }
 }

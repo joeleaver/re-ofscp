@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
-use super::{MessageType, MetadataObject, Tier, Timestamp, open_enum};
+use super::{Membership, MessageType, MetadataObject, Tier, Timestamp, open_enum};
 use crate::{Actor, LocalId};
 
 /// A role's name within a group, such as `owner`, `admin`, `member`,
@@ -142,6 +142,10 @@ pub struct Group {
     /// The roles it defines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roles: Option<Vec<RoleDefinition>>,
+    /// The caller's own membership, in an answer to a signed member only
+    /// (§5.5). Such an answer must not be publicly cacheable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub membership: Option<Membership>,
     /// When it was made.
     pub created_at: Timestamp,
     /// When it last changed.

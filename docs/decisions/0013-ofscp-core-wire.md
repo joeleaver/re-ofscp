@@ -18,8 +18,8 @@ provider.
 
 - **One module, `ofscp_core::wire`,** holds the REST payloads of the whole
   spec, split by area (auth, guest, discovery, directory, profile, privacy,
-  contact, group, membership, message, dm, follow, notify, delivery,
-  problem). `ofscp_core::auth` and `ofscp_core::discovery` are now
+  contact, group, membership, my groups, media, message, dm, follow,
+  notify, delivery, problem). `ofscp_core::auth` and `ofscp_core::discovery` are now
   re-export paths, and so is `re_ofscp_types::profile`, so existing code
   compiles at its old imports. The names already used in this repository
   won where two definitions met (`DeviceKeyCreated`, `PublicKey`,
@@ -64,6 +64,29 @@ provider.
   casing) answers exist. `Message.content` is optional, so a tombstone
   (§7.1) and a page holding one decode. An extra permission entry that is
   not a list of roles is dropped rather than failing the group or channel.
+- **Content, media and membership** (lost-conn/ofscp#24, spec
+  `187acb9`).
+  - Messages, message creates and DM creates carry `mentions` (strict
+    actors); messages and creates carry the article fields `title`,
+    `summary` and `cover`.
+  - `MessageUpdate` is the spec's partial edit: `content`, `attachments`,
+    `tags` and `mentions` replace when present and refuse `null`; the
+    article fields are `Patch`es, so `null` removes them. It is not
+    refused at decode when empty: `is_empty` and `has_only_article_fields`
+    give the provider the two `400` checks of §7.1, since the second needs
+    the stored message's type.
+  - `Attachment` gains `expiresAt` and a `thumbnail`, typed `Thumbnail`
+    (an attachment without a thumbnail of its own); a nested thumbnail is
+    refused at decode, as the schema's `not` says.
+  - `Group.membership` (`Membership`) is the caller's own, authoritative
+    membership. `GroupPointer`, `GroupPointerRequest` and
+    `GroupPointersResponse` are the home provider's group list (§5.7, *My
+    groups*); a pointer's `group` is a strict `ObjectUri`.
+  - `Patch` and the `some` helper moved from `profile` to `common`, now
+    that messages use them too.
+  - The WebSocket samples of #24 (`groups.updated`, the article
+    `message.update`) are WebSocket frames, which `wire` does not hold;
+    the roundtrip test skips `ws-*` samples.
 - **The `errorCode` registry** (§7.3, lost-conn/ofscp#17) is
   `wire::ErrorCode`, with `REGISTRY` and the fixed `status()` of each
   code. The server writes its problem bodies as `wire::ProblemDetails`,

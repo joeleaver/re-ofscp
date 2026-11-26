@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Actor, LocalId};
 
-use super::{Attachment, Content, MetadataObject, Paged, Timestamp, open_enum};
+use super::{Attachment, Content, MetadataObject, Paged, Patch, Timestamp, open_enum, some};
 
 open_enum! {
     /// What a message is (§5.3). An unknown type is shown as a plain
@@ -78,6 +78,22 @@ pub struct Message {
     /// Tags.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
+    /// Who it mentions, set by the author's client (§5.3, *Mentions*).
+    /// When present it is authoritative for mention notifications (§10.1);
+    /// when absent, mentions are parsed from the text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mentions: Option<Vec<Actor>>,
+    /// An article's title, plain text (§5.3); ignored on other types.
+    /// When absent, a level-1 heading opening the body is the title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// An article's summary, plain text (§5.3); ignored on other types.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// An article's cover: the id of one of its own `attachments` (§5.3);
+    /// ignored on other types.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cover: Option<LocalId>,
     /// How many replies it has.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_count: Option<u64>,
@@ -120,16 +136,102 @@ pub struct MessageCreate {
     /// Tags.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
+    /// Who it mentions, set by the author's client (§5.3, *Mentions*).
+    /// When present it is authoritative for mention notifications (§10.1);
+    /// when absent, mentions are parsed from the text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mentions: Option<Vec<Actor>>,
+    /// An article's title, plain text (§5.3); ignored on other types.
+    /// When absent, a level-1 heading opening the body is the title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// An article's summary, plain text (§5.3); ignored on other types.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// An article's cover: the id of one of its own `attachments` (§5.3);
+    /// ignored on other types.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cover: Option<LocalId>,
     /// Extension data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Vec<MetadataObject>>,
 }
 
-/// `PATCH .../messages/{messageId}`: an edit (§7.1).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// An edit (§7.1, `MessageUpdate`): the body of `PATCH .../messages/{messageId}`
+/// in a channel or a DM (§7.4, §8.3), and the data of the `message.update`
+/// command less its ids. Each field present replaces the stored one; an
+/// absent field is unchanged. `type`, `reference` and `metadata` cannot be
+/// edited, so they are not here (and are ignored if sent).
+///
+/// The provider refuses (`400`) an edit that [`is_empty`](Self::is_empty),
+/// and an edit of a message that is not an article that
+/// [`has_only_article_fields`](Self::has_only_article_fields).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MessageUpdate {
     /// The new content.
-    pub content: Content,
+    #[serde(
+        default,
+        deserialize_with = "some",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub content: Option<Content>,
+    /// The new attachments, in full; one left out loses this message's
+    /// reference to it (§5.8, *Revocation*).
+    #[serde(
+        default,
+        deserialize_with = "some",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub attachments: Option<Vec<Attachment>>,
+    /// The new tags, in full.
+    #[serde(
+        default,
+        deserialize_with = "some",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub tags: Option<Vec<String>>,
+    /// The new mentions, in full (§5.3).
+    #[serde(
+        default,
+        deserialize_with = "some",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub mentions: Option<Vec<Actor>>,
+    /// An article's new title, or `null` to remove it.
+    #[serde(default, skip_serializing_if = "Patch::is_keep")]
+    pub title: Patch<String>,
+    /// An article's new summary, or `null` to remove it.
+    #[serde(default, skip_serializing_if = "Patch::is_keep")]
+    pub summary: Patch<String>,
+    /// An article's new cover attachment id, or `null` to remove it. After
+    /// the edit it must name one of the message's attachments.
+    #[serde(default, skip_serializing_if = "Patch::is_keep")]
+    pub cover: Patch<LocalId>,
+}
+
+impl MessageUpdate {
+    /// Whether the edit changes nothing (the schema's `anyOf`).
+    pub fn is_empty(&self) -> bool {
+        !self.has_general_fields() && !self.has_article_fields()
+    }
+
+    /// Whether the edit carries article fields and nothing else, which is
+    /// a `400` on a message that is not an article (§7.1).
+    pub fn has_only_article_fields(&self) -> bool {
+        self.has_article_fields() && !self.has_general_fields()
+    }
+
+    fn has_general_fields(&self) -> bool {
+        self.content.is_some()
+            || self.attachments.is_some()
+            || self.tags.is_some()
+            || self.mentions.is_some()
+    }
+
+    fn has_article_fields(&self) -> bool {
+        !(self.title.is_keep() && self.summary.is_keep() && self.cover.is_keep())
+    }
 }
 
 /// A reaction on a message (§5.3). The provider keeps no counts.
@@ -213,5 +315,31 @@ mod tests {
         .unwrap();
         assert!(matches!(&page.items[0], TimelineItem::Message(m) if m.content.is_none()));
         assert!(matches!(&page.items[1], TimelineItem::Reaction(_)));
+    }
+
+    #[test]
+    fn an_edit_tells_absent_from_null_and_refuses_null_where_it_means_nothing() {
+        let body = json!({"title": "New", "summary": null, "tags": ["#a"]});
+        let u: MessageUpdate = serde_json::from_value(body.clone()).unwrap();
+        assert_eq!(u.title, Patch::Set("New".to_owned()));
+        assert_eq!(u.summary, Patch::Clear);
+        assert_eq!(u.cover, Patch::Keep);
+        assert_eq!(serde_json::to_value(&u).unwrap(), body);
+        for field in ["content", "attachments", "tags", "mentions"] {
+            let body = json!({ field: null });
+            assert!(serde_json::from_value::<MessageUpdate>(body).is_err());
+        }
+    }
+
+    #[test]
+    fn an_edit_knows_when_it_is_empty_or_only_for_articles() {
+        let empty: MessageUpdate =
+            serde_json::from_value(json!({"type": "memo", "metadata": []})).unwrap();
+        assert!(empty.is_empty() && !empty.has_only_article_fields());
+        let article: MessageUpdate = serde_json::from_value(json!({"cover": null})).unwrap();
+        assert!(!article.is_empty() && article.has_only_article_fields());
+        let both: MessageUpdate =
+            serde_json::from_value(json!({"cover": "att_1", "tags": []})).unwrap();
+        assert!(!both.is_empty() && !both.has_only_article_fields());
     }
 }

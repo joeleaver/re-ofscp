@@ -110,6 +110,22 @@ pub struct Member {
     pub joined_at: Timestamp,
 }
 
+/// The caller's own membership of a group, `Group.membership` (§5.5):
+/// sent only to a signed member, and authoritative, unlike a membership
+/// pointer's role hint (§5.7, *My groups*). Its absence does not prove the
+/// caller is not a member.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Membership {
+    /// The caller's role.
+    pub role: Role,
+    /// When the caller joined.
+    pub joined_at: Timestamp,
+    /// The caller's nickname in this group (§5.7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name_override: Option<String>,
+}
+
 open_enum! {
     /// Where a join request stands (§5.7).
     pub enum JoinRequestState {

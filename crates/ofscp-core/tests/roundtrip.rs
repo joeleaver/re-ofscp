@@ -66,6 +66,7 @@ macro_rules! rest_samples {
 
 rest_samples! {
     "attachment.sample.json" => Attachment,
+    "attachment-video.sample.json" => Attachment,
     "auth-bootstrap-response.sample.json" => BootstrapResponse,
     "auth-login-request.sample.json" => LoginRequest,
     "auth-registration-request.sample.json" => RegistrationRequest,
@@ -88,6 +89,10 @@ rest_samples! {
     "follow.sample.json" => Follow,
     "follows-response.sample.json" => FollowsResponse,
     "group-create-request.sample.json" => GroupCreateRequest,
+    "group-membership.sample.json" => Group,
+    "group-pointer-request.sample.json" => GroupPointerRequest,
+    "group-pointer.sample.json" => GroupPointer,
+    "group-pointers-response.sample.json" => GroupPointersResponse,
     "group-update-request.sample.json" => GroupUpdateRequest,
     "group.sample.json" => Group,
     "guest-claim-request.sample.json" => GuestClaimRequest,
@@ -97,7 +102,9 @@ rest_samples! {
     "invite.sample.json" => Invite,
     "join-request.sample.json" => JoinRequest,
     "member.sample.json" => Member,
+    "message-article.sample.json" => Message,
     "message-create-request.sample.json" => MessageCreate,
+    "message-update-article-request.sample.json" => MessageUpdate,
     "message-update-request.sample.json" => MessageUpdate,
     "message.sample.json" => Message,
     "messages-page.sample.json" => MessagesPage,

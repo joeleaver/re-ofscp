@@ -1,19 +1,11 @@
 //! Users: profiles, the account and group lists (spec §5.1, §6.2, §6.3,
 //! §6.5).
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use super::{MetadataObject, Timestamp};
+use super::{MetadataObject, Patch, Timestamp, some};
 use crate::Authority;
-
-/// A present optional field must hold a value: `null` is refused rather
-/// than read as absent (only fields typed [`Patch`] give `null` a meaning).
-pub(crate) fn some<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
-    d: D,
-) -> Result<Option<T>, D::Error> {
-    T::deserialize(d).map(Some)
-}
 
 /// A user's public profile (§5.1.1), also the answer to
 /// `GET /api/users/{userRef}/profile` (§6.2), which adds the profile
@@ -57,48 +49,6 @@ pub struct UserAccount {
     pub profile: UserProfile,
     /// Provider-defined settings.
     pub settings: Map<String, Value>,
-}
-
-/// A field of a partial update that may also be cleared with `null`.
-/// Give the field `#[serde(default, skip_serializing_if = "Patch::is_keep")]`.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum Patch<T> {
-    /// Absent: leave it unchanged.
-    #[default]
-    Keep,
-    /// `null`: remove it.
-    Clear,
-    /// A new value.
-    Set(T),
-}
-
-impl<T> Patch<T> {
-    /// Whether the field is left out.
-    pub fn is_keep(&self) -> bool {
-        matches!(self, Self::Keep)
-    }
-}
-
-impl<'de, T: Deserialize<'de>> Deserialize<'de> for Patch<T> {
-    // Called only when the field is present (absent fields take the
-    // `Default`, `Keep`), so `null` here means "clear".
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        Ok(match Option::<T>::deserialize(d)? {
-            None => Self::Clear,
-            Some(v) => Self::Set(v),
-        })
-    }
-}
-
-impl<T: Serialize> Serialize for Patch<T> {
-    // `Keep` is skipped by `skip_serializing_if`; if it is serialized
-    // anyway it becomes `null`, like `Clear`.
-    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        match self {
-            Self::Keep | Self::Clear => s.serialize_none(),
-            Self::Set(v) => s.serialize_some(v),
-        }
-    }
 }
 
 /// `PATCH /api/me/profile` (§6.3). Every field is optional; an absent field

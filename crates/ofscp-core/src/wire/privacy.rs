@@ -8,8 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::profile::some;
-use super::{MetadataObject, Timestamp, open_enum};
+use super::{MetadataObject, Timestamp, open_enum, some};
 use crate::Actor;
 
 open_enum! {
