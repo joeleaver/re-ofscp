@@ -19,6 +19,9 @@ Three facts shape the data layer:
      condition atomically. The filter selects ids first, then each id is
      written in its own transaction without re-checking the filter, and
      queries run in parallel (`rhypedb-query` executor at c73cc88).
+     Since rhypedb 7b78190 (#59) the filter is re-checked on each object
+     inside its write transaction, so a guarded write is compare-and-set
+     per object, though still not per statement (decision 0012, "Update").
    - **Consequence:** `T.filter(.x <= n).update(...)` can modify, or delete, a
      row that no longer matches by the time it is written. Code that needs a
      real conditional write must serialize the competing paths with a

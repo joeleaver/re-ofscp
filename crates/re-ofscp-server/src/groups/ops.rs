@@ -235,7 +235,8 @@ impl Groups {
                 return Ok(group.to_wire());
             };
             // Only the holder of the claim on the next revision writes it
-            // (claims.rs: a filtered update alone is not compare-and-set).
+            // (claims.rs: a guarded update is now compare-and-set, so the claim is
+            // belt and braces that could be simplified away).
             let next = claims::group_key(&group.id, group.revision.saturating_add(1));
             // The lease runs from the clock at claiming, not from the
             // request's `now`, which earlier attempts may have aged; the
@@ -474,10 +475,14 @@ impl Groups {
         Ok(deleted?)
     }
 
-    /// How many channels `group_id` has (read whole; see
-    /// `GroupStore::channel_count`).
+    /// How many channels `group_id` has, counted up to one past
+    /// [`MAX_CHANNELS_PER_GROUP`]: enough to tell "at the limit" from
+    /// "over it", which is all `create_channel` asks.
     async fn channel_count(&self, group_id: &str) -> Result<usize, GroupError> {
-        Ok(self.store.channel_count(group_id).await?)
+        Ok(self
+            .store
+            .channel_count(group_id, MAX_CHANNELS_PER_GROUP + 1)
+            .await?)
     }
 
     fn channel_changed(&self, group_id: &str, channel_id: &str) {

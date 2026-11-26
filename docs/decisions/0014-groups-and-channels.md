@@ -110,10 +110,11 @@ it sends.
 
 - Three types: `Group`, `Channel` and `Membership`. References are string
   columns (`Channel.group_id`, `Membership.group_id`, `Membership.actor`)
-  with `@indexed`, not rhypedb links. At the pinned rhypedb commit
-  (c73cc88) a link cannot be set inside `create`, and `.link` fails, so
-  `@inverse`/`@on_delete` cannot be relied on yet. Cascades are done by
-  the server (below). Revisit when rhypedb is bumped.
+  with `@indexed`, not rhypedb links. At rhypedb c73cc88 a link could not
+  be set inside `create`, and `.link` failed, so `@inverse`/`@on_delete`
+  cannot be relied on yet. The bump to 7b78190 did not touch links (its
+  changes are guarded writes, write rules and limited scans), so this
+  stands until it is re-probed. Cascades are done by the server (below).
 - `Membership.key` is `"{group_id} {actor}"`, `@unique`, so an actor has at
   most one membership per group without a transaction.
 - The owner is `Group.owner`, not a `Membership` row. §5.7 must keep that
@@ -134,12 +135,16 @@ it sends.
 
 ### Concurrency without compare-and-set
 
-rhypedb's filtered writes are not compare-and-set (at the pinned c73cc88,
-and on the managed server production runs). `X.filter(p).update(...)`
-evaluates `p` on a snapshot, then writes each matching object in its own
-transaction, which does not re-check `p`. A rhypedb fix is in progress,
-but production waits on jkbase upgrading its managed server, so this code
-must be correct without it. The rule, per guard:
+This section was written against rhypedb c73cc88, where filtered writes
+were not compare-and-set: `X.filter(p).update(...)` evaluated `p` on a
+snapshot, then wrote each matching object in its own transaction, which
+did not re-check `p`. Since rhypedb 7b78190 (#59), pinned here and run by
+production's managed server, a guarded write re-checks `p` on each object
+inside that object's write transaction and skips objects that no longer
+match (decision 0012, "Update"). The claims below stay correct under
+that, and are kept until they are simplified in their own change; where
+compare-and-set closes a gap they left, that is noted. The rule, per
+guard:
 
 - **Revisions: claims.** `GroupClaim` holds `@unique` keys
   `group:{id}:{revision}` and `channel:{id}:{revision}`. A `create` on a
@@ -160,9 +165,10 @@ must be correct without it. The rule, per guard:
   read/write timeout. It stops the client waiting, but it does not cancel
   the statement on the server. If the server sat on that statement for
   over 120 s, another edit could take the claim over and write the same
-  revision, and the late statement would then undo that edit. Without
-  compare-and-set nothing on this side can close that gap. It needs a
-  server-side statement deadline or a guarded write.
+  revision, and the late statement would then undo that edit. At c73cc88
+  nothing on this side could close that gap. Since 7b78190 the write's
+  filter on the old revision is compare-and-set, so a late statement
+  finds the revision moved on and writes nothing: the gap is closed.
 - **Status guards need no claim.** Every status transition is one-way
   (`pending → active`, `active → deleting`), deletes are final, and no edit
   writes `status`. So a guarded update that runs after its guard stopped
@@ -238,15 +244,19 @@ creates therefore never leave more than the limit, though a burst at the
 limit may all be refused. A channel listing fetches up to twice the limit,
 so channels about to be taken back cannot crowd real ones out.
 
-The channel count is read whole, with no `.limit`. On rhypedb c73cc88, a
+The channel count is a limited read: `Channel.filter(.group_id ==
+g).limit(201)`, one past the limit, which is all the two checks need. A
 filter on one indexed field followed by `.limit(N)` is pushed down to an
-index scan, and that scan stops after N keys, *deleted rows included*.
-So a limited count comes back short by the number of recently deleted
-channels and lets creates past the limit. The test
-`deleted_channels_never_make_room_past_the_limit` reproduces this every
-time it runs. Reading the count whole is also bounded, because the limit
-keeps a group near 200 rows. Filters that `AND` (or `OR`) two fields
-don't push a limit down, so the listings and the owner count are exact.
+index scan. On rhypedb c73cc88 that scan stopped after N keys, *deleted
+rows included*, so a limited count came back short by the number of
+recently deleted channels and let creates past the limit; the count was
+read whole instead. rhypedb 7b78190 (#61) counts only live rows toward
+the limit, so the count is limited again. Two tests catch a regression:
+`a_limited_index_scan_after_deletes_counts_only_live_rows` (tests/db.rs)
+pins rhypedb's behaviour directly, and
+`deleted_channels_never_make_room_past_the_limit` checks the channel
+limit end to end. Filters that `AND` (or `OR`) two fields don't push a
+limit down, so the listings and the owner count were exact throughout.
 
 ### Requests
 

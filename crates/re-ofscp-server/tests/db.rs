@@ -8,6 +8,7 @@ use axum::http::StatusCode;
 use common::harness::*;
 use common::rhypedb::RhypeServer;
 use re_ofscp_server::db::{Db, DbConfig, DbError, Ql};
+use re_ofscp_server::groups::store::GroupStore;
 use re_ofscp_server::replay::ledger::RhypeLedger;
 use re_ofscp_server::replay::{LedgerError, NonceLedger, SignerKind, StoredNonce};
 use re_ofscp_server::{AppState, Config, router};
@@ -490,9 +491,9 @@ async fn concurrent_unique_creates_are_conflicts_or_contended() {
     assert_eq!(rows.len(), 1);
 }
 
-/// A write to an object that is gone is [`DbError::Vanished`] (a filtered
-/// `update` meets this when the object it matched is deleted before the
-/// write). Pins rhypedb's message for it.
+/// A point write to an object that is gone is [`DbError::Vanished`]. (A
+/// filtered write skips such an object instead, since rhypedb 7b78190's
+/// compare-and-set guarded writes.) Pins rhypedb's message for it.
 #[tokio::test]
 async fn writing_a_deleted_object_is_vanished() {
     let server = RhypeServer::start();
@@ -504,4 +505,50 @@ async fn writing_a_deleted_object_is_vanished() {
         Err(DbError::Vanished(_)) => {}
         other => panic!("{other:?}"),
     }
+}
+
+/// A limited scan of one indexed field counts only live rows toward its
+/// limit. rhypedb c73cc88 counted deleted rows too, so after deletes
+/// `filter(.indexed == x).limit(n)` came back short; the channel limit
+/// relies on it being exact (decision 0014, rhypedb #61).
+#[tokio::test]
+async fn a_limited_index_scan_after_deletes_counts_only_live_rows() {
+    let server = RhypeServer::start();
+    let db = db(&server);
+    for i in 0..10 {
+        let q = Ql::new("Channel.create({ channel_id: ")
+            .str(&format!("c{i}"))
+            .raw(", group_id: \"g\", kind: \"text\", tier: \"public\", status: \"active\", revision: 0, doc: \"{}\", created_at: ")
+            .unix_seconds(i)
+            .raw(", updated_at: ")
+            .unix_seconds(i)
+            .raw(" })");
+        db.execute(&q).await.unwrap();
+    }
+    // The first rows written are the ones deleted, so a scan that counted
+    // them would stop early.
+    for i in 0..4 {
+        let q = Ql::new("Channel.filter(.channel_id == ")
+            .str(&format!("c{i}"))
+            .raw(").delete()");
+        db.execute(&q).await.unwrap();
+    }
+    let limited = |n: u64| {
+        Ql::new("Channel.filter(.group_id == \"g\").limit(")
+            .uint(n)
+            .raw(")")
+    };
+    let rows = db
+        .fetch::<serde::de::IgnoredAny>(&limited(5))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 5);
+    let rows = db
+        .fetch::<serde::de::IgnoredAny>(&limited(10))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 6);
+    let store = GroupStore::new(db.clone());
+    assert_eq!(store.channel_count("g", 5).await.unwrap(), 5);
+    assert_eq!(store.channel_count("g", 7).await.unwrap(), 6);
 }

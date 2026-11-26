@@ -68,10 +68,11 @@ pub enum DbError {
     /// conflicting object may have been written.
     #[error("write conflict: {0}")]
     Contended(String),
-    /// An object the statement named or matched was deleted before the
-    /// statement wrote it. As for [`Self::Contended`], a statement that writes one
-    /// object wrote nothing and may be run again (its filter then no longer
-    /// matches the object).
+    /// The object a point write named (`T.get(id).update(..)` or
+    /// `.delete()`) does not exist, having been deleted meanwhile. Nothing was
+    /// written. A filtered write no longer meets this: since rhypedb #59
+    /// (7b78190) it re-checks its filter per object and skips an object that
+    /// is gone.
     #[error("object gone: {0}")]
     Vanished(String),
     /// The server rejected the query (a bug in this code, or a schema
@@ -382,13 +383,13 @@ impl Db {
     /// `update` or `delete` filtered on a `@unique` field), and return what
     /// it returned.
     ///
-    /// Such a write is one rhypedb transaction, so when it loses a
-    /// write-write conflict, or the object it matched is deleted before it
-    /// is written, nothing of it was applied, and it is run again (its
-    /// filter evaluated afresh) up to [`ONE_OBJECT_WRITE_ATTEMPTS`] times
-    /// with a short growing pause (see [`DbError::Contended`] and
-    /// [`DbError::Vanished`]). Never use this for a write that may touch
-    /// several objects.
+    /// Such a write is one rhypedb transaction. rhypedb already retries a
+    /// filtered write's own conflicts and skips an object that is gone; when
+    /// a conflict outlasts those retries ([`DbError::Contended`]), or a
+    /// point write's object is gone ([`DbError::Vanished`]), nothing of it was
+    /// applied, and it is run again (its filter evaluated afresh) up to
+    /// [`ONE_OBJECT_WRITE_ATTEMPTS`] times with a short growing pause. Never
+    /// use this for a write that may touch several objects.
     pub async fn write_one_object(&self, q: &Ql) -> Result<QueryResult, DbError> {
         let mut attempt = 1;
         loop {

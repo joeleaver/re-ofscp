@@ -1,12 +1,42 @@
 # 0012: Guarded updates are not compare-and-set; serialize with `@unique`
 
-- **Status:** accepted
+- **Status:** accepted; partly overtaken. rhypedb #59 (in 7b78190) made
+  guarded writes compare-and-set per object. "Update" is current; "Context"
+  and the rule's premise ("a guard never decides a race") are historical, as
+  is the title. The claim pattern and where it is applied still describe the
+  code.
 - **Date:** 2026-11-26
 
-## Context
+## Update: rhypedb 7b78190
 
-rhypedb (pinned c73cc88, and the jkbase-managed production server) has no
-multi-statement transactions. Decision 0003 already noted that a filtered
+The context below describes rhypedb c73cc88. rhypedb 7b78190, now pinned
+here and run by production's managed rhypedb, changes it:
+
+- **#59: guarded writes are compare-and-set, per object.** A write after
+  a filter re-evaluates the filter on each object inside that object's
+  write transaction and skips objects that no longer match (or are gone);
+  conflicts are retried inside the server. So concurrent writes guarded
+  on one old value apply exactly once. `update` returns only the objects
+  it wrote. Not per statement: a multi-object write can be seen part-way.
+- **`.limit` picks objects before the re-check**, so a limited guarded
+  statement that loses a race returns no rows rather than moving on to
+  the next match. `@unique` creates still serialize as before.
+- **#60: write rules are checked inside the write transaction**, so a
+  rule input changed concurrently cannot let a write through.
+- A filtered write that meets a vanished object now skips it rather than
+  failing with `Vanished`; a point write (`T.get(id)…`) still fails. The
+  code that treats `Vanished`/`Contended` as "already done" stays correct.
+
+The claims this decision introduced remain correct under compare-and-set,
+and some (the invite redemption, account settlements) decide more than
+one object's fate, which a per-object guard cannot. Replacing the
+single-object claims (revisions, credential epochs, TOTP steps) with
+plain guarded updates is a separate change, not made by the bump. Until
+then the rule below still describes the code.
+
+## Context (rhypedb c73cc88)
+
+rhypedb (pinned c73cc88 at the time) has no multi-statement transactions. Decision 0003 already noted that a filtered
 write does not apply its condition atomically. A probe in the profiles
 work (PR #16) showed what that means in practice:
 

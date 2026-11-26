@@ -372,10 +372,11 @@ impl AccountStore {
     /// Revoke `handle`'s active key `key_id` in one conditional update.
     /// `false` if no such active key belongs to `handle`.
     ///
-    /// The `revoked == false` guard is not compare-and-set (decision 0012),
-    /// and needs not be: revoking is idempotent and one-way (nothing sets
-    /// `revoked` back), so racing revocations all leave the key revoked. At
-    /// worst two report `true` and `revoked_at` keeps the later time.
+    /// The `revoked == false` guard is compare-and-set per object since
+    /// rhypedb #59 (decision 0012), so exactly one of two racing
+    /// revocations writes and reports `true`. It would not matter if both
+    /// did: revoking is idempotent and one-way (nothing sets `revoked`
+    /// back), so the key ends revoked either way.
     pub async fn revoke_key(
         &self,
         handle: &str,

@@ -1,10 +1,11 @@
 //! Admins in rhypedb (`Admin` in `schema.rhype`). Every query goes through
 //! [`Ql`]. Optional text fields are stored as `""`, never null.
 //!
-//! A filtered `update` is not compare-and-set in rhypedb, so a guard in a
-//! filter (`.credential_epoch == e`) only narrows which rows are written; it
-//! does not stop two concurrent writers. Writes whose race matters are
-//! serialized by a claim first ([`super::claims`], docs/decisions/0012).
+//! Since rhypedb #59 (in 7b78190) a guard in a filter
+//! (`.credential_epoch == e`) is compare-and-set per object, so a stale
+//! writer is skipped. Writes whose race matters are still serialized by a
+//! claim first ([`super::claims`], docs/decisions/0012); it could become a
+//! guarded update, and covers multi-statement sequences and crash recovery.
 
 use std::sync::Arc;
 
