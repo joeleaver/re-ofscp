@@ -1,10 +1,14 @@
 //! Claims: `@unique` rows (`AdminClaim` in `schema.rhype`) that serialize
 //! security-relevant admin writes (docs/decisions/0012).
 //!
-//! rhypedb's filtered `update` is not compare-and-set: two updates guarded
-//! on the same old value can both apply. A `create` on a `@unique` field is
-//! atomic, so the competing paths first create a claim row under a key that
-//! names exactly what they compete for, and only the creator proceeds:
+//! Since rhypedb #59 (in 7b78190) a single guarded `update` is
+//! compare-and-set per object, so a guard alone would now settle either race
+//! below; these claims predate that and could become guarded updates (see
+//! docs/decisions/0012, "Update"). They are kept because a claim also covers
+//! a sequence of statements, and its expiry recovers from a holder that
+//! died. A `create` on a `@unique` field is atomic, so the competing paths
+//! first create a claim row under a key that names exactly what they
+//! compete for, and only the creator proceeds:
 //!
 //! - **TOTP steps** (`totp-step:{username}:{step}`): a code is accepted only
 //!   by the sign-in (or enrollment) that claims its step, so each code works

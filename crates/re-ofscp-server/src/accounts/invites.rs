@@ -208,9 +208,11 @@ impl InviteStore {
     /// the caller may now create the account `handle` under it, `false` if
     /// the invite is spent on another handle, expired or revoked.
     ///
-    /// The `used == false` guard alone is not compare-and-set (decision
-    /// 0012), so the redemption is an `InviteRedemption` row, `@unique` on
-    /// the token hash: of any number of registrations presenting the
+    /// A `used == false` guard alone would now be compare-and-set per
+    /// object (rhypedb #59), but one invite's fate spans two objects (the
+    /// pending account and the invite) and several statements, so the
+    /// redemption is an `InviteRedemption` row, `@unique` on
+    /// the token hash (decision 0012): of any number of registrations presenting the
     /// invite, in this process or another, exactly one creates it, and it
     /// names the only handle the invite can ever make an account for. It is
     /// never deleted, so a slow or crashed request can never let a second
@@ -361,8 +363,9 @@ impl InviteStore {
     /// flight may still complete (a revocation racing it is too late), and
     /// [`Revoked::Used`] then says it was already used or being used.
     ///
-    /// The `expires_at > now` guard is not compare-and-set (decision 0012),
-    /// and needs not be: concurrent revocations all write the same expiry.
+    /// The `expires_at > now` guard is compare-and-set per object since
+    /// rhypedb #59 (decision 0012); the race was harmless anyway, as
+    /// concurrent revocations all write the same expiry.
     pub async fn revoke(&self, token_hash: &str, now: i64) -> Result<Revoked, DbError> {
         #[derive(Deserialize)]
         struct UsedRow {

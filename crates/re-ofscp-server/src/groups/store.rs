@@ -261,7 +261,8 @@ impl GroupStore {
 
     /// Write `fields` to `group` as its next revision. The caller must
     /// hold that revision's claim (claims.rs): the filter on the old
-    /// revision only refuses a stale read, since it is not compare-and-set.
+    /// revision is compare-and-set per object (rhypedb #59), so it refuses a
+    /// stale read even if a claim was taken over.
     /// `None` when the revision moved on or the group is gone or being
     /// deleted.
     pub async fn update_group(

@@ -1,7 +1,8 @@
 //! Concurrent edits of groups and channels: every edit that answers `200`
-//! is its own revision, none undone by another (docs/decisions/0014:
-//! rhypedb's filtered updates are not compare-and-set, so edits are
-//! serialized by revision claims). Over a real rhypedb-server.
+//! is its own revision, none undone by another (docs/decisions/0014: edits
+//! are serialized by revision claims, and the guarded write is also
+//! compare-and-set per object since rhypedb #59). Over a real
+//! rhypedb-server.
 
 mod common;
 

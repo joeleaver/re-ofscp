@@ -156,8 +156,9 @@ type Admin {
 }
 
 // A claim that serializes competing admin writes (docs/decisions/0012):
-// rhypedb's filtered updates are not compare-and-set, but a `@unique` create
-// is, so only the request that creates the claim proceeds. Keys are
+// A guarded update is compare-and-set per object since rhypedb #59, but a
+// `@unique` create also serializes multi-statement sequences and supports
+// leases, so only the request that creates the claim proceeds. Keys are
 // "totp-step:{username}:{step}" (each TOTP code is accepted once) and
 // "epoch:{username}:{epoch}" (one credential change per epoch). Claims are
 // never updated; expired ones may be taken over, and are purged.
@@ -250,8 +251,10 @@ type Membership {
 }
 
 // A claim on the next revision of a group or channel (docs/decisions/0014):
-// rhypedb's filtered updates are not compare-and-set, but a `@unique` create
-// is, so only the edit that creates the claim writes that revision. Keys are
+// A guarded update is compare-and-set per object since rhypedb #59, so the
+// claim could be simplified away (decision 0012); until then a `@unique`
+// create is atomic, so only the edit that creates the claim writes that
+// revision. Keys are
 // "group:{group_id}:{revision}" and "channel:{channel_id}:{revision}".
 // Claims are never updated; expired ones may be taken over, and are purged.
 type GroupClaim {

@@ -279,9 +279,11 @@ impl ProfileStore {
     /// stamp the change time (nothing is written if nothing changes).
     /// `None` if there is no such active account.
     ///
-    /// The `status == active` guard is not compare-and-set (decision 0012):
-    /// racing a disable, the change may land on the just-disabled account.
-    /// That is harmless, since a disabled account's profile is not served.
+    /// The `status == active` guard is compare-and-set per object since
+    /// rhypedb #59 (decision 0012), so a change that loses a race with a
+    /// disable is skipped and reports `None`; one that wins lands on the
+    /// account just before it is disabled. Either is harmless, since a
+    /// disabled account's profile is not served.
     pub async fn update_profile(
         &self,
         handle: &str,

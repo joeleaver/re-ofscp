@@ -1,6 +1,10 @@
 # 0012: Guarded updates are not compare-and-set; serialize with `@unique`
 
-- **Status:** accepted; partly overtaken by rhypedb 7b78190 (see "Update")
+- **Status:** accepted; partly overtaken. rhypedb #59 (in 7b78190) made
+  guarded writes compare-and-set per object. "Update" is current; "Context"
+  and the rule's premise ("a guard never decides a race") are historical, as
+  is the title. The claim pattern and where it is applied still describe the
+  code.
 - **Date:** 2026-11-26
 
 ## Update: rhypedb 7b78190
@@ -14,6 +18,9 @@ here and run by production's managed rhypedb, changes it:
   conflicts are retried inside the server. So concurrent writes guarded
   on one old value apply exactly once. `update` returns only the objects
   it wrote. Not per statement: a multi-object write can be seen part-way.
+- **`.limit` picks objects before the re-check**, so a limited guarded
+  statement that loses a race returns no rows rather than moving on to
+  the next match. `@unique` creates still serialize as before.
 - **#60: write rules are checked inside the write transaction**, so a
   rule input changed concurrently cannot let a write through.
 - A filtered write that meets a vanished object now skips it rather than

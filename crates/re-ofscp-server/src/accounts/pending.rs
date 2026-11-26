@@ -1,7 +1,8 @@
 //! Registration's pending accounts (docs/decisions/0012).
 //!
-//! rhypedb's filtered updates are not compare-and-set; a `@unique` create
-//! is. Registration therefore takes the handle **first**, by creating the
+//! A `@unique` create is atomic, and a guarded update is compare-and-set
+//! only per object (rhypedb #59), while registration decides the fate of
+//! two objects, a handle and an invite. Registration therefore takes the handle **first**, by creating the
 //! account with `pending: true` (handles are `@unique`), and only then
 //! redeems the invite for that handle ([`InviteStore::redeem`]) and
 //! activates the account. Two invites racing for one handle are decided by

@@ -2,14 +2,16 @@
 //! make an edit of a group or channel the only edit of its revision
 //! (docs/decisions/0014).
 //!
-//! rhypedb's filtered `update` is not compare-and-set: the filter is
-//! evaluated first and each matching row is then written by its own
-//! transaction, which does not re-check it. So two PATCHes that both read
-//! revision `n` would both pass `filter(.revision == n).update(...)`, and
-//! the second would silently undo the first. A `create` on a `@unique`
-//! field is atomic, so an edit from revision `n` first claims revision
-//! `n + 1` and writes only if it created the claim. Every other edit read
-//! at `n` loses the claim, reads again and edits the newer revision.
+//! Since rhypedb #59 (in 7b78190) a guarded `update` is compare-and-set per
+//! object: the filter is re-checked inside each object's write transaction,
+//! so of two PATCHes that both read revision `n` only one
+//! `filter(.revision == n).update(...)` writes. The claim predates that and
+//! could become a plain guarded update (docs/decisions/0012, 0014); it is
+//! kept for now, and still backs the guard if a holder's statement is late.
+//! A `create` on a `@unique` field is atomic, so an edit from revision `n`
+//! first claims revision `n + 1` and writes only if it created the claim.
+//! Every other edit read at `n` loses the claim, reads again and edits the
+//! newer revision.
 //!
 //! A claim is a lease, stamped with the clock when it is created. Its
 //! holder writes once, at once, in one statement that is never retried.

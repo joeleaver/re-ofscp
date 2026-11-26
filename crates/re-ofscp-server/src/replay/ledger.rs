@@ -11,11 +11,13 @@
 //! entry stays (the nonce remains burned) and the client re-signs and
 //! retries, as §4.5 requires for any `503`.
 //!
-//! rhypedb's filtered `update`/`delete` is not compare-and-set (decision
-//! 0012), so the ledger never relies on a guard: rows are created under a
-//! `@unique` key and deleted, never updated. A filter over them is then
-//! exact, and every outcome below holds however many writers race, in this
-//! process or another.
+//! The ledger does not depend on a guarded write: rows are created under a
+//! `@unique` key and deleted, never updated. (Since rhypedb #59, in
+//! 7b78190, a filtered `update`/`delete` is compare-and-set per object, but
+//! this design predates it, needs no more, and a `@unique` create also
+//! covers the persisted clock's multi-row logic; decision 0012.) A filter
+//! over the rows is exact, and every outcome below holds however many
+//! writers race, in this process or another.
 
 use std::future::Future;
 use std::pin::Pin;
