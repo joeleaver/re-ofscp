@@ -94,53 +94,94 @@ grant anything (a role landing on an admin who was just disabled).
   `set_totp_pending` stays unserialized: a pending secret left beside an
   enrolled one, or surviving a reset, grants nothing. Only a confirmation
   reads it, and it enrolls exactly the secret its caller proved a code for.
-- **Account invites** (`InviteRedemption`, `@unique` on the token hash,
-  recording the handle). A registration redeems the invite, by creating
-  that row, before it creates the account. The row is never updated,
-  deleted or taken over, so the invite can only ever make an account with
-  that handle, and handles are `@unique` (accounts are never deleted), so
-  **one invite makes at most one account**, however requests race, stall
-  or crash. This is what makes consumption safe: no lease or takeover
-  decides it.
-  - **Why not a leased claim.** An earlier revision used an `InviteClaim`
-    with a 120 s lease that a later registration could take over. A holder
-    that stalled past the lease before its `used == false` update could
-    then race the taker's update; neither is compare-and-set, so both could
-    apply and both make an account. No re-read or compensation after the
-    update closes that, because the second account already exists. A
-    redemption that is never released has no such window.
-  - **Order.** The invite is checked (unexpired; unused, or used by this
-    same handle), then the handle and password, then the password is
-    hashed, then the redemption is created, then the invite is marked used
-    (`used: true, used_by: handle`), then the account is created. A
-    `Conflict` on the redemption reads it: another handle means the invite
-    is spent (`403 invite_required`, as for a used invite); the same handle
-    resumes it.
-  - **Resuming.** A registration for the redemption's own handle goes on to
-    create the account. If the first request made it, that create fails as
-    the handle is taken (`409`); if it never did, this one makes it. Either
-    way one account. Resuming needs the invite token, which could have
-    redeemed the invite anyway.
+- **Account invites and registration** (`accounts/pending.rs`,
+  `accounts/invites.rs`). Two serialization points, in this order: the
+  handle, then the invite.
+  - **The handle first.** A registration creates the `User` row before
+    touching the invite, with `pending: true`, the invite's hash and a
+    random `pending_key`. Handles are `@unique`, so of any registrations
+    (with any invites) and admin creates of one handle, exactly one holds
+    it. A loser gets `409` and **its invite is untouched**: it can still
+    register another handle. (Before, the handle was only looked up before
+    redeeming, holding nothing: two invites racing for one handle both
+    redeemed, one account create won, and the other invite was left
+    redeemed for a handle someone else owned, burned for good.)
+  - **Then the invite** (`InviteRedemption`, `@unique` on the token hash,
+    recording the handle). The holder of the pending row redeems the invite
+    for its handle, then marks it used (`used: true, used_by`). The
+    redemption is never updated, deleted or taken over, so the invite can
+    only ever make an account with that handle, and that handle holds at
+    most one account: **one invite makes at most one account**, however
+    requests race, stall or crash. A `Conflict` on the redemption reads it:
+    another handle means the invite is spent, so the registration discards
+    its pending row and answers `403 invite_required`; the same handle goes
+    on.
+    - **Why not a leased invite claim.** An earlier revision used an
+      `InviteClaim` with a 120 s lease that a later registration could take
+      over. A holder that stalled past the lease before its `used == false`
+      update could then race the taker's; neither is compare-and-set, so
+      both could make an account. A redemption that is never released has
+      no such window.
+  - **Then activation, decided by a settlement.** A pending row ends in
+    exactly one of two ways, recorded by an `AccountSettlement` row,
+    `@unique` on the row's `pending_key`, never updated or deleted:
+    `activate` (created only by a registration whose redemption names the
+    row's handle; then `pending` is set to false) or `discard` (then the row
+    may be deleted by id; object ids are never reused). The outcomes
+    exclude each other, so a row being activated is never deleted, and a
+    discarded row is never activated, however late either write lands.
+    Activation writes only `pending: false`, and nothing sets it back or
+    writes it otherwise, so a late or repeated activation cannot undo a
+    disable (which writes `status`).
+  - **Pending rows are invisible.** `AccountStore::find_user` (login,
+    key lookup and registration, `/.well-known/ofscp/users/*/keys`, admin
+    disable, federation key resolution), and profiles (so discovery and
+    every profile surface) treat a pending row as no account. The admin
+    listings show it with the status `pending`. Its password cannot be
+    used, and it has no keys, as a bootstrap token is issued only for an
+    activated account.
+  - **Meeting a pending row.** A create (registration or admin) that hits
+    `Conflict` reads the holder:
+    - an account: `409`;
+    - settled `activate`: an account whose holder crashed before
+      activating; the create finishes the activation, and it is taken;
+    - settled `discard`: deleted, and the create retried;
+    - unsettled and made with the creator's **own invite**: joinable. A
+      registration that proves the row's password (Argon2 verify) joins it:
+      it redeems for the same handle and activates the same row, so a
+      retried or duplicated request finishes the registration rather than
+      racing it. Another password is a rival: `409`.
+    - unsettled, another invite (or an admin), and **live**: `409`;
+      **stale** (older than `PENDING_LEASE_SECS`, 300 s): settled `discard`
+      and deleted, and the create retried. The lease is fairness, not
+      safety: the settlement decides every race, so a stalled holder racing
+      a reclaimer either activates (the reclaimer then finds it taken) or
+      finds it discarded (`409`).
   - **Crash and failure windows.** Each fails closed:
-    - *After the redemption, before marking used:* the invite still reads
+    - *After the pending create, before redeeming:* the invite is
+      unredeemed and usable for any handle. The same handle, invite and
+      password finish it at once; anything else waits for the lease, then
+      reclaims the handle.
+    - *After redeeming, before marking used:* the invite still reads
       `used == false`, but every read that calls an invite usable (the
       admin list, the outstanding-invite cap, registration's own redeem)
       also checks for a redemption, and revoking it reports it used. Every
-      other handle is refused; its own handle can resume and marks it.
-    - *After marking used, before (or failing) the account create, or an
-      ambiguous create error:* the invite reads used by that handle. Every
-      other handle is refused, and the same handle resumes (or, if the
-      create had landed, finds its account).
-    - *The handle taken between the check and the create* (another
-      invite's registration, or an admin, won it): the redemption stays,
-      so the invite is spent. This is a rare race, and failing closed is
-      acceptable: the admin issues a new invite. Releasing it instead would
-      not be sound, because the account that took the handle may be a
-      resumed registration of this very invite.
+      other handle is refused; its own handle resumes.
+    - *After marking used, before activating:* the invite reads used by
+      that handle. Registration's `used_by` check refuses every other
+      handle, and lets the same handle on only while it has no account;
+      a pending row is not one, so the retry joins it.
+    - *After settling `activate`, before activating:* the next create
+      meeting the row finishes it. The account then exists with the
+      password of the request that settled it.
+    - *A stalled request whose row was reclaimed:* it finds its row
+      discarded and answers `409`. It reads the settlement before redeeming,
+      so normally its invite stays unredeemed; only a discard landing
+      between that read and the redemption leaves the invite spent on a
+      handle someone else now owns (the admin issues a new one).
   - **`used` is a mirror** of the redemption, written only by requests
     holding it (all with the same handle), so its guard (`expires_at >
-    now`) decides nothing. Registration no longer needs an in-process
-    lock: nothing is released, so there is no release to order.
+    now`) decides nothing. Registration needs no in-process lock.
 - **Replay ledger** (`replay/ledger.rs`). Rows are now never updated.
   - **Expired-row reuse:** §4.5 permits reusing a nonce after its window.
     The ledger now persists the clock (at least `now`), deletes the
@@ -187,8 +228,11 @@ grant anything (a role landing on an admin who was just disabled).
 
 ## Consequences
 
-- **New types, added only.** `AdminClaim` and `InviteRedemption` are new types;
-  rhypedb applies added types without a migration (its `migrations.md`).
+- **New types and fields, added only.** `AdminClaim`, `InviteRedemption`
+  and `AccountSettlement` are new types, and `User.pending`,
+  `User.invite_hash` and `User.pending_key` new optional fields (absent on
+  existing accounts, which read as not pending); rhypedb applies added
+  types and fields without a migration (its `migrations.md`).
   `ReplayClock` is unchanged in shape; only how its rows are used changed.
 - **A credential change or sign-in costs one more write** (the claim), and
   an expired-row reuse two more (the clock and the delete). These are rare
@@ -197,11 +241,21 @@ grant anything (a role landing on an admin who was just disabled).
   to 120 s, until the lease expires.
 - **An invite redeemed by a request that crashed or failed before making
   its account** is spent on that handle: only a registration for that
-  handle can finish it. An invite whose handle was taken in the moment
-  between the check and the create is spent outright. The admin issues a
-  new one in either case.
-- **Handles are never reused.** The invite bound relies on accounts never
-  being deleted; a future account deletion must keep the handle reserved.
+  handle can finish it. A registration's own crash holds its handle for
+  up to `PENDING_LEASE_SECS` (300 s) against rivals; its own retry, with
+  the same password, finishes at once.
+- **Settlements and redemptions are never deleted.** One small row each
+  per registration, which invites already bound. A purge would need its
+  own design (a settlement may be deleted only once its row is gone or
+  activated, and a redemption never while its invite is live).
+- **Handles are never reused, and any future account delete must deal
+  with redemptions.** The invite bound relies on a handle holding at most
+  one account, ever: an invite redeemed for a handle could make a second
+  account there if its account were deleted. A future account deletion
+  must therefore keep the handle reserved (or mark every redemption naming
+  it as spent, and invites used, before freeing it), and must leave
+  pending rows to the settlement protocol rather than deleting them by
+  filter.
 - **New code that needs a conditional write follows the pattern.** Code
   review rejects a guard used as compare-and-set. Example: a
   revision-guarded PATCH (`If-Match: rev`) claims `{object}:{rev + 1}`

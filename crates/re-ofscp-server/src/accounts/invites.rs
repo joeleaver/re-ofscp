@@ -7,7 +7,8 @@
 //! logged.
 //!
 //! Redeeming creates an `InviteRedemption` row, `@unique` on the token
-//! hash and recording the handle, before the account is created
+//! hash and recording the handle, after registration holds the handle (a
+//! pending account, [`super::pending`]) and before it activates it
 //! (docs/decisions/0012). The row is never updated, deleted or taken over:
 //! whatever happens to the registration, that invite can only ever make an
 //! account with that handle, and handles are unique, so one invite makes at
@@ -214,9 +215,9 @@ impl InviteStore {
     /// names the only handle the invite can ever make an account for. It is
     /// never deleted, so a slow or crashed request can never let a second
     /// handle through. A registration for the same handle finding it
-    /// resumes it (`true`): if the first request's account exists, the
-    /// account create then fails as the handle is taken, and if it never
-    /// came to be, this one makes it. Either way one account at most.
+    /// resumes it (`true`): it holds that handle's pending account (made or
+    /// joined, [`super::pending`]), and handles are unique, so either way
+    /// one account at most.
     pub async fn redeem(&self, token_hash: &str, handle: &str, now: i64) -> Result<bool, DbError> {
         let create = Ql::new("InviteRedemption.create({ token_hash: ")
             .str(token_hash)

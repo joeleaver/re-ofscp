@@ -9,6 +9,7 @@ pub mod bootstrap;
 pub mod invites;
 pub mod keys;
 pub mod password;
+pub mod pending;
 pub mod register;
 pub mod routes;
 pub mod store;
@@ -23,6 +24,7 @@ pub use bootstrap::{BOOTSTRAP_TTL_SECS, BootstrapTokens, IssueError};
 pub use invites::{InviteStore, InviteSummary, IssuedInvite, Revoked};
 pub use keys::ProviderKeys;
 pub use password::{PasswordError, Passwords};
+pub use pending::{Held, PENDING_LEASE_SECS, PendingAccount, Settlement};
 pub use register::{InviteError, RegisterError};
 pub use store::{AccountStore, AccountSummary, DeviceKey, StoreError, User};
 

@@ -6,7 +6,8 @@ mod common;
 use axum::http::StatusCode;
 use common::accounts::*;
 use common::harness::*;
-use re_ofscp_server::accounts::{CreateError, InviteError};
+use re_ofscp_server::accounts::invites::token_hash;
+use re_ofscp_server::accounts::{CreateError, Held, InviteError};
 use serde_json::{Value, json};
 
 fn now() -> i64 {
@@ -272,4 +273,101 @@ async fn auth_bodies_are_capped() {
         let (s, j, _, _) = send(&env.app, post_json(path, big.clone(), "10.2.6.1")).await;
         assert_problem(s, &j, StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large");
     }
+}
+
+/// A registration whose request redeemed the invite (and marked it used)
+/// but crashed before making the account: only the same handle resumes it,
+/// and once the account exists the invite is spent for good.
+#[tokio::test]
+async fn a_used_invite_resumes_only_its_own_unmade_handle() {
+    let env = env().await;
+    let token = invite(&env, None).await;
+    let hash = token_hash(&token).unwrap();
+    assert!(
+        env.state
+            .accounts
+            .invites
+            .redeem(&hash, "dave", now())
+            .await
+            .unwrap()
+    );
+    let (s, j) = register(
+        &env,
+        json!({"handle": "erin", "password": "correct horse battery", "inviteToken": token}),
+        "10.2.7.1",
+    )
+    .await;
+    assert_problem(s, &j, StatusCode::FORBIDDEN, "invite_required");
+    let (s, j) = register(
+        &env,
+        json!({"handle": "dave", "password": "correct horse battery", "inviteToken": token}),
+        "10.2.7.2",
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{j}");
+    let (s, _, _) = login(&env, "dave", "correct horse battery", "10.2.7.2").await;
+    assert_eq!(s, StatusCode::OK);
+    // Used by dave, whose account now exists: spent, even for dave.
+    let (s, j) = register(
+        &env,
+        json!({"handle": "dave", "password": "correct horse battery", "inviteToken": token}),
+        "10.2.7.3",
+    )
+    .await;
+    assert_problem(s, &j, StatusCode::FORBIDDEN, "invite_required");
+}
+
+/// A registration that crashed after holding its handle: the pending
+/// account cannot log in and has no profile; a retry with its invite and
+/// another password is a rival (409), and one with the same password
+/// finishes it.
+#[tokio::test]
+async fn a_stranded_registration_is_finished_by_its_own_retry() {
+    let env = env().await;
+    let token = invite(&env, None).await;
+    let hash = token_hash(&token).unwrap();
+    let accounts = &env.state.accounts;
+    let phc = accounts
+        .passwords
+        .hash("correct horse battery")
+        .await
+        .unwrap();
+    let held = accounts
+        .store
+        .create_pending("frank", "frank", &phc, &hash, now())
+        .await
+        .unwrap();
+    assert!(matches!(held, Held::Created(_)));
+    let (s, _, _) = login(&env, "frank", "correct horse battery", "10.2.8.1").await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    assert!(
+        env.state
+            .profiles
+            .store
+            .profile("frank")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let summary = accounts.store.summary("frank").await.unwrap().unwrap();
+    assert_eq!(summary.status, "pending");
+
+    let (s, j) = register(
+        &env,
+        json!({"handle": "frank", "password": "another long password", "inviteToken": token}),
+        "10.2.8.2",
+    )
+    .await;
+    assert_problem(s, &j, StatusCode::CONFLICT, "conflict");
+    let (s, j) = register(
+        &env,
+        json!({"handle": "frank", "password": "correct horse battery", "inviteToken": token}),
+        "10.2.8.3",
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{j}");
+    let (s, _, _) = login(&env, "frank", "correct horse battery", "10.2.8.4").await;
+    assert_eq!(s, StatusCode::OK);
+    let summary = accounts.store.summary("frank").await.unwrap().unwrap();
+    assert_eq!(summary.status, "active");
 }

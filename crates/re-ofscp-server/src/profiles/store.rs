@@ -58,6 +58,9 @@ struct ProfileRow {
     profile_metadata: Option<String>,
     #[serde(default)]
     profile_updated_at: Option<String>,
+    // A registration in flight (docs/decisions/0012): not an account yet.
+    #[serde(default)]
+    pending: Option<bool>,
 }
 
 fn decode(what: &str) -> DbError {
@@ -83,9 +86,10 @@ pub fn metadata_json(metadata: &[MetadataObject]) -> String {
 }
 
 impl ProfileRow {
-    /// The profile, or `None` for a disabled account.
+    /// The profile, or `None` for a disabled account or a pending
+    /// registration.
     fn into_profile(self) -> Result<Option<StoredProfile>, DbError> {
-        if self.status != status::ACTIVE {
+        if self.status != status::ACTIVE || self.pending == Some(true) {
             return Ok(None);
         }
         let updated = self

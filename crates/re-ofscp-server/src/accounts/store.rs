@@ -1,5 +1,10 @@
 //! Accounts and device keys in rhypedb (`User`, `DeviceKey` in
 //! `schema.rhype`). Every query goes through [`Ql`].
+//!
+//! A `User` row with `pending: true` is a registration in flight
+//! ([`super::pending`], docs/decisions/0012). It is not an account: every
+//! read here that returns a [`User`] skips it, and the admin listings show
+//! it with the status [`status::PENDING`].
 
 use std::sync::Arc;
 
@@ -7,10 +12,12 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use serde::Deserialize;
 
+use super::pending::Resolution;
 use crate::db::{Db, DbError, Ql};
 
-/// Attempts at an account create aborted by a concurrent one (`Contended`).
-const CREATE_PASSES: usize = 4;
+/// Attempts at an account create aborted by a concurrent one
+/// (`Contended`), or freed by discarding a pending registration.
+pub(super) const CREATE_PASSES: usize = 6;
 
 /// Account status values stored in `User.status`.
 pub mod status {
@@ -18,6 +25,9 @@ pub mod status {
     pub const ACTIVE: &str = "active";
     /// Cannot log in; keys do not verify.
     pub const DISABLED: &str = "disabled";
+    /// Shown by the admin listings for a registration in flight (a row
+    /// with `pending: true`); never stored in `User.status`.
+    pub const PENDING: &str = "pending";
 }
 
 /// An account.
@@ -76,16 +86,58 @@ struct UserRow {
     display_name: String,
     password_hash: String,
     status: String,
+    // Absent on accounts made by admins or before registrations were
+    // pending first.
+    #[serde(default)]
+    pending: Option<bool>,
+}
+
+impl UserRow {
+    fn into_user(self, id: u64) -> Option<User> {
+        (self.pending != Some(true)).then_some(User {
+            id,
+            handle: self.handle,
+            display_name: self.display_name,
+            password_hash: self.password_hash,
+            status: self.status,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct SummaryRow {
+    handle: String,
+    display_name: String,
+    status: String,
+    created_at: String,
+    #[serde(default)]
+    pending: Option<bool>,
+}
+
+impl From<SummaryRow> for AccountSummary {
+    fn from(r: SummaryRow) -> Self {
+        Self {
+            handle: r.handle,
+            display_name: r.display_name,
+            status: if r.pending == Some(true) {
+                status::PENDING.to_owned()
+            } else {
+                r.status
+            },
+            created_at: r.created_at,
+        }
+    }
 }
 
 /// An account as the admin API lists it (no password hash).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountSummary {
     /// The handle.
     pub handle: String,
     /// Display name.
     pub display_name: String,
-    /// [`status::ACTIVE`] or [`status::DISABLED`].
+    /// [`status::ACTIVE`] or [`status::DISABLED`], or [`status::PENDING`]
+    /// for a registration in flight (not an account yet).
     pub status: String,
     /// RFC 3339 creation time.
     pub created_at: String,
@@ -125,7 +177,7 @@ fn new_key_id() -> Result<String, DbError> {
 /// Account and device-key storage.
 #[derive(Debug, Clone)]
 pub struct AccountStore {
-    db: Arc<Db>,
+    pub(super) db: Arc<Db>,
 }
 
 impl AccountStore {
@@ -134,8 +186,12 @@ impl AccountStore {
         Self { db }
     }
 
-    /// Create an active account. The caller has validated the handle and
-    /// hashed the password.
+    /// Create an active account (an admin's). The caller has validated the
+    /// handle and hashed the password.
+    ///
+    /// A pending registration holding the handle makes it taken, unless it
+    /// is stale or settled discarded, when it is discarded and the create
+    /// retried ([`AccountStore::resolve_taken`]).
     pub async fn create_user(
         &self,
         handle: &str,
@@ -157,39 +213,41 @@ impl AccountStore {
         // A create racing another of the same handle can abort with
         // `Contended`, which wrote nothing; a retry then succeeds or meets
         // the winner's `Conflict` (docs/decisions/0012).
-        let mut passes = 0;
-        loop {
-            passes += 1;
-            return match self.db.write_one::<UserRow>(&q).await {
-                Ok(row) => Ok(User {
-                    id: row.id,
-                    handle: row.data.handle,
-                    display_name: row.data.display_name,
-                    password_hash: row.data.password_hash,
-                    status: row.data.status,
-                }),
-                Err(DbError::Conflict(_)) => Err(StoreError::HandleTaken),
-                Err(DbError::Contended(_)) if passes < CREATE_PASSES => continue,
-                Err(e) => Err(e.into()),
-            };
+        for _ in 0..CREATE_PASSES {
+            match self.db.write_one::<UserRow>(&q).await {
+                Ok(row) => {
+                    let id = row.id;
+                    return row.data.into_user(id).ok_or_else(|| {
+                        DbError::Decode("a created account reads pending".to_owned()).into()
+                    });
+                }
+                Err(DbError::Conflict(_)) => {
+                    // With no invite, nothing is joinable: taken.
+                    match self.resolve_taken(handle, None, now).await? {
+                        Resolution::Free => {}
+                        Resolution::Taken | Resolution::Joinable(..) => {
+                            return Err(StoreError::HandleTaken);
+                        }
+                    }
+                }
+                Err(DbError::Contended(_)) => {}
+                Err(e) => return Err(e.into()),
+            }
         }
+        Err(DbError::Contended("account create stayed contended".to_owned()).into())
     }
 
-    /// The account with `handle`, if any.
+    /// The account with `handle`, if any. A pending registration is not
+    /// one: `None`.
     pub async fn find_user(&self, handle: &str) -> Result<Option<User>, StoreError> {
         let q = Ql::new("User.filter(.handle == ").str(handle).raw(")");
         let rows = self.db.fetch::<UserRow>(&q).await?;
-        Ok(rows.into_iter().next().map(|r| User {
-            id: r.id,
-            handle: r.data.handle,
-            display_name: r.data.display_name,
-            password_hash: r.data.password_hash,
-            status: r.data.status,
-        }))
+        Ok(rows.into_iter().next().and_then(|r| r.data.into_user(r.id)))
     }
 
     /// Up to `limit` accounts whose handle contains `contains` (every
-    /// account when `None`), in no particular order.
+    /// account when `None`), in no particular order. Pending registrations
+    /// are included, marked [`status::PENDING`].
     pub async fn search(
         &self,
         contains: Option<&str>,
@@ -204,23 +262,24 @@ impl AccountStore {
         let q = q.uint(limit as u64).raw(")");
         Ok(self
             .db
-            .fetch::<AccountSummary>(&q)
+            .fetch::<SummaryRow>(&q)
             .await?
             .into_iter()
-            .map(|r| r.data)
+            .map(|r| r.data.into())
             .collect())
     }
 
-    /// The account with `handle`, without its password hash.
+    /// The account with `handle`, without its password hash (a pending
+    /// registration is marked [`status::PENDING`]).
     pub async fn summary(&self, handle: &str) -> Result<Option<AccountSummary>, StoreError> {
         let q = Ql::new("User.filter(.handle == ").str(handle).raw(")");
         Ok(self
             .db
-            .fetch::<AccountSummary>(&q)
+            .fetch::<SummaryRow>(&q)
             .await?
             .into_iter()
             .next()
-            .map(|r| r.data))
+            .map(|r| r.data.into()))
     }
 
     /// Set an account's status.

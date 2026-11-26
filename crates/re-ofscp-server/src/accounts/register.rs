@@ -12,6 +12,7 @@ use super::invites::{
     DEFAULT_INVITE_TTL_SECS, IssuedInvite, MAX_INVITE_TTL_SECS, new_token, token_hash,
 };
 use super::password::check_length;
+use super::pending::{self, Held};
 use super::{Accounts, CreateError, PasswordError, StoreError, User, check_new_handle};
 use crate::db::DbError;
 
@@ -153,16 +154,19 @@ impl Accounts {
         }
         // A used invite is spent, except to resume its own handle's
         // registration when that never made the account (its request
-        // crashed or failed after redeeming; docs/decisions/0012). The
-        // lookup only answers a caller holding this invite, for the handle
-        // it was redeemed for.
+        // crashed or failed after redeeming; docs/decisions/0012): a
+        // pending registration is not an account, so `find_user` does not
+        // see it. The lookup only answers a caller holding this invite, for
+        // the handle it was redeemed for.
         if let Some(by) = &invite.used_by
             && (by != &req.handle || self.store.find_user(&req.handle).await?.is_some())
         {
             return Err(RegisterError::InviteRequired);
         }
 
-        // 2. The handle and password, then hash.
+        // 2. The handle and password, then hash. The lookup only spares a
+        // hash for a handle that is plainly taken: it holds nothing, and
+        // the pending create below is what decides.
         check_new_handle(&req.handle).map_err(RegisterError::Invalid)?;
         check_length(&req.password)?;
         if self.store.find_user(&req.handle).await?.is_some() {
@@ -170,18 +174,28 @@ impl Accounts {
         }
         let password_hash = self.passwords.hash(&req.password).await?;
 
-        // 3. Redeem the invite for this handle, then create the account.
-        // The redemption is never undone (docs/decisions/0012): the invite
-        // can then only ever make the account `req.handle`, and handles are
-        // unique, so however requests race, stall or crash, it makes one
-        // account at most. A failure from here on leaves it spent on this
-        // handle; a retry for the same handle resumes it.
-        if !self.invites.redeem(&hash, &req.handle, now).await? {
-            return Err(RegisterError::InviteRequired);
-        }
-        Ok(self
+        // 3. Hold the handle (a pending account), redeem the invite for it,
+        // then activate (docs/decisions/0012). The handle is decided first,
+        // so losing it never touches the invite; the redemption is never
+        // undone, so the invite only ever makes the account `req.handle`.
+        // A live pending account of this same invite is joined only with
+        // its password: a retried or duplicated request finishes it, while
+        // another password is a rival, refused until it goes stale. A
+        // failure from here on leaves an invisible pending account that a
+        // retry with this handle, invite and password finishes.
+        let held = match self
             .store
-            .create_user(&req.handle, &req.handle, &password_hash, now)
-            .await?)
+            .create_pending(&req.handle, &req.handle, &password_hash, &hash, now)
+            .await?
+        {
+            Held::Created(p) => p,
+            Held::Joinable(p, stored) => {
+                if !self.passwords.verify(&req.password, Some(&stored)).await? {
+                    return Err(RegisterError::HandleTaken);
+                }
+                p
+            }
+        };
+        pending::complete(&self.store, &self.invites, &hash, &held, now).await
     }
 }

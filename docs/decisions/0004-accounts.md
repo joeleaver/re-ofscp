@@ -29,14 +29,18 @@
   2. No invite, or one that is unknown, expired, used, or pinned to another
      handle → `403 invite_required`. The body is identical in every case.
   3. Invalid handle or password → `400`. Handle taken → `409`.
-  4. Hash, then redeem the invite and create the account. The redemption
-     is a `@unique` `InviteRedemption` row naming the handle, made before
-     the account and never undone (decision 0012; a conditional update on
-     `used == false` alone is not atomic in rhypedb). Of any number of
-     registrations with one invite, in any number of processes, at most
-     one account results. A registration that fails after redeeming leaves
-     the invite spent on its handle: a retry for that handle finishes it,
-     any other handle gets `403 invite_required`.
+  4. Hash, then hold the handle, redeem the invite, and activate
+     (decision 0012). The account is created first as a pending row
+     (invisible to login, keys, profiles; `pending` in the admin lists), so
+     a registration that loses the handle (`409`) leaves its invite
+     untouched. The redemption is a `@unique` `InviteRedemption` row naming
+     the handle, never undone (a conditional update on `used == false`
+     alone is not atomic in rhypedb). Of any number of registrations with
+     one invite, in any number of processes, at most one account results.
+     A registration that fails after redeeming leaves the invite spent on
+     its handle: a retry for that handle finishes it (at once with the same
+     password; with another once its pending row is stale), any other
+     handle gets `403 invite_required`.
   5. `201` with a bootstrap token.
 - **Display name:** starts as the handle; the registration request carries
   none.

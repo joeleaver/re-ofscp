@@ -23,6 +23,17 @@ type User {
     // The profile's metadata list (§5.4), as a JSON array.
     profile_metadata: String
     profile_updated_at: DateTime
+    // A registration in flight (docs/decisions/0012). Registration creates
+    // the account first, with `pending: true`, so the `@unique` handle is
+    // the first thing it holds; it then redeems the invite and activates the
+    // account by setting `pending` to false (never back). A pending account
+    // is invisible: it cannot log in, has no keys or profile, and the admin
+    // lists mark it. `invite_hash` is the invite it registers with, and
+    // `pending_key` (random) names its `AccountSettlement`. Accounts created
+    // by admins, or before this field existed, have none of the three.
+    pending: Bool
+    invite_hash: String
+    pending_key: String
 }
 
 // A device key (§4.3.2), owned by the account with `handle`. Keys are found
@@ -43,8 +54,9 @@ type DeviceKey {
 
 // An account invite (§4.1.1, lost-conn/ofscp#18): single-use, time-limited,
 // optionally pinned to a handle. Only the token's SHA-256 is stored.
-// `used_at` and `used_by` describe the use only while `used` is true (a
-// registration that fails after claiming the invite releases it again).
+// `used_at` and `used_by` describe the use only while `used` is true
+// (`used` mirrors the `InviteRedemption`; an earlier version could set it
+// back to false).
 type RegistrationInvite {
     token_hash: String @unique
     // The pinned handle, absent when the invite is for any handle.
@@ -58,8 +70,9 @@ type RegistrationInvite {
     used_by: String
 }
 
-// The redemption of an invite (docs/decisions/0012): created before the
-// account, and never updated, deleted or taken over. The `@unique` create
+// The redemption of an invite (docs/decisions/0012): created by the
+// registration holding the (pending) account for `handle`, before it is
+// activated, and never updated, deleted or taken over. The `@unique` create
 // decides which registration redeems a `RegistrationInvite`, and `handle`
 // is the only account it can ever make, so one invite makes at most one
 // account however requests race, stall or crash. `RegistrationInvite.used`
@@ -68,6 +81,18 @@ type InviteRedemption {
     token_hash: String @unique
     handle: String
     redeemed_at: DateTime
+}
+
+// How a pending account was settled (docs/decisions/0012): `key` is its
+// `User.pending_key`, `outcome` is "activate" or "discard". Created once,
+// never updated or deleted. Only the creator of "activate" (or anyone
+// finishing it) clears `User.pending`; only "discard" lets anyone delete the
+// pending row. So a row being activated is never deleted, however late
+// either write lands.
+type AccountSettlement {
+    key: String @unique
+    outcome: String
+    settled_at: DateTime
 }
 
 // The persistent replay ledger (spec §4.5 "Restarts"; docs/decisions/0001).
