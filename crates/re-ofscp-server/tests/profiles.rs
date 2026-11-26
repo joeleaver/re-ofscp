@@ -177,7 +177,7 @@ async fn every_user_ref_form_resolves_and_nothing_else_does() {
         assert_eq!(body["handle"], "alice", "{path}");
     }
     // Disable a second account: it is answered like one that never existed.
-    local(&env, "carol").await;
+    let carol_caller = local(&env, "carol").await;
     let carol = env
         .state
         .accounts
@@ -187,6 +187,11 @@ async fn every_user_ref_form_resolves_and_nothing_else_does() {
         .unwrap()
         .unwrap();
     env.state.accounts.disable_account(&carol, 0).await.unwrap();
+    // Its signer is refused, even for a PATCH that changes nothing.
+    for body in [json!({}), json!({"bio": "still here"})] {
+        let (status, p) = call(&env, &carol_caller, "PATCH", "/api/me/profile", Some(&body)).await;
+        assert!(status.is_client_error(), "{body}: {status} {p}");
+    }
     let mut answers = Vec::new();
     for path in [
         "/api/users/nobody/profile",

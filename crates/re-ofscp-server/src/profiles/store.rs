@@ -273,7 +273,8 @@ impl ProfileStore {
     }
 
     /// Apply `changes` to the active account `handle` in one update and
-    /// stamp the change time (nothing is written if nothing changes). `None` if there is no such active account.
+    /// stamp the change time (nothing is written if nothing changes).
+    /// `None` if there is no such active account.
     pub async fn update_profile(
         &self,
         handle: &str,

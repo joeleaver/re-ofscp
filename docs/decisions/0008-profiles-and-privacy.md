@@ -3,7 +3,7 @@
 - **Status:** accepted
 - **Date:** 2026-11-26
 - **Spec:** §5.1 (UserProfile, UserAccount), §6.1–§6.6 (user privacy
-  endpoints), §7.5 (presence), §2.2 (`{userRef}`); schemas
+  endpoints), §7.5 (presence), §2.2 (`{userRef}`), as settled in lost-conn/ofscp#26; schemas
   `user-profile.json`, `user-account.json`, `user-public-profile-response.json`,
   `privacy-settings.json`, `presence.json`, `user-groups-response.json`
 
@@ -30,8 +30,8 @@ leaving each of those a place to plug in.
 | `GET /api/users/{userRef}/presence` | anyone | `Presence`, filtered |
 | `GET /api/users/{userRef}/groups` | anyone | `UserGroupsResponse`, filtered |
 
-- **Unsigned reads are an anonymous viewer** (Joe's decision, relayed
-  by the OFSCP oracle on 2026-11-26; spec clarification PR to follow). The
+- **Unsigned reads are an anonymous viewer** (Joe's decision;
+  lost-conn/ofscp#26). The
   three `/api/users/{userRef}/…` reads accept unsigned requests; an
   anonymous viewer satisfies only `public` and never matches `allowList`
   or `denyList`. Otherwise `public` and `authenticated` would mean the
@@ -86,8 +86,9 @@ So a viewer cannot tell refusal from absence.
   profile `public`, membership `authenticated`, empty lists, no metadata.
 - **`PUT /api/me/privacy` is a partial update**: an absent field is left
   unchanged, `[]` clears a list, `null` is refused. The first save creates
-  the row; a concurrent first save that loses the unique-handle race
-  retries as an update, so both changes land (tested).
+  the row; a concurrent first save that loses the unique-handle race is
+  validated again against the row that won and applied to it, so both
+  changes land (tested).
 - **No actor is ever on both lists, even under concurrency.** A change
   to either list is validated against the stored lists and writes both
   lists together, as the validated pair. An object's update is one
@@ -114,7 +115,8 @@ So a viewer cannot tell refusal from absence.
   is trimmed, 1–100 characters, no control characters, and cannot be
   removed. `bio` is at most 2000 characters, line breaks and tabs only;
   `""` removes it. `metadata` replaces the list. `updatedAt` is the time of
-  the last change (a PATCH that changes nothing writes nothing), falling back to the account's creation.
+  the last change (a PATCH that changes nothing writes nothing),
+  falling back to the account's creation.
 - **Avatars wait for media.** §5.1.1 says an avatar SHOULD be a media URL
   this provider serves (§5.8, `POST /api/media`), and no media exists yet.
   Every avatar URL is refused with `400` and a detail that says why;
@@ -130,8 +132,8 @@ So a viewer cannot tell refusal from absence.
 - The stored state is the explicit availability (`online`, `away`,
   `dnd`) and `status` (at most 200 characters, one line). `PUT` is a full
   replace: an absent `status` clears it. `offline` is refused with `400`:
-  §7.5 makes it derived, not settable (the schema's allowing it is a bug
-  the oracle is fixing).
+  §7.5 makes it derived, not settable (lost-conn/ofscp#26 fixed the
+  schema, which had allowed it).
 - The reported availability is the stored one **only while the subject
   has a live connection**, and `offline` otherwise. Liveness is the
   `Liveness` seam; until WebSockets exist its implementation is
@@ -173,10 +175,14 @@ accept rule (security requirement 4) and DM consent belong together.
   queried into, so a JSON column is the right shape; the server validates
   before writing and treats unparsable stored JSON as a database error.
 
-## Settled with the OFSCP oracle (2026-11-26)
+## Settled in the spec (lost-conn/ofscp#26)
 
-The oracle agreed with every decision above, and Joe decided the three it
-could not: unsigned reads are anonymous, `PUT /api/me/privacy` is partial,
-and `PUT /api/me/presence` is a full replace (like `presence.set`). It is
-fixing `presence-update-request.json`, which wrongly allows `offline`, in
-one §6 clarification spec PR; cite it here once open.
+The OFSCP oracle agreed with every decision above, and Joe decided the
+three it could not: unsigned reads are anonymous, `PUT /api/me/privacy`
+is partial, and `PUT /api/me/presence` is a full replace (like
+`presence.set`). All of it is merged into the spec as
+[lost-conn/ofscp#26](https://github.com/lost-conn/ofscp/pull/26)
+(7fa0817), which also fixes `presence-update-request.json` to refuse
+`offline`. The spec also notes that WS `presence.subscribe` leaves out
+users REST would answer `404` and reports them in one `not_found` error
+(`details.users`); that belongs to the WebSocket work.

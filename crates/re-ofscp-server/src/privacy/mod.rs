@@ -5,7 +5,9 @@
 //! asks [`Policy::admits`] whether a [`Viewer`] may see a subject's data.
 //! Identity is always `(handle, domain)` (security requirement 1): a remote
 //! `alice@b.com` never matches local `alice`, in the allow and deny lists
-//! as in every tier.
+//! as in every tier. Settled in lost-conn/ofscp#26: anonymous viewers
+//! satisfy only `public`, `allowList` overrides even `nobody`, `denyList`
+//! even `public`, and the lists never match an anonymous viewer.
 //!
 //! The `sharedGroups` and `contacts` tiers depend on state other modules
 //! own, reached through two seams, [`GroupMemberships`] and [`Contacts`].
