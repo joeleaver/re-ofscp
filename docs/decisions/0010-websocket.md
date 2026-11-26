@@ -202,11 +202,16 @@ Disabling an account closes all of its connections with `4003`.
   (building therefore needs a Tokio runtime). It holds neither alive and
   ends when the state is dropped.
 
-  A group write announces its change whether it returned `Ok` or `Err`:
-  a write can commit and still fail to report it (the connection drops
-  after the commit), and a spurious announcement costs only a re-check.
-  Only a write known to have changed nothing (a filtered update that
-  matched no row, `set_role` on a non-member) goes unannounced.
+  A group write that can revoke access (tier or `view` edits, role
+  changes, member removal, channel and group deletes, including
+  `delete_group`'s `mark_deleting`) announces its change whether it
+  returned `Ok` or `Err`: a write can commit and still fail to report it
+  (the connection drops after the commit), and a spurious announcement
+  costs only a re-check. Only a write known to have changed nothing (a
+  filtered update that matched no row, `set_role` on a non-member) goes
+  unannounced. A write that only grants access (`add_member`) announces
+  on success alone: a grant revokes nothing, and a new subscribe checks
+  access itself.
 
   Deleting a group purges the channel rows that `Group` would be listed
   from, so `delete_group` also announces `Channel` for each of its

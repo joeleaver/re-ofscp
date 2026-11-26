@@ -274,7 +274,20 @@ impl Groups {
         if group.owner != *actor {
             return Err(GroupError::Forbidden("only the owner may delete a group"));
         }
-        if !self.store.mark_deleting(group_id).await? {
+        // A failed mark may have committed (the group is then hidden): tell
+        // live readers now, as every revoking write does. On success the
+        // channels and the group are announced below, in that order.
+        let marked = self.store.mark_deleting(group_id).await;
+        announce_unless(
+            &marked,
+            |_| true,
+            || {
+                self.changed(AccessChange::Group {
+                    group_id: group_id.to_owned(),
+                });
+            },
+        );
+        if !marked? {
             return Err(GroupError::NotFound(NO_GROUP));
         }
         // Live readers (WebSocket subscriptions) find a group's channels
