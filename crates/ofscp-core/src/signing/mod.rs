@@ -338,4 +338,26 @@ mod tests {
             Ok(format!("a.example\nGET\n/\n\nt\nn\n{EMPTY_BODY_DIGEST}"))
         );
     }
+
+    /// The path is signed exactly as written in the request-target: no
+    /// dot-segment removal, no slash collapsing, no trailing-slash trimming
+    /// (§4.4.2). Forumall's suite has the same case.
+    #[test]
+    fn path_is_signed_as_written() {
+        let c = CanonicalRequest {
+            authority: "a.example",
+            method: "GET",
+            path: "/a/../b/./c//d/",
+            query: None,
+            timestamp: "t",
+            nonce: "n",
+            content_digest: EMPTY_BODY_DIGEST,
+        };
+        assert_eq!(
+            c.render(),
+            Ok(format!(
+                "a.example\nGET\n/a/../b/./c//d/\n\nt\nn\n{EMPTY_BODY_DIGEST}"
+            ))
+        );
+    }
 }
