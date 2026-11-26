@@ -7,10 +7,13 @@
 //! never serialized, logged or printed.
 
 use base64::Engine as _;
-use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::SigningKey;
+use re_ofscp_types::auth::ED25519;
 use re_ofscp_types::discovery::ProviderPublicKey;
 use sha2::{Digest as _, Sha256};
+
+use crate::signing::canonical::encode_public_key;
 
 /// Prefix of a provider key id (`psk-…`, after the spec's example).
 pub const KEY_ID_PREFIX: &str = "psk-";
@@ -66,8 +69,8 @@ impl ProviderKey {
             .into_iter()
             .map(|(key_id, key)| ProviderPublicKey {
                 key_id,
-                algorithm: "Ed25519".to_owned(),
-                public_key: STANDARD.encode(key.as_bytes()),
+                algorithm: ED25519.to_owned(),
+                public_key: encode_public_key(&key),
                 created_at: None,
             })
             .collect()

@@ -197,10 +197,10 @@ pub async fn register_device_key(
     if algorithm != ED25519 {
         return Err(Problem::bad_request().with_detail("algorithm must be Ed25519 (§4.3.3)"));
     }
-    if decode_public_key(&req.public_key).is_none() {
-        return Err(
-            Problem::bad_request().with_detail("public_key must be a base64 Ed25519 public key")
-        );
+    if let Err(e) = decode_public_key(&req.public_key) {
+        return Err(Problem::bad_request().with_detail(format!(
+            "public_key must be a base64 Ed25519 public key ({e})"
+        )));
     }
     let device_name = req.device_name.trim();
     if device_name.chars().count() > MAX_DEVICE_NAME_CHARS {

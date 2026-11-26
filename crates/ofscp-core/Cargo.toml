@@ -1,0 +1,21 @@
+[package]
+name = "ofscp-core"
+description = "The OFSCP protocol core: identifiers, wire types, dmId and request signing (no I/O, wasm-safe)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# Everything here must also build for `wasm32-unknown-unknown` (CI checks
+# it): no tokio, no I/O, no clock reads. Keep the dependency list short; a
+# client takes this crate as a pinned git dependency.
+[dependencies]
+serde = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+ed25519-dalek = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

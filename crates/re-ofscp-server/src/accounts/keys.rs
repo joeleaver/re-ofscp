@@ -133,11 +133,8 @@ impl ProviderKeys {
         else {
             return Ok(Resolved::authoritative(None));
         };
-        let Some(key) = decode_public_key(&stored.public_key) else {
-            return Err(store_unavailable(format!(
-                "stored key {key_id} is not a valid Ed25519 key"
-            )));
-        };
+        let key = decode_public_key(&stored.public_key)
+            .map_err(|e| store_unavailable(format!("stored key {key_id} is unusable: {e}")))?;
         let mut cache = self.cache();
         // Invalidated since we read the store: return what we read for this
         // one request (it was valid when read), but never cache it.

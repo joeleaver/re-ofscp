@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/re-ofscp-types", "crates/re-ofscp-server"]
+members = ["crates/ofscp-core", "crates/re-ofscp-types", "crates/re-ofscp-server"]
 # The admin UI is a wasm32 crate built by trunk (jkbase `[sites.admin]`); it is
 # NOT a workspace member, so `cargo build`/`cargo test` at the root (and the
 # jkbase Rust server buildpack) never try to compile it for the host.
@@ -14,6 +14,7 @@ repository = "https://github.com/joeleaver/re-ofscp"
 rust-version = "1.99"
 
 [workspace.dependencies]
+ofscp-core = { path = "crates/ofscp-core" }
 re-ofscp-types = { path = "crates/re-ofscp-types" }
 
 serde = { version = "1", features = ["derive"] }

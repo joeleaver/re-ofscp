@@ -154,12 +154,8 @@ fn key_set(entries: Vec<RawKey>, created_at: CreatedAt) -> Result<KeySet, Invali
             }
             _ => {}
         }
-        let key = decode_public_key(&entry.public_key).ok_or_else(|| {
-            invalid(format!(
-                "key {:?} is not a 32-byte base64 Ed25519 key",
-                entry.key_id
-            ))
-        })?;
+        let key = decode_public_key(&entry.public_key)
+            .map_err(|e| invalid(format!("key {:?}: {e}", entry.key_id)))?;
         keys.insert(entry.key_id, key);
     }
     Ok(keys)

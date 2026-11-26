@@ -2,17 +2,19 @@
 //!
 //! Keep this crate free of I/O and async runtimes: it compiles for both the
 //! host (server) and `wasm32-unknown-unknown` (admin UI).
+//!
+//! The OFSCP protocol itself (identifiers, auth and discovery payloads,
+//! `dmId`, signing) lives in [`ofscp_core`], which OFSCP clients share. Its
+//! modules are re-exported here at their old paths, so `re_ofscp_types::actor`
+//! and friends keep working. What is defined here is specific to this
+//! provider: its admin API, its federation policy, and its health check.
 
-pub mod actor;
 pub mod admin;
-pub mod auth;
-pub mod discovery;
-pub mod dm;
 pub mod federation;
 pub mod profile;
 
-pub use actor::{Actor, Authority, IdentError, is_valid_handle};
-pub use dm::dm_id;
+pub use ofscp_core::{Actor, Authority, IdentError, dm_id, is_valid_handle};
+pub use ofscp_core::{actor, auth, discovery, dm};
 
 use serde::{Deserialize, Serialize};
 
