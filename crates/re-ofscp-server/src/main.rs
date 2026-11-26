@@ -63,6 +63,7 @@ async fn main() -> anyhow::Result<()> {
             .clone()
             .purge_sessions_forever(std::sync::Arc::new(re_ofscp_server::signing::SystemClock)),
     );
+    let sweep_groups = tokio::spawn(state.groups.clone().sweep_forever());
     let app = router(state);
     axum::serve(
         listener,
@@ -72,6 +73,7 @@ async fn main() -> anyhow::Result<()> {
     .await?;
     purge.abort();
     purge_sessions.abort();
+    sweep_groups.abort();
     Ok(())
 }
 

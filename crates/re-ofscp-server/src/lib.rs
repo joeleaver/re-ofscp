@@ -10,6 +10,7 @@ pub mod config;
 pub mod cors;
 pub mod db;
 pub mod discovery;
+pub mod groups;
 pub mod outbound;
 pub mod problem;
 pub mod provider_key;
@@ -34,6 +35,7 @@ pub use problem::Problem;
 use accounts::Accounts;
 use admin::{AdminSecrets, Admins, ConsoleOrigins};
 use db::{Db, DbConfig};
+use groups::Groups;
 use outbound::{OutboundClient, OutboundConfig};
 use remote_keys::RemoteKeys;
 use replay::ReplayStore;
@@ -56,6 +58,8 @@ pub struct AppState {
     pub accounts: Arc<Accounts>,
     /// Admin identity, sessions and the audit log.
     pub admins: Arc<Admins>,
+    /// Groups, channels and membership (§5.2, §5.5).
+    pub groups: Arc<Groups>,
     /// Verifies every signed request, REST and federation alike, against the
     /// one provider-wide replay store.
     pub verifier: Arc<Verifier>,
@@ -168,6 +172,7 @@ impl AppStateBuilder {
                 setup_token: config.admin_setup_token.as_ref().map(|t| t.0.clone()),
             },
         ));
+        let groups = Arc::new(Groups::new(config.domain.clone(), db.clone()));
         let keys: Arc<dyn KeyResolver> = self.keys.unwrap_or_else(|| accounts.keys.clone());
         let verifier = Arc::new(Verifier::new(
             config.domain.clone(),
@@ -182,6 +187,7 @@ impl AppStateBuilder {
             db,
             accounts,
             admins,
+            groups,
             verifier,
             discovery,
         })
@@ -269,6 +275,24 @@ pub fn router(state: AppState) -> Router {
             "/.well-known/ofscp/users/{handle}/keys",
             get(accounts::routes::user_keys),
         )
+        .route("/api/groups", post(groups::routes::create_group))
+        .route(
+            "/api/groups/{group_id}",
+            get(groups::routes::get_group)
+                .patch(groups::routes::update_group)
+                .delete(groups::routes::delete_group),
+        )
+        .route(
+            "/api/groups/{group_id}/channels",
+            get(groups::routes::list_channels).post(groups::routes::create_channel),
+        )
+        .route(
+            "/api/groups/{group_id}/channels/{channel_id}",
+            get(groups::routes::get_channel)
+                .patch(groups::routes::update_channel)
+                .delete(groups::routes::delete_channel),
+        )
+        .route("/api/tiers", get(groups::routes::tiers))
         .route(discovery::PATH, get(discovery::get))
         .route("/problems/{code}", get(problem::describe))
         .fallback(|| async { Problem::not_found() })

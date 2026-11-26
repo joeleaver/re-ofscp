@@ -123,3 +123,53 @@ type AdminAudit {
     source: String
     detail: String
 }
+
+// A group (spec §5.2), hosted here. Channels and memberships refer to it by
+// `group_id` (its local id), not by a relation field: rhypedb at the pinned
+// commit cannot link inside `create`, so a relation would make every channel
+// create two non-atomic statements (docs/decisions/0008). Groups are deleted
+// in two steps: `status` goes to "deleting" (the group disappears from every
+// surface at once), then its channels, memberships and finally the group row
+// are removed; a sweeper finishes any deletion a crash interrupted.
+type Group {
+    group_id: String @unique
+    // The owner's canonical actor (`handle@domain`, §2.2).
+    owner: String @indexed
+    name: String
+    tier: String
+    join_policy: String
+    // "active" or "deleting".
+    status: String @indexed
+    // Bumped by every update; updates are conditional on it.
+    revision: i64
+    // JSON: description, permissions, roles, metadata (model::GroupDoc).
+    doc: String
+    created_at: DateTime
+    updated_at: DateTime
+}
+
+// A channel of a group (spec §5.2, §5.2.1).
+type Channel {
+    channel_id: String @unique
+    group_id: String @indexed
+    // "text" or "call"; immutable.
+    kind: String
+    tier: String
+    revision: i64
+    // JSON: name, topic, tags, permissions, metadata (model::ChannelDoc).
+    doc: String
+    created_at: DateTime
+    updated_at: DateTime
+}
+
+// A non-owner member of a group (spec §5.7). The owner is `Group.owner` and
+// has no row here. `key` is `group_id` + " " + the canonical actor, so one
+// actor holds at most one membership per group. Actors may be remote
+// (§8.2): identity is the full `handle@domain` (security requirement 1).
+type Membership {
+    key: String @unique
+    group_id: String @indexed
+    actor: String @indexed
+    role: String
+    joined_at: DateTime
+}
