@@ -14,6 +14,9 @@
 //!   target already has its cap of requests in flight, is `503` with the
 //!   `Retry-After` of that limit, again unless an unexpired cached key
 //!   matches;
+//! * a provider the federation policy denies is `403` before anything
+//!   else, cache included (§4.6 "No fetch is allowed"), and every lookup
+//!   is `503` until the policy has loaded;
 //! * a host under a public suffix the PSL does not know is refused like an
 //!   outbound refusal (`401`), before any budget is consulted, unless the
 //!   operator allowed its name in `OUTBOUND_ALLOW_HOSTS`.
@@ -36,6 +39,7 @@ use tokio::sync::watch;
 use self::budget::{Budgets, Standing};
 use self::fetch::{Fetched, Source};
 use self::state::{Flight, MAX_ENTRIES, Tables};
+use crate::federation::{Decision, UNKNOWN_RETRY_SECS};
 use crate::outbound::{OutboundClient, OutboundError, Reservation};
 use crate::registrable::has_unknown_suffix;
 use crate::signing::{Clock, KeyError, KeyFuture, KeyResolver, Requester, Resolved, Signer};
@@ -125,6 +129,10 @@ impl Inner {
         fresh: bool,
         requester: &Requester,
     ) -> Plan {
+        // The policy first: a denied provider's cached keys are never used.
+        if let Some(refusal) = policy_refusal(self.client.policy().decide(source.host()), source) {
+            return Plan::Answer(Err(refusal));
+        }
         let now = self.now();
         let mut tables = self.tables();
         if !fresh && let Some(keys) = tables.live(source, now) {
@@ -138,6 +146,9 @@ impl Inner {
         // A target refused without any lookup (an IP-literal host) costs no
         // fetch and no budget.
         if let Err(e) = self.client.target(source.host(), &source.path()) {
+            if let Some(refusal) = outbound_policy_refusal(&e, source) {
+                return Plan::Answer(Err(refusal));
+            }
             let why = match e {
                 OutboundError::Refused(why) => why,
                 other => other.to_string(),
@@ -181,6 +192,9 @@ impl Inner {
                 ));
             }
             Err(e) => {
+                if let Some(refusal) = outbound_policy_refusal(&e, source) {
+                    return Plan::Answer(Err(refusal));
+                }
                 return Plan::Answer(fallback(&tables, source, key_id, now, || {
                     KeyError::Unresolvable(e.to_string())
                 }));
@@ -248,6 +262,9 @@ impl Inner {
             Fetched::Refused(why) => {
                 tracing::info!(host = %source.host(), reason = %why, "key fetch refused");
             }
+            Fetched::Denied(_) => {
+                tracing::info!(host = %source.host(), "key fetch refused by federation policy");
+            }
         }
         tx.send_replace(Some(fetched));
     }
@@ -283,7 +300,32 @@ impl Inner {
             Fetched::Refused(why) => {
                 fallback(&tables, source, key_id, now, || KeyError::Unresolvable(why))
             }
+            Fetched::Denied(who) => Err(KeyError::Denied(who)),
         }
+    }
+}
+
+/// The answer the federation policy forces for `source`, if any: `403`
+/// when it denies the provider, `503` while it is not loaded. Neither
+/// falls back to the cache.
+fn policy_refusal(decision: Decision, source: &Source) -> Option<KeyError> {
+    match decision {
+        Decision::Permitted => None,
+        Decision::Denied => Some(KeyError::Denied(source.host().to_string())),
+        Decision::Unknown => Some(KeyError::Unavailable {
+            reason: "the federation policy is not loaded yet".to_owned(),
+            retry_after: UNKNOWN_RETRY_SECS,
+        }),
+    }
+}
+
+/// [`policy_refusal`] for an outbound refusal made by the policy (it can
+/// change between our check and the client's).
+fn outbound_policy_refusal(e: &OutboundError, source: &Source) -> Option<KeyError> {
+    match e {
+        OutboundError::Denied(_) => policy_refusal(Decision::Denied, source),
+        OutboundError::PolicyUnknown => policy_refusal(Decision::Unknown, source),
+        _ => None,
     }
 }
 

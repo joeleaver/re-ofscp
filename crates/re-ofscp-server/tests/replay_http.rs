@@ -135,6 +135,7 @@ async fn replay_refused_through_the_last_acceptable_second() {
         replay,
         Arc::new(NoLedger),
         Arc::new(alice_keys()),
+        Arc::new(re_ofscp_server::federation::FederationPolicy::open()),
         clock.clone(),
     ));
     let app = Router::new()
@@ -184,6 +185,7 @@ fn verifier_at(clock: Arc<SettableClock>) -> (Verifier, Arc<ReplayStore>) {
         replay.clone(),
         Arc::new(NoLedger),
         Arc::new(alice_keys()),
+        Arc::new(re_ofscp_server::federation::FederationPolicy::open()),
         clock,
     );
     (v, replay)

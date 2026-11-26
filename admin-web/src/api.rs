@@ -19,6 +19,7 @@ async fn send(call: ApiCall, csrf: Option<&str>) -> Result<Body, ApiError> {
         Method::Get => Request::get(call.url),
         Method::Post => Request::post(call.url),
         Method::Patch => Request::patch(call.url),
+        Method::Put => Request::put(call.url),
         Method::Delete => Request::delete(call.url),
     }
     .credentials(Credentials::SameOrigin)

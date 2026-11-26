@@ -12,6 +12,12 @@
 //!   ([`inflight`]) so that a few stalling hosts cannot take every slot.
 //! * TLS through rustls with the bundled Mozilla roots.
 //!
+//! * Never to a provider the federation policy denies (§8 *Authorization*:
+//!   no request of any kind, signed or not, whatever stored state names
+//!   it), nor to any provider before the policy has loaded. Checked when
+//!   a target is checked or reserved and again just before sending, so a
+//!   denial made meanwhile still stops the request.
+//!
 //! Hosts in `OUTBOUND_ALLOW_HOSTS` skip only the address rule.
 
 pub mod addr;
@@ -29,6 +35,7 @@ use url::{Host, Url};
 
 use self::dns::{RefusedAddress, VettingResolver};
 use self::inflight::{PerTarget, TargetSlot};
+use crate::federation::{Decision, FederationPolicy};
 use crate::registrable::{host_of, registrable_group};
 
 /// Limits and trust settings for an [`OutboundClient`].
@@ -53,12 +60,15 @@ pub struct OutboundConfig {
     /// registrable domain (ports and subdomains share it). Past it a
     /// request fails at once with [`OutboundError::Busy`].
     pub max_in_flight_per_target: usize,
+    /// The federation policy in force.
+    pub policy: Arc<FederationPolicy>,
 }
 
 impl OutboundConfig {
     /// The defaults of docs/decisions/0006 (10 s, 5 s connect, 64 KiB, 64
-    /// in flight, 4 per target), allowing `allow_hosts` to be internal.
-    pub fn new(allow_hosts: Vec<Authority>) -> Self {
+    /// in flight, 4 per target), allowing `allow_hosts` to be internal and
+    /// obeying `policy`.
+    pub fn new(allow_hosts: Vec<Authority>, policy: Arc<FederationPolicy>) -> Self {
         Self {
             allow_hosts,
             extra_roots: Vec::new(),
@@ -67,6 +77,7 @@ impl OutboundConfig {
             max_body: 64 * 1024,
             max_in_flight: 64,
             max_in_flight_per_target: 4,
+            policy,
         }
     }
 }
@@ -74,6 +85,14 @@ impl OutboundConfig {
 /// Why an outbound request did not produce a response.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum OutboundError {
+    /// The federation policy denies this provider (§8 *Authorization*).
+    /// Deterministic until an admin changes the policy.
+    #[error("federation with {0} is denied by policy")]
+    Denied(String),
+    /// The federation policy has not loaded yet: nothing is sent until it
+    /// has. Temporary.
+    #[error("the federation policy is not loaded yet")]
+    PolicyUnknown,
     /// Our outbound rules forbid contacting this target (a non-public
     /// address, or a URL we will not build). Deterministic: retrying
     /// cannot help.
@@ -134,6 +153,7 @@ pub struct OutboundClient {
     allow_host_names: HashSet<String>,
     slots: Arc<Semaphore>,
     per_target: Arc<PerTarget>,
+    policy: Arc<FederationPolicy>,
     timeout: Duration,
     max_body: usize,
 }
@@ -174,15 +194,33 @@ impl OutboundClient {
                 .collect(),
             slots: Arc::new(Semaphore::new(config.max_in_flight.max(1))),
             per_target: Arc::new(PerTarget::new(config.max_in_flight_per_target)),
+            policy: config.policy.clone(),
             timeout: config.timeout,
             max_body: config.max_body,
         })
     }
 
-    /// Check a target without contacting it: the URL `https://{authority}{path}`
-    /// and, for an IP-literal host, the address rule. Names are checked when
-    /// they are resolved.
+    /// The federation policy this client obeys.
+    pub fn policy(&self) -> &Arc<FederationPolicy> {
+        &self.policy
+    }
+
+    /// Whether the federation policy lets us contact `authority`.
+    fn permitted(&self, authority: &Authority) -> Result<(), OutboundError> {
+        match self.policy.decide(authority) {
+            Decision::Permitted => Ok(()),
+            Decision::Denied => Err(OutboundError::Denied(authority.to_string())),
+            Decision::Unknown => Err(OutboundError::PolicyUnknown),
+        }
+    }
+
+    /// Check a target without contacting it: the federation policy, the URL
+    /// `https://{authority}{path}` and, for an IP-literal host, the address
+    /// rule. Names are checked when they are resolved.
     pub fn target(&self, authority: &Authority, path: &str) -> Result<Url, OutboundError> {
+        // Before anything else: an operator-allowed internal peer is still
+        // subject to the policy.
+        self.permitted(authority)?;
         if !path.starts_with('/') {
             return Err(OutboundError::Refused(format!(
                 "path {path:?} is not absolute"
@@ -259,6 +297,8 @@ impl OutboundClient {
             url,
             _slot,
         } = reservation;
+        // The policy may have changed since the reservation was made.
+        self.permitted(&authority)?;
         let client = if self.allow_hosts.contains(&authority) {
             &self.allowed
         } else {

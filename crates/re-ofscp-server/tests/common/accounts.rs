@@ -74,6 +74,7 @@ pub async fn env_with(opts: EnvOptions) -> Env {
     }
     let state = b.build().unwrap();
     state.restore_replay().await.unwrap();
+    state.load_federation().await.unwrap();
     clock.set(SIGNED_AT);
     let app = router(state.clone());
     Env {
@@ -82,6 +83,17 @@ pub async fn env_with(opts: EnvOptions) -> Env {
         app,
         clock,
     }
+}
+
+/// A second provider process over `env`'s database (as after a restart),
+/// with its federation policy loaded from it.
+pub async fn restarted(env: &Env) -> AppState {
+    let state = AppState::builder(config(&env._server, None, true))
+        .clock(env.clock.clone())
+        .build()
+        .unwrap();
+    state.load_federation().await.unwrap();
+    state
 }
 
 /// [`env_with`] the defaults.

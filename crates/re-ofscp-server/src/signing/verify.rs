@@ -2,7 +2,10 @@
 //!
 //! The seven checks run in the order §4.5 lists them, each failing with the
 //! status the spec names. The replay store is only read at step 4 and written
-//! after step 7 succeeds.
+//! after step 7 succeeds. Step 6 begins with the federation policy (§4.6 "No
+//! fetch is allowed", docs/decisions/0008): a remote signer whose provider
+//! is denied gets `403` before any key is resolved, cached or not, and its
+//! nonce is never recorded.
 
 use std::sync::Arc;
 
@@ -13,6 +16,7 @@ use time::format_description::well_known::Rfc3339;
 
 use super::canonical::{self, CanonicalRequest};
 use super::keys::{KeyError, KeyResolver, Requester};
+use crate::federation::{Decision, FederationPolicy, UNKNOWN_RETRY_SECS};
 use crate::problem::Problem;
 use crate::replay::{
     LedgerError, NonceLedger, NonceUse, ReplayError, ReplayStore, SignerKind, StoredNonce, Surface,
@@ -139,6 +143,14 @@ pub enum VerifyError {
     /// Step 5: body digest mismatch.
     #[error("X-OFSCP-Content-Digest does not match the body")]
     Digest,
+    /// Step 6: the federation policy denies the signer's provider (§4.6,
+    /// §8 *Authorization*): `403` `forbidden`.
+    #[error("federation with the signer's provider is not permitted")]
+    Forbidden,
+    /// Step 6: the federation policy has not loaded yet, so no remote
+    /// signer can be judged: `503`.
+    #[error("federation policy is loading; retry shortly")]
+    PolicyUnknown,
     /// Step 6: no active key with that id, or no key for this signer can
     /// ever be checked (its provider is refused by our outbound rules).
     #[error("unknown or revoked key")]
@@ -168,6 +180,8 @@ impl From<VerifyError> for Problem {
             }
             VerifyError::LedgerUnavailable => Problem::service_unavailable(LEDGER_RETRY_SECS),
             VerifyError::RateLimited { retry_after } => Problem::too_many_requests(retry_after),
+            VerifyError::Forbidden => Problem::forbidden(),
+            VerifyError::PolicyUnknown => Problem::service_unavailable(UNKNOWN_RETRY_SECS),
             _ => Problem::unauthorized(),
         };
         p.with_detail(e.to_string())
@@ -185,6 +199,7 @@ pub struct Verifier {
     replay: Arc<ReplayStore>,
     ledger: Arc<dyn NonceLedger>,
     keys: Arc<dyn KeyResolver>,
+    policy: Arc<FederationPolicy>,
     clock: Arc<dyn Clock>,
 }
 
@@ -234,13 +249,14 @@ impl Precheck {
 impl Verifier {
     /// Create a verifier for `authority` (this provider's canonical host).
     /// Every recorded nonce is also written to `ledger` before a request is
-    /// accepted.
+    /// accepted. Remote signers are judged by `policy` first.
     pub fn new(
         authority: Authority,
         skew_secs: i64,
         replay: Arc<ReplayStore>,
         ledger: Arc<dyn NonceLedger>,
         keys: Arc<dyn KeyResolver>,
+        policy: Arc<FederationPolicy>,
         clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
@@ -249,8 +265,19 @@ impl Verifier {
             replay,
             ledger,
             keys,
+            policy,
             clock,
         }
+    }
+
+    /// The signer's provider, if it is not this one: the authority the
+    /// federation policy judges.
+    fn remote_provider<'a>(&self, signer: &'a Signer) -> Option<&'a Authority> {
+        let provider = match signer {
+            Signer::Actor(a) => a.domain(),
+            Signer::Provider(p) => p,
+        };
+        (*provider != self.authority).then_some(provider)
     }
 
     /// The shared replay store (the WebSocket handshake records into it too).
@@ -344,6 +371,18 @@ impl Verifier {
             return Err(VerifyError::Digest);
         }
 
+        // Step 6 begins with the federation policy, decided from the claimed
+        // provider before any key is resolved (§4.5 step 6, §4.6 "No fetch
+        // is allowed", §7.3 `forbidden`): a cached key that would verify
+        // must not rescue a denied signer.
+        if let Some(provider) = self.remote_provider(&pre.signer) {
+            match self.policy.decide(provider) {
+                Decision::Permitted => {}
+                Decision::Denied => return Err(VerifyError::Forbidden),
+                Decision::Unknown => return Err(VerifyError::PolicyUnknown),
+            }
+        }
+
         // Steps 6 and 7: resolve the key and verify. If a *cached* answer
         // has no such key or its key does not verify, ask again with
         // `fresh` so a newly registered or rotated key is honoured (§4.6,
@@ -418,6 +457,8 @@ impl Verifier {
             .await
         {
             Ok(resolved) => resolved,
+            // The policy changed while the key was being resolved.
+            Err(KeyError::Denied(_)) => return Err(KeyFailure::terminal(VerifyError::Forbidden)),
             Err(KeyError::Unresolvable(e)) => {
                 tracing::info!(error = %e, key_id = pre.key_id, "signer's keys are unresolvable");
                 return Err(KeyFailure::terminal(VerifyError::UnknownKey));

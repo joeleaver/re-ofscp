@@ -1,12 +1,13 @@
 //! The console's logic that isn't UI: building API requests, reading
 //! problem responses, role gating, form validation, the restricted-session
-//! flow, what an answer does to the session, time windows and the
-//! enrollment QR code.
+//! flow, what an answer does to the session, time windows, the
+//! federation policy form and the enrollment QR code.
 //!
 //! Nothing here touches the DOM, the network or a rinch signal, so it
 //! compiles and is unit-tested natively (`cargo test` in `admin-web`),
 //! while the same code runs in the wasm build.
 
+pub mod federation;
 pub mod flow;
 pub mod forms;
 pub mod problem;
