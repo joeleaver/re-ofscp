@@ -49,6 +49,7 @@ pub fn fast_config() -> WsConfig {
             per_actor: 16,
             per_remote_group: 100,
             max_subscriptions: 10,
+            max_channels_per_command: 10,
             outbound_queue: 64,
             held_max: 64,
         },

@@ -7,10 +7,10 @@
 //! land, and nothing else in the server builds frames by hand. The rest of
 //! the server reaches it through [`super::protocol`].
 //!
-//! Where the spec leaves a choice this follows what the OFSCP oracle
-//! confirmed (docs/decisions/0010-websocket.md): `ts` is optional on client
-//! commands, and the close codes other than 4001/4003 are the RFC 6455
-//! ones.
+//! This follows §7.1 as lost-conn/ofscp#27 settled it
+//! (docs/decisions/0010-websocket.md): `ts` is optional on client commands
+//! and ignored, `data` is an object on every standard command, and the
+//! close codes other than 4001/4003 are the RFC 6455 ones.
 
 use std::collections::BTreeMap;
 
@@ -83,6 +83,22 @@ pub struct Command {
     pub data: Value,
 }
 
+impl Command {
+    /// Whether `type` is one of the [`STANDARD_COMMANDS`].
+    pub fn is_standard(&self) -> bool {
+        STANDARD_COMMANDS.contains(&self.kind.as_str())
+    }
+
+    /// Whether this is a standard command whose `data` is missing or not an
+    /// object. §7.1 requires an object for every standard command, and a
+    /// provider answers one without it with `bad_request` (an `authenticate`
+    /// with `unauthorized`). Checked before `data` is deserialized, since
+    /// serde would read a struct from an array field by field.
+    pub fn lacks_object_data(&self) -> bool {
+        self.is_standard() && !self.data.is_object()
+    }
+}
+
 /// Why a frame is not a command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Malformed {
@@ -93,8 +109,11 @@ pub struct Malformed {
 }
 
 /// Parse a text frame as a command envelope. `id` (non-empty, at most
-/// [`MAX_ID_LEN`] bytes) and `type` are required; `ts` is not required on
-/// commands (the spec's own examples omit it) and is ignored.
+/// [`MAX_ID_LEN`] bytes) and `type` are required. `ts` is optional on
+/// commands and its value, whatever it is, is ignored (§7.1, as
+/// lost-conn/ofscp#27 settled): it is never read. Whether `data` is an
+/// object is checked per command ([`Command::lacks_object_data`]), since
+/// unknown types may carry anything.
 pub fn parse_command(text: &str) -> Result<Command, Malformed> {
     let malformed = |id: Option<String>, why| Malformed { id, why };
     let Ok(Value::Object(mut obj)) = serde_json::from_str::<Value>(text) else {
@@ -419,6 +438,19 @@ mod tests {
         let c = parse_command(r#"{"id":"cli_1","type":"ping","extra":1}"#).unwrap();
         assert_eq!(c.kind, "ping");
         assert_eq!(c.data, Value::Null);
+        assert!(c.lacks_object_data(), "a standard command needs data");
+        // Any ts, or none, is ignored.
+        for ts in [r#""not a timestamp""#, "5", "null"] {
+            let text = format!(r#"{{"id":"cli_1","type":"ping","ts":{ts},"data":{{}}}}"#);
+            let c = parse_command(&text).unwrap();
+            assert!(!c.lacks_object_data(), "{ts}");
+        }
+        for data in ["[]", r#"[["chn_1"]]"#, "7"] {
+            let text = format!(r#"{{"id":"cli_1","type":"subscribe","data":{data}}}"#);
+            assert!(parse_command(&text).unwrap().lacks_object_data(), "{data}");
+        }
+        let other = parse_command(r#"{"id":"cli_1","type":"x.y","data":[]}"#).unwrap();
+        assert!(!other.lacks_object_data(), "unknown types are not checked");
         assert_eq!(
             parse_command(r#"{"type":"ping"}"#).unwrap_err().why,
             "frame has no usable id"

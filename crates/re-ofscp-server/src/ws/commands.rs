@@ -10,8 +10,10 @@
 //! be replayed), the replayed events, and then the live events kept
 //! meanwhile. Topics that are not readable, or do not exist, are refused
 //! together in one `not_found` error naming them, so a subscribe cannot
-//! tell a private channel from a missing one
-//! (docs/decisions/0010-websocket.md).
+//! tell a private channel from a missing one. The subscription cap counts
+//! only the readable channels, all or none: past it, nothing is subscribed
+//! and the one answer is `subscription_limit` (§7.1 *Subscriptions*,
+//! docs/decisions/0010-websocket.md).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -50,14 +52,16 @@ pub async fn run(session: Session, mut commands: mpsc::Receiver<Command>) {
 }
 
 /// The topics of a command, deduplicated in order, or why they are not
-/// acceptable.
-fn topics(channels: Vec<String>, cap: usize) -> Result<Vec<String>, WsError> {
+/// acceptable. `max` bounds how many one command may list; it is not the
+/// subscription cap, which counts only readable channels (applied by
+/// [`super::registry::Registry::grant`]).
+fn topics(channels: Vec<String>, max: usize) -> Result<Vec<String>, WsError> {
     if channels.is_empty() {
         return Err(WsError::bad_request("channels must not be empty"));
     }
-    if channels.len() > cap {
-        return Err(WsError::subscription_limit(format!(
-            "at most {cap} channels per connection"
+    if channels.len() > max {
+        return Err(WsError::bad_request(format!(
+            "at most {max} channels per command"
         )));
     }
     let mut seen = HashSet::new();
@@ -104,7 +108,7 @@ impl Session {
                 )
             })
             .and_then(|d| {
-                let t = topics(d.channels, hub.registry.limits().max_subscriptions)?;
+                let t = topics(d.channels, hub.registry.limits().max_channels_per_command)?;
                 Ok((t, d.include, d.since.unwrap_or_default()))
             });
         let (topics, include, since) = match parsed {
@@ -112,10 +116,9 @@ impl Session {
             Err(e) => return self.error(&cmd.id, &e),
         };
         let include = include.map(|kinds| Arc::new(kinds.into_iter().collect::<HashSet<_>>()));
-        let Some(holds) = hub.registry.hold_new(self.id, &topics, include) else {
-            let cap = hub.registry.limits().max_subscriptions;
-            let e = WsError::subscription_limit(format!("at most {cap} channels per connection"));
-            return self.error(&cmd.id, &e);
+        // The connection is gone.
+        let Some(holds) = hub.registry.hold_new(self.id, &topics, include.clone()) else {
+            return;
         };
         let mut granted = Vec::new();
         let mut truncated = HashSet::new();
@@ -157,7 +160,7 @@ impl Session {
             }
         }
         let now = hub.now();
-        let acked = hub.registry.grant(self.id, &granted, |live| {
+        let granted_now = hub.registry.grant(self.id, &granted, include, |live| {
             let ack = Subscribed {
                 channels: live.to_vec(),
                 truncated: live
@@ -173,6 +176,20 @@ impl Session {
             }
             texts
         });
+        if !revoked.is_empty() {
+            let data = Unsubscribed {
+                channels: revoked,
+                reason: Some(ACCESS_REVOKED.to_owned()),
+            };
+            self.send(protocol::event("unsubscribed", None, data.to_value(), now));
+        }
+        // Past the cap: nothing subscribed, and the one answer is the limit
+        // (no `not_found` for the refused channels, §7.1).
+        let Ok(acked) = granted_now else {
+            let cap = hub.registry.limits().max_subscriptions;
+            let e = WsError::subscription_limit(format!("at most {cap} channels per connection"));
+            return self.error(&cmd.id, &e);
+        };
         // Granted, but ended by a re-check before it could be
         // acknowledged: refused like any other unreadable channel, so the
         // command still gets its answer (an existing one was also told
@@ -183,13 +200,6 @@ impl Session {
                 .map(|(t, _)| t)
                 .filter(|t| !acked.contains(t)),
         );
-        if !revoked.is_empty() {
-            let data = Unsubscribed {
-                channels: revoked,
-                reason: Some(ACCESS_REVOKED.to_owned()),
-            };
-            self.send(protocol::event("unsubscribed", None, data.to_value(), now));
-        }
         if !refused.is_empty() {
             let e = WsError::not_found("no such channel, or it cannot be read")
                 .with_detail("channels", json!(refused));
@@ -244,7 +254,7 @@ impl Session {
             .map_err(|_| {
                 WsError::bad_request("unsubscribe needs channels, an array of channel ids")
             })
-            .and_then(|d| topics(d.channels, hub.registry.limits().max_subscriptions));
+            .and_then(|d| topics(d.channels, hub.registry.limits().max_channels_per_command));
         let topics = match parsed {
             Ok(t) => t,
             Err(e) => return self.error(&cmd.id, &e),
@@ -276,7 +286,7 @@ mod tests {
         assert_eq!(topics(vec![], 5).unwrap_err().code, "bad_request");
         assert_eq!(
             topics(vec!["a".into(); 6], 5).unwrap_err().code,
-            "subscription_limit"
+            "bad_request"
         );
         assert_eq!(
             topics(vec![String::new()], 5).unwrap_err().code,

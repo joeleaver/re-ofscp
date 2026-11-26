@@ -112,8 +112,14 @@ pub struct Limits {
     /// Authenticated connections of remote actors whose providers share a
     /// registrable domain (ICANN section, as the replay quotas group).
     pub per_remote_group: usize,
-    /// Subscriptions on one connection.
+    /// Subscriptions on one connection. Only channels the actor can read
+    /// count towards it (§7.1 *Subscriptions*), so [`Registry::grant`]
+    /// applies it, after the access checks.
     pub max_subscriptions: usize,
+    /// Channels one `subscribe` or `unsubscribe` may list, readable or not:
+    /// a bound on the work one command causes (an access check each), not
+    /// the subscription cap. Over it is `bad_request`.
+    pub max_channels_per_command: usize,
     /// Events queued for one connection.
     pub outbound_queue: usize,
     /// Events kept for one held subscription.
@@ -167,6 +173,11 @@ pub struct Hold {
     /// Its generation.
     pub generation: u64,
 }
+
+/// A `subscribe` would take its connection past
+/// [`Limits::max_subscriptions`]: [`Registry::grant`] granted none of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OverCap;
 
 /// What [`Registry::end`] found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -349,10 +360,13 @@ impl Registry {
     }
 
     /// Hold subscriptions of connection `id` to `topics` (adding the new
-    /// ones, with `include`), pending their access checks. All or none:
-    /// if the new ones would take the connection past its cap, nothing
-    /// changes and `None` is returned. Otherwise, per topic, its hold.
-    /// Finish with [`Registry::grant`] and [`Registry::end`].
+    /// ones, with `include`; an existing one keeps its filter until
+    /// [`Registry::grant`] replaces it), pending their access checks: per
+    /// topic, its hold, or `None` when the connection is gone. The subscription cap
+    /// is not applied here, since only readable channels count towards it
+    /// (§7.1): [`Registry::grant`] applies it. Until then the connection
+    /// may hold up to [`Limits::max_channels_per_command`] more. Finish
+    /// with [`Registry::grant`] and [`Registry::end`].
     pub fn hold_new(
         &self,
         id: ConnId,
@@ -362,19 +376,11 @@ impl Registry {
         let mut s = self.lock();
         let s = &mut *s;
         let conn = s.conns.get_mut(&id)?;
-        let new = topics
-            .iter()
-            .filter(|t| !conn.subs.contains_key(*t))
-            .count();
-        if conn.subs.len() + new > self.limits.max_subscriptions {
-            return None;
-        }
         let mut fresh = Vec::with_capacity(topics.len());
         for topic in topics {
             match conn.subs.get_mut(topic) {
                 Some(sub) => {
                     sub.holds += 1;
-                    sub.include.clone_from(&include);
                     fresh.push(Hold {
                         fresh: sub.pending,
                         generation: sub.generation,
@@ -484,23 +490,50 @@ impl Registry {
     /// it was checked is never acknowledged, and nothing published on a
     /// granted one reaches the client before its ack. Returns the topics
     /// acknowledged.
+    ///
+    /// All or none against the subscription cap (§7.1 *Subscriptions*):
+    /// if the connection's acknowledged subscriptions plus the new ones
+    /// among `topics` would pass it, the new ones are ended, the holds on
+    /// the others released, nothing is announced, and [`OverCap`] is
+    /// returned. `topics` are the readable ones, so only they count.
+    ///
+    /// Granted, each subscription takes `include` as its filter from the
+    /// ack on (what it kept while held passed its old one). Refused, an
+    /// existing one keeps its old filter: the `subscribe` changed nothing.
     pub fn grant(
         &self,
         id: ConnId,
         topics: &[(String, u64)],
+        include: Option<Arc<HashSet<String>>>,
         announce: impl FnOnce(&[String]) -> Vec<Arc<str>>,
-    ) -> Vec<String> {
+    ) -> Result<Vec<String>, OverCap> {
         let mut s = self.lock();
+        let s = &mut *s;
         let Some(conn) = s.conns.get_mut(&id) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let live: Vec<String> = topics
             .iter()
             .filter(|(t, g)| conn.subs.get(t).is_some_and(|sub| sub.generation == *g))
             .map(|(t, _)| t.clone())
             .collect();
+        let pending =
+            |subs: &HashMap<String, Sub>, t: &String| subs.get(t).is_some_and(|s| s.pending);
+        let new = live.iter().filter(|t| pending(&conn.subs, t)).count();
+        let acked = conn.subs.values().filter(|sub| !sub.pending).count();
+        if acked + new > self.limits.max_subscriptions {
+            for topic in &live {
+                if pending(&conn.subs, topic) {
+                    conn.subs.remove(topic);
+                    unindex(&mut s.by_topic, topic, id);
+                } else if let Some(sub) = conn.subs.get_mut(topic) {
+                    Self::release_sub(&conn.shared, sub);
+                }
+            }
+            return Err(OverCap);
+        }
         if live.is_empty() {
-            return live;
+            return Ok(live);
         }
         for text in announce(&live) {
             conn.shared.deliver(text);
@@ -508,10 +541,11 @@ impl Registry {
         for topic in &live {
             if let Some(sub) = conn.subs.get_mut(topic) {
                 sub.pending = false;
+                sub.include.clone_from(&include);
                 Self::release_sub(&conn.shared, sub);
             }
         }
-        live
+        Ok(live)
     }
 
     /// End the subscription of connection `id` to `topic`, if it is still

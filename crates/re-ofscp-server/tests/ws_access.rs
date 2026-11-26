@@ -321,6 +321,68 @@ async fn the_subscription_cap_applies() {
     );
 }
 
+/// Only readable channels count towards the cap (10 here), and a
+/// `subscribe` past it subscribes none of them, answered by the one
+/// `subscription_limit` error: no `subscribed`, no `not_found` (§7.1
+/// *Subscriptions*).
+#[tokio::test]
+async fn only_readable_channels_count_towards_the_cap() {
+    let (p, topics) = setup().await;
+    let readable: Vec<String> = (0..12).map(|i| format!("chn_{i}")).collect();
+    for c in &readable {
+        topics.set(c, Answer::Readable);
+    }
+    let mut c = p.alice("10.0.0.1").await;
+    c.command("subscribe", json!({"channels": readable[..9]}))
+        .await;
+    assert_eq!(c.event().await["type"], "subscribed");
+    // One readable and two unreadable: the one fits.
+    let id = c
+        .command(
+            "subscribe",
+            json!({"channels": [readable[9], "chn_x", "chn_y"]}),
+        )
+        .await;
+    let ack = c.event().await;
+    assert_eq!(
+        (&ack["type"], &ack["data"]["channels"]),
+        (&json!("subscribed"), &json!([readable[9]]))
+    );
+    let e = c.event().await;
+    assert_eq!(e["correlationId"], id);
+    assert_eq!(e["data"]["details"]["channels"], json!(["chn_x", "chn_y"]));
+    // At the cap, a channel already subscribed may be listed again.
+    c.command("subscribe", json!({"channels": [readable[0]]}))
+        .await;
+    assert_eq!(c.event().await["data"]["channels"], json!([readable[0]]));
+    // Past it, all or none: neither the readable one, nor a not_found.
+    c.command("unsubscribe", json!({"channels": [readable[0]]}))
+        .await;
+    assert_eq!(c.event().await["type"], "unsubscribed");
+    let id = c
+        .command(
+            "subscribe",
+            json!({"channels": [readable[10], readable[11], "chn_x"]}),
+        )
+        .await;
+    let e = c.event().await;
+    assert_valid("error.json", &e);
+    assert_eq!(
+        (&e["correlationId"], &e["data"]["code"]),
+        (&json!(id), &json!("subscription_limit"))
+    );
+    let ping = c.command("ping", json!({})).await;
+    assert_eq!(
+        c.event().await["correlationId"],
+        ping,
+        "nothing else was sent"
+    );
+    // Nothing of it was kept: one of them alone still fits.
+    c.command("subscribe", json!({"channels": [readable[10]]}))
+        .await;
+    assert_eq!(c.event().await["data"]["channels"], json!([readable[10]]));
+}
+
 #[tokio::test]
 async fn the_periodic_recheck_catches_unreported_changes() {
     let mut config = fast_config();

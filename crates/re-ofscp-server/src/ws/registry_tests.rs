@@ -7,6 +7,7 @@ fn limits() -> Limits {
         per_actor: 2,
         per_remote_group: 2,
         max_subscriptions: 2,
+        max_channels_per_command: 3,
         outbound_queue: 4,
         held_max: 2,
     }
@@ -27,8 +28,28 @@ fn text(s: &str) -> Arc<str> {
 /// Subscribe connection `id` to `topic` and grant it: its generation.
 fn subscribe(r: &Registry, id: ConnId, topic: &str) -> u64 {
     let g = r.hold_new(id, &[topic.to_owned()], None).unwrap()[0].generation;
-    r.grant(id, &[(topic.to_owned(), g)], |_| Vec::new());
+    r.grant(id, &[(topic.to_owned(), g)], None, |_| Vec::new())
+        .unwrap();
     g
+}
+
+/// Hold `topics` on connection `id` and grant them all, keeping only the
+/// events of `only` if given: what was acked.
+fn grant_all(
+    r: &Registry,
+    id: ConnId,
+    topics: &[&str],
+    only: Option<&str>,
+) -> Result<Vec<String>, OverCap> {
+    let include = only.map(|k| Arc::new(HashSet::from([k.to_owned()])));
+    let topics: Vec<String> = topics.iter().map(|&t| t.to_owned()).collect();
+    let holds = r.hold_new(id, &topics, include.clone()).unwrap();
+    let granted: Vec<(String, u64)> = topics
+        .into_iter()
+        .zip(holds)
+        .map(|(t, h)| (t, h.generation))
+        .collect();
+    r.grant(id, &granted, include, |_| Vec::new())
 }
 
 fn fresh(holds: Option<Vec<Hold>>) -> Option<Vec<bool>> {
@@ -86,15 +107,18 @@ fn fan_out_respects_include_and_holds() {
     } = r.admit("c").unwrap();
     r.authenticate(id, &actor("alice@a.example"), "k").unwrap();
     let include = Some(Arc::new(HashSet::from(["message.created".to_owned()])));
-    let holds = r.hold_new(id, &["ch".to_owned()], include).unwrap();
+    let holds = r.hold_new(id, &["ch".to_owned()], include.clone()).unwrap();
     assert!(holds[0].fresh);
     r.publish("ch", "message.created", &text("held"));
     r.publish("ch", "reaction.added", &text("filtered"));
     assert!(drain(&mut rx).is_empty(), "held while access is checked");
-    let acked = r.grant(id, &[("ch".to_owned(), holds[0].generation)], |live| {
-        vec![text(&format!("ack {}", live.join(",")))]
-    });
-    assert_eq!(acked, ["ch"]);
+    let acked = r.grant(
+        id,
+        &[("ch".to_owned(), holds[0].generation)],
+        include,
+        |live| vec![text(&format!("ack {}", live.join(",")))],
+    );
+    assert_eq!(acked.unwrap(), ["ch"]);
     assert_eq!(drain(&mut rx), ["ack ch", "held"], "the ack comes first");
     r.publish("ch", "message.created", &text("live"));
     assert_eq!(drain(&mut rx), ["live"]);
@@ -152,20 +176,64 @@ fn hold_matching_selects_by_topic_actor_or_all() {
     assert_eq!(r.hold_matching(&AccessChange::All).len(), 3);
 }
 
+/// The cap (2 here) is applied when granting, to the granted topics only,
+/// all or none; an existing subscription listed again does not count.
 #[test]
 fn the_subscription_cap_is_all_or_none() {
     let r = Registry::new(limits(), local());
-    let Admitted { id, .. } = r.admit("c").unwrap();
+    let Admitted {
+        id,
+        shared: _shared,
+        events: mut rx,
+    } = r.admit("c").unwrap();
     r.authenticate(id, &actor("alice@a.example"), "k").unwrap();
-    subscribe(&r, id, "a");
-    assert_eq!(
-        r.hold_new(id, &["b".to_owned(), "c".to_owned()], None),
-        None
-    );
+    let a = subscribe(&r, id, "a");
+    assert_eq!(grant_all(&r, id, &["b", "c"], None), Err(OverCap));
+    // Neither was kept: "b" alone still fits, beside "a" listed again.
     assert_eq!(
         fresh(r.hold_new(id, &["a".to_owned(), "b".to_owned()], None)),
         Some(vec![false, true])
     );
+    r.unsubscribe(id, "b");
+    r.release(id, "a", a);
+    assert_eq!(
+        grant_all(&r, id, &["a", "b"], None),
+        Ok(vec!["a".into(), "b".into()])
+    );
+    // At the cap, an over-cap subscribe releases what it held on "a", and
+    // leaves its filter as it was.
+    assert_eq!(
+        grant_all(&r, id, &["a", "c"], Some("reaction.added")),
+        Err(OverCap)
+    );
+    r.publish("a", "message.created", &text("live"));
+    assert_eq!(drain(&mut rx), ["live"]);
+    // A granted one takes its new filter.
+    assert_eq!(
+        grant_all(&r, id, &["a"], Some("reaction.added")),
+        Ok(vec!["a".into()])
+    );
+    r.publish("a", "message.created", &text("filtered"));
+    assert!(drain(&mut rx).is_empty());
+}
+
+/// Holding is not capped: a `subscribe` may list more channels than fit,
+/// as long as the readable ones (the ones granted) do.
+#[test]
+fn unreadable_topics_do_not_count_towards_the_cap() {
+    let r = Registry::new(limits(), local());
+    let Admitted { id, .. } = r.admit("c").unwrap();
+    r.authenticate(id, &actor("alice@a.example"), "k").unwrap();
+    subscribe(&r, id, "a");
+    let topics = ["b".to_owned(), "x".to_owned(), "y".to_owned()];
+    let holds = r.hold_new(id, &topics, None).unwrap();
+    for (t, h) in topics.iter().zip(&holds).skip(1) {
+        assert_eq!(r.end(id, t, h.generation), Ended::Pending);
+    }
+    let acked = r.grant(id, &[("b".to_owned(), holds[0].generation)], None, |_| {
+        Vec::new()
+    });
+    assert_eq!(acked, Ok(vec!["b".to_owned()]));
 }
 
 /// A re-check that outlives its subscription (the client unsubscribed and
@@ -192,7 +260,10 @@ fn a_stale_recheck_cannot_touch_a_new_subscription() {
     assert!(drain(&mut rx).is_empty(), "a stale release flushes nothing");
     assert_eq!(r.end(id, "ch", stale.generation), Ended::Missing);
 
-    r.grant(id, &[("ch".to_owned(), new.generation)], |_| Vec::new());
+    r.grant(id, &[("ch".to_owned(), new.generation)], None, |_| {
+        Vec::new()
+    })
+    .unwrap();
     assert_eq!(drain(&mut rx), ["held for the new check"]);
 }
 
@@ -212,8 +283,8 @@ fn a_subscription_ended_while_pending_is_not_acknowledged() {
     let g = r.hold_new(id, &["ch".to_owned()], None).unwrap()[0].generation;
     let check = r.hold_matching(&AccessChange::Actor(alice)).remove(0);
     assert_eq!(r.end(id, "ch", check.generation), Ended::Pending);
-    let acked = r.grant(id, &[("ch".to_owned(), g)], |_| vec![text("ack")]);
-    assert!(acked.is_empty());
+    let acked = r.grant(id, &[("ch".to_owned(), g)], None, |_| vec![text("ack")]);
+    assert_eq!(acked, Ok(Vec::new()));
     assert!(drain(&mut rx).is_empty());
 }
 
