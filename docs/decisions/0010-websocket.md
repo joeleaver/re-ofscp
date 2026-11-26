@@ -65,11 +65,15 @@ being ported from Postrinch's client (decision 0011) once they land.
 ### Envelope and dispatch
 
 - Client frames must have an `id` and a `type`; `data` must be an object
-  for the commands we implement. `ts` is accepted but not required on
-  commands. The oracle confirmed this: `ws/envelope.json` is wrong to
-  require it there, and is being split so `ts` is required only on events.
-  A command without an `id` gets `error bad_request` (no correlationId),
-  or `4001` before authentication.
+  for every standard §7.1 command, `ping` and `pong` included (anything
+  else gets `error bad_request` with `correlationId`, checked before the
+  data is deserialized). `ts` is optional on commands and never read, so
+  any value is accepted. This is spec text since lost-conn/ofscp#27
+  (`ws/command-envelope.json`; `ts` is required only on events,
+  `ws/event-envelope.json`). A command without an `id` gets
+  `error bad_request` (no correlationId), or `4001` before authentication.
+- A malformed `authenticate` (its `data` not an object, or short of a
+  field) is a failed sign-in: `error unauthorized`, then `4001`.
 - **Unknown types are ignored** (§2.3). **Standard §7.1 commands we do not
   implement yet** get `error bad_request` ("unsupported command") with
   `correlationId`, so a client never waits on a reply that will not come.
@@ -119,7 +123,22 @@ reasons, RFC 6455 codes otherwise. It is going into the spec as a SHOULD.
     when full or shutting down);
   - 16 per actor;
   - 1 000 per remote ICANN registrable group (the decision 0006 grouping);
-  - 500 subscriptions per connection (`409 subscription_limit`).
+  - 500 subscriptions per connection (`409 subscription_limit`). Only
+    readable channels count (§7.1 *Subscriptions*, lost-conn/ofscp#27):
+    the cap is applied after the access checks, when the readable ones are
+    granted, all or none. Past it nothing is subscribed, and the only
+    answer is the `subscription_limit` error (no `subscribed`, no
+    `not_found`). A channel already subscribed and listed again does not
+    count.
+  - No limit on how many channels one `subscribe` or `unsubscribe` lists
+    (the spec names none); the 64 KiB frame cap bounds a command. Channels
+    are deduplicated first. A `subscribe` naming more distinct channels
+    than the whole cap could not fit even if all were readable, so it is
+    answered `subscription_limit` at once, without checking any access:
+    the MAY clause of lost-conn/ofscp#29 (in review). A list within the
+    cap is always checked, even if longer than the room left, and the
+    readable-only count above decides. A long, well-formed list is never
+    `bad_request`.
 - Each connection has a bounded outbound queue (256). A client that does
   not read is closed `1013`, without the backlog.
 

@@ -62,10 +62,46 @@ fn every_sent_frame_has_the_fields_spec_main_requires() {
 }
 
 #[test]
-fn ping_may_leave_out_its_data() {
-    let frame = Envelope::<Command>::decode(r#"{"id":"c1","type":"ping"}"#).unwrap();
+fn a_command_without_ts_is_read() {
+    let frame = Envelope::<Command>::decode(r#"{"id":"c1","type":"ping","data":{}}"#).unwrap();
     assert_eq!(frame.body, Command::Ping(Empty {}));
     assert_eq!(frame.ts, None);
+}
+
+/// Providers must ignore a command's `ts` (§7.1): one that is not a time
+/// reads as `None` rather than failing the frame.
+#[test]
+fn a_ts_that_is_not_a_time_is_ignored() {
+    for ts in [r#""not a timestamp""#, "5", "null", "{}"] {
+        let text = format!(r#"{{"id":"c1","type":"ping","ts":{ts},"data":{{}}}}"#);
+        let frame = Envelope::<Command>::decode(&text).unwrap();
+        assert_eq!(
+            (frame.ts, frame.body),
+            (None, Command::Ping(Empty {})),
+            "{ts}"
+        );
+    }
+}
+
+/// `data` must be an object for every standard type (§7.1): missing,
+/// `null`, an array (which serde would read field by field) or a scalar is
+/// bad data, kept with the frame's id so a provider can answer it.
+#[test]
+fn a_standard_type_needs_object_data() {
+    for data in ["", r#","data":null"#, r#","data":[]"#, r#","data":7"#] {
+        let text = format!(r#"{{"id":"c1","type":"ping"{data}}}"#);
+        let err = Envelope::<Command>::decode(&text).unwrap_err();
+        assert!(
+            matches!(err, DecodeError::Data { ref id, ref kind, .. } if id == "c1" && kind == "ping"),
+            "{text}: {err:?}"
+        );
+    }
+    let err = Envelope::<Command>::decode(r#"{"id":"c2","type":"subscribe","data":[["chn_1"]]}"#)
+        .unwrap_err();
+    assert!(matches!(err, DecodeError::Data { .. }), "{err:?}");
+    let err = Envelope::<Event>::decode(r#"{"id":"e1","type":"pong","ts":"2026-01-01T12:00:00Z"}"#)
+        .unwrap_err();
+    assert!(matches!(err, DecodeError::Data { .. }), "{err:?}");
 }
 
 #[test]
