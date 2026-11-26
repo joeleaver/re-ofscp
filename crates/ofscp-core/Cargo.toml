@@ -1,6 +1,6 @@
 [package]
 name = "ofscp-core"
-description = "The OFSCP protocol core: identifiers, wire types, dmId and request signing (no I/O, wasm-safe)."
+description = "The OFSCP protocol core: identifiers, wire types, WebSocket frames, dmId and request signing (no I/O, wasm-safe)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -29,3 +29,6 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 rand_core = { workspace = true, features = ["getrandom"] }
+# Checks encoded WebSocket frames against the spec's schemas (the server's
+# tests use the same version).
+jsonschema = { version = "0.60", default-features = false }

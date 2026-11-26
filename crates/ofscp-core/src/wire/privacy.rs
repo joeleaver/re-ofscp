@@ -98,9 +98,24 @@ pub struct PresenceUpdate {
         skip_serializing_if = "Option::is_none"
     )]
     pub status: Option<String>,
-    /// Extension data; absent clears it.
-    #[serde(default)]
-    pub metadata: Vec<MetadataObject>,
+    /// Extension data. The update replaces the stored list, so absent and
+    /// `[]` both clear it; they are kept apart only so that each re-encodes
+    /// as it came (the spec's samples use both). `null` is refused. Read it
+    /// through [`PresenceUpdate::new_metadata`].
+    #[serde(
+        default,
+        deserialize_with = "some",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub metadata: Option<Vec<MetadataObject>>,
+}
+
+impl PresenceUpdate {
+    /// The metadata list to store: empty when `metadata` is absent, since
+    /// absent clears it.
+    pub fn new_metadata(&self) -> &[MetadataObject] {
+        self.metadata.as_deref().unwrap_or_default()
+    }
 }
 
 open_enum! {
@@ -260,6 +275,20 @@ mod tests {
         assert!(serde_json::from_value::<PrivacyUpdate>(json!({"allowList": null})).is_err());
         let away_null = json!({"availability": "away", "status": null});
         assert!(serde_json::from_value::<PresenceUpdate>(away_null).is_err());
+    }
+
+    #[test]
+    fn presence_metadata_absent_and_empty_both_clear_and_keep_their_form() {
+        for body in [
+            json!({"availability": "away"}),
+            json!({"availability": "away", "metadata": []}),
+        ] {
+            let u: PresenceUpdate = serde_json::from_value(body.clone()).unwrap();
+            assert!(u.new_metadata().is_empty());
+            assert_eq!(serde_json::to_value(&u).unwrap(), body);
+        }
+        let null = json!({"availability": "away", "metadata": null});
+        assert!(serde_json::from_value::<PresenceUpdate>(null).is_err());
     }
 
     #[test]
