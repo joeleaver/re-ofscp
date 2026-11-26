@@ -106,15 +106,21 @@ impl Verifier {
                 "authenticate timestamp is outside the allowed clock skew",
             ));
         }
+        // The authority and challenge are ours and the timestamp parsed as
+        // RFC 3339, so no component can hold a line break; refusing one
+        // anyway keeps the canonical string one-to-one with its inputs, and
+        // the refusal is an ordinary §7.1 authentication failure.
+        let canonical = canonical::ws_canonical_string(
+            self.authority.as_str(),
+            challenge_nonce,
+            auth.timestamp,
+        )
+        .map_err(|_| VerifyError::Headers("an authenticate component contains a line break"))?;
         let pre = WsPrecheck {
             actor_id: actor.to_string(),
             actor,
             key_id: auth.key_id.to_owned(),
-            canonical: canonical::ws_canonical_string(
-                self.authority.as_str(),
-                challenge_nonce,
-                auth.timestamp,
-            ),
+            canonical,
             signature: auth.signature.to_owned(),
             challenge_nonce: challenge_nonce.to_owned(),
             signed_at,

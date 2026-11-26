@@ -211,7 +211,8 @@ impl Client {
         assert_eq!(challenge["type"], "auth.challenge", "{challenge}");
         let nonce = challenge["data"]["nonce"].as_str().unwrap();
         let timestamp = rfc3339(now);
-        let canonical = ws_canonical_string(authority, nonce, &timestamp);
+        let canonical = ws_canonical_string(authority, nonce, &timestamp)
+            .expect("challenge components have no line break");
         let cmd = json!({
             "id": self.fresh_id(),
             "type": "authenticate",

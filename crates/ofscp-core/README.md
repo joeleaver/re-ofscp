@@ -45,5 +45,5 @@ deliberately:
 ofscp-core = { git = "https://github.com/joeleaver/re-ofscp", rev = "<commit>" }
 ```
 
-See `docs/decisions/0011-ofscp-core.md` and `0012-ofscp-core-client.md` for why it exists and what belongs
+See `docs/decisions/0011-ofscp-core.md` and `0015-ofscp-core-client.md` for why it exists and what belongs
 in it.

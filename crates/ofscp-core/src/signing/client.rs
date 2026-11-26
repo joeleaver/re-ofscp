@@ -54,11 +54,6 @@ impl DeviceKey {
         encode_public_key(&self.0.verifying_key())
     }
 
-    /// The underlying key, for the parent module's [`sign`].
-    pub fn signing_key(&self) -> &SigningKey {
-        &self.0
-    }
-
     /// `base64(Ed25519_sign(key, utf8(canonical)))`.
     pub fn sign(&self, canonical: &str) -> String {
         sign(&self.0, canonical)

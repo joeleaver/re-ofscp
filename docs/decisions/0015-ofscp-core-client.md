@@ -1,4 +1,4 @@
-# 0012: ofscp-core grows the client side: ids, signing, strict identifiers
+# 0015: ofscp-core grows the client side: ids, signing, strict identifiers
 
 - **Status:** accepted
 - **Date:** 2026-11-26

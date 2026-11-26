@@ -108,7 +108,8 @@ async fn the_handshake_challenges_and_authenticates() {
     let nonce = challenge["data"]["nonce"].as_str().unwrap();
     let ts = rfc3339(p.now());
     let canonical =
-        re_ofscp_server::signing::canonical::ws_canonical_string("providera.com", nonce, &ts);
+        re_ofscp_server::signing::canonical::ws_canonical_string("providera.com", nonce, &ts)
+            .expect("challenge components have no line break");
     let cmd = json!({"id": "cli_auth", "type": "authenticate", "ts": ts, "data": {
         "actor": ALICE, "keyId": KEY_ID, "timestamp": ts,
         "signature": re_ofscp_server::signing::canonical::sign(&key(), &canonical),

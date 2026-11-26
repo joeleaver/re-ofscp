@@ -19,7 +19,7 @@ thiserror = { workspace = true }
 # Randomness is passed in (`CryptoRngCore`); no `getrandom` is forced on
 # consumers.
 rand_core = { workspace = true }
-# The one timestamp type of the crate (docs/decisions/0012). No default
+# The one timestamp type of the crate (docs/decisions/0015). No default
 # features: no `std`, so nothing here can read the system clock.
 jiff = { workspace = true }
 zeroize = { workspace = true }
