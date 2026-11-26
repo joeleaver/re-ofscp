@@ -226,6 +226,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_watch_never_resolves_for_the_providers_own_authority() {
+        let own = a("re-ofscp.example");
+        let p = FederationPolicy::unloaded_for(own.clone());
+        p.install(Snapshot {
+            mode: FederationMode::Allowlist,
+            ..Snapshot::default()
+        });
+        let mut w = p.watch();
+        let r = tokio::time::timeout(Duration::from_millis(50), w.until_denied(&own)).await;
+        assert!(r.is_err(), "this provider is never denied to itself");
+    }
+
+    #[tokio::test]
     async fn a_watch_resolves_when_its_provider_becomes_denied() {
         let p = Arc::new(FederationPolicy::unloaded());
         let mut w = p.watch();

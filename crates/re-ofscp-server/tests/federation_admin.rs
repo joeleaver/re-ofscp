@@ -366,6 +366,13 @@ async fn a_denied_remote_signer_gets_403_and_a_local_one_never_does() {
         send_signed(&env.app, health()).await.0,
         StatusCode::FORBIDDEN
     );
+    // The built state's policy (the outbound client's too) spares this
+    // provider's own authority.
+    let own = re_ofscp_types::Authority::parse_canonical("providera.com").unwrap();
+    assert_eq!(
+        env.state.federation.policy().decide(&own),
+        re_ofscp_server::federation::Decision::Permitted
+    );
     common::accounts::create(&env, "alice", "alice password").await;
     let (_, boot, _) = account_login(&env, "alice", "alice password", "10.0.0.1").await;
     let alice_key = new_key();

@@ -5,8 +5,9 @@
 //! in force, under one lock, so the in-memory policy follows the stored
 //! one. A write that fails may still have committed (its answer lost), so
 //! after any failed write the stored policy is read back and put in force
-//! before the error is reported ([`PolicyStore::resync`]): the policy in
-//! force is then whatever rhypedb holds, never a guess.
+//! before the error is reported. If that read fails too, the policy is
+//! marked stale and the next change reads rhypedb before applying
+//! anything, so a change never builds on a copy that may have drifted.
 //! Like the replay ledger (decision 0001), one process owns the policy:
 //! another process writing the same database would not be seen until its
 //! next restart.
@@ -113,8 +114,10 @@ pub struct PolicyStore {
     policy: Arc<FederationPolicy>,
     /// This provider's authority, which no rule may name.
     own: Authority,
-    /// Serializes loads and changes.
-    write: Mutex<()>,
+    /// Serializes loads and changes. Holds whether the policy in force may
+    /// differ from the stored one (a write failed and so did reading the
+    /// policy back): the next change then reads rhypedb first.
+    write: Mutex<bool>,
 }
 
 impl PolicyStore {
@@ -124,7 +127,7 @@ impl PolicyStore {
             db,
             policy,
             own,
-            write: Mutex::new(()),
+            write: Mutex::new(false),
         }
     }
 
@@ -136,9 +139,10 @@ impl PolicyStore {
     /// Read the stored policy and put it in force. On error the policy in
     /// force is unchanged (unknown, before the first load).
     pub async fn load(&self) -> Result<(), DbError> {
-        let _write = self.write.lock().await;
+        let mut stale = self.write.lock().await;
         let snapshot = self.read().await?;
         self.policy.install(snapshot);
+        *stale = false;
         Ok(())
     }
 
@@ -206,11 +210,11 @@ impl PolicyStore {
         by: &str,
         now: i64,
     ) -> Result<FederationMode, PolicyError> {
-        let _write = self.write.lock().await;
-        let mut snapshot = self.loaded()?;
+        let mut stale = self.write.lock().await;
+        let mut snapshot = self.current(&mut stale).await?;
         let previous = snapshot.mode;
         if let Err(e) = self.write_mode(mode, by, now).await {
-            self.resync().await;
+            self.resync(&mut stale).await;
             return Err(e.into());
         }
         snapshot.mode = mode;
@@ -246,18 +250,38 @@ impl PolicyStore {
     }
 
     /// After a failed write, which may have committed: put the stored
-    /// policy in force. If even that read fails, the policy in force stays
-    /// as it was (the last one known stored) and the failure is logged;
-    /// the next change, or a restart, reads it again.
-    async fn resync(&self) {
+    /// policy in force. If even that read fails, mark the policy stale, so
+    /// the next change reads rhypedb before it applies anything (a restart
+    /// reads it too); until then the policy in force is the last one known
+    /// stored.
+    async fn resync(&self, stale: &mut bool) {
         match self.read().await {
-            Ok(snapshot) => self.policy.install(snapshot),
-            Err(e) => tracing::error!(
-                error = %e,
-                "federation policy write failed and could not be read back; \
-                 the policy in force may differ from the stored one until the next change"
-            ),
+            Ok(snapshot) => {
+                self.policy.install(snapshot);
+                *stale = false;
+            }
+            Err(e) => {
+                *stale = true;
+                tracing::error!(
+                    error = %e,
+                    "federation policy write failed and could not be read back; \
+                     the next change reads the stored policy first"
+                );
+            }
         }
+    }
+
+    /// The policy to change: the one in force, or, while `stale`, the
+    /// stored one read afresh (and put in force). A stale policy that
+    /// cannot be read refuses the change.
+    async fn current(&self, stale: &mut bool) -> Result<Snapshot, PolicyError> {
+        if *stale {
+            let snapshot = self.read().await?;
+            self.policy.install(snapshot.clone());
+            *stale = false;
+            return Ok(snapshot);
+        }
+        self.loaded()
     }
 
     /// Validate `add` and store it as a rule by `by`.
@@ -274,8 +298,8 @@ impl PolicyStore {
                 "a note is at most {MAX_RULE_NOTE_LEN} bytes"
             )));
         }
-        let _write = self.write.lock().await;
-        let mut snapshot = self.loaded()?;
+        let mut stale = self.write.lock().await;
+        let mut snapshot = self.current(&mut stale).await?;
         let list = snapshot.list(add.list);
         if list.get(add.scope, &value).is_some() {
             return Err(PolicyError::Duplicate);
@@ -311,7 +335,7 @@ impl PolicyStore {
             // A conflict means the rule is stored although the policy in
             // force lacks it (a create that committed with its answer
             // lost): reading back puts it in force.
-            self.resync().await;
+            self.resync(&mut stale).await;
             return Err(match e {
                 DbError::Conflict(_) => PolicyError::Duplicate,
                 e => e.into(),
@@ -324,14 +348,14 @@ impl PolicyStore {
 
     /// Remove the rule with `id`, returning it.
     pub async fn remove_rule(&self, id: &str) -> Result<Rule, PolicyError> {
-        let _write = self.write.lock().await;
-        let mut snapshot = self.loaded()?;
+        let mut stale = self.write.lock().await;
+        let mut snapshot = self.current(&mut stale).await?;
         let rule = snapshot.find(id).cloned().ok_or(PolicyError::NotFound)?;
         let q = Ql::new("FederationRule.filter(.rule_id == ")
             .str(&rule.id)
             .raw(").delete()");
         if let Err(e) = self.db.execute(&q).await {
-            self.resync().await;
+            self.resync(&mut stale).await;
             return Err(e.into());
         }
         snapshot.list_mut(rule.list).remove(&rule.id);
