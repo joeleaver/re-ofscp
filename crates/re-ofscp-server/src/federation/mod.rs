@@ -1,5 +1,6 @@
-//! The federation allow/deny policy (spec §8 *Authorization*, §4.5 step 6,
-//! §4.6 "No fetch is allowed", §7.1; docs/decisions/0008).
+//! The federation allow/deny policy (spec §8 *Authorization* as settled by
+//! lost-conn/ofscp#25, §4.5 step 6, §8.1 step 2, §4.6 "No fetch is
+//! allowed", §7.1, §8.5; docs/decisions/0008).
 //!
 //! [`FederationPolicy`] holds the policy in force, in memory, for the hot
 //! paths that consult it:
@@ -13,8 +14,10 @@
 //! * the outbound client, which refuses every request to a denied
 //!   provider, whoever asks and whatever stored state names it.
 //!
-//! The policy never applies to this provider's own authority: local
-//! signers are not federation (the verifier skips them).
+//! The policy never applies to this provider's own authority (local
+//! signers and requests to itself are not federation): a policy built
+//! with [`FederationPolicy::unloaded_for`] always permits it, even before
+//! it loads, on every path that consults it.
 //!
 //! Until the stored policy has been read ([`store::PolicyStore::load`])
 //! the policy is *unknown*, and every federation decision fails closed
@@ -24,10 +27,12 @@
 //!
 //! **WebSocket close `4001` (§7.1).** A connection authenticated as a
 //! remote actor must close with `4001` at once when that actor's provider
-//! becomes denied. [`FederationPolicy::watch`] is the seam: the connection
-//! task selects on [`PolicyWatch::until_denied`] for its actor's domain
-//! beside its socket, and closes `4001` when it resolves. The same check
-//! at `authenticate` time is [`FederationPolicy::decide`].
+//! becomes denied, and §8.5 makes the same check at `authenticate` a MUST
+//! (an `error` event, then `4001`). [`FederationPolicy::watch`] is the
+//! seam: the connection task selects on [`PolicyWatch::until_denied`] for
+//! its actor's domain beside its socket, and closes `4001` when it
+//! resolves. The same check at `authenticate` time is
+//! [`FederationPolicy::decide`].
 
 pub mod rules;
 pub mod store;
@@ -58,6 +63,8 @@ pub enum Decision {
 #[derive(Debug)]
 pub struct FederationPolicy {
     current: watch::Sender<Option<Arc<Snapshot>>>,
+    /// This provider's own authority, never subject to the policy.
+    own: Option<Authority>,
 }
 
 impl FederationPolicy {
@@ -65,6 +72,16 @@ impl FederationPolicy {
     pub fn unloaded() -> Self {
         Self {
             current: watch::Sender::new(None),
+            own: None,
+        }
+    }
+
+    /// The provider `own`'s policy, not loaded yet: every decision is
+    /// [`Decision::Unknown`] except about `own`, which is always permitted.
+    pub fn unloaded_for(own: Authority) -> Self {
+        Self {
+            current: watch::Sender::new(None),
+            own: Some(own),
         }
     }
 
@@ -72,6 +89,7 @@ impl FederationPolicy {
     pub fn with(snapshot: Snapshot) -> Self {
         Self {
             current: watch::Sender::new(Some(Arc::new(snapshot))),
+            own: None,
         }
     }
 
@@ -93,18 +111,26 @@ impl FederationPolicy {
 
     /// The policy's verdict on the remote provider `authority`.
     pub fn decide(&self, authority: &Authority) -> Decision {
-        decide(self.current.borrow().as_deref(), authority)
+        decide(
+            self.own.as_ref(),
+            self.current.borrow().as_deref(),
+            authority,
+        )
     }
 
     /// Follow policy changes (the §7.1 `4001` seam, see the module docs).
     pub fn watch(&self) -> PolicyWatch {
         PolicyWatch {
             current: self.current.subscribe(),
+            own: self.own.clone(),
         }
     }
 }
 
-fn decide(snapshot: Option<&Snapshot>, authority: &Authority) -> Decision {
+fn decide(own: Option<&Authority>, snapshot: Option<&Snapshot>, authority: &Authority) -> Decision {
+    if own == Some(authority) {
+        return Decision::Permitted;
+    }
     match snapshot {
         None => Decision::Unknown,
         Some(s) if s.permits(authority) => Decision::Permitted,
@@ -116,6 +142,7 @@ fn decide(snapshot: Option<&Snapshot>, authority: &Authority) -> Decision {
 #[derive(Debug, Clone)]
 pub struct PolicyWatch {
     current: watch::Receiver<Option<Arc<Snapshot>>>,
+    own: Option<Authority>,
 }
 
 impl PolicyWatch {
@@ -126,9 +153,10 @@ impl PolicyWatch {
     /// provider is shutting down).
     pub async fn until_denied(&mut self, authority: &Authority) {
         // `is_ok` drops the borrow at once, so the future stays `Send`.
+        let own = self.own.as_ref();
         let denied = self
             .current
-            .wait_for(|s| decide(s.as_deref(), authority) == Decision::Denied)
+            .wait_for(|s| decide(own, s.as_deref(), authority) == Decision::Denied)
             .await
             .is_ok();
         if !denied {
@@ -178,6 +206,23 @@ mod tests {
             FederationPolicy::open().decide(&a("evil.example")),
             Decision::Permitted
         );
+    }
+
+    #[test]
+    fn the_providers_own_authority_is_always_permitted() {
+        let own = a("re-ofscp.example");
+        let p = FederationPolicy::unloaded_for(own.clone());
+        assert_eq!(p.decide(&own), Decision::Permitted);
+        assert_eq!(p.decide(&a("other.example")), Decision::Unknown);
+        // Even an empty allowlist, or a domain rule above it, spares it.
+        p.install(Snapshot {
+            mode: FederationMode::Allowlist,
+            ..Snapshot::default()
+        });
+        assert_eq!(p.decide(&own), Decision::Permitted);
+        assert_eq!(p.decide(&a("other.example")), Decision::Denied);
+        p.install(denying("example"));
+        assert_eq!(p.decide(&own), Decision::Permitted);
     }
 
     #[tokio::test]

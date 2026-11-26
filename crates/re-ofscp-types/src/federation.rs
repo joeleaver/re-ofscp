@@ -94,9 +94,10 @@ impl RuleList {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuleScope {
-    /// Exactly one provider: a canonical authority (§2.4), `host` or
-    /// `host:port`. `example.com` does not match `example.com:8443` or
-    /// `a.example.com`.
+    /// One host: a canonical authority (§2.4). Without a port it matches
+    /// that host on every port (§8 *Authorization*, lost-conn/ofscp#25);
+    /// with one, only that port. `example.com` matches `example.com:8443`
+    /// but not `a.example.com`; `example.com:8443` matches only itself.
     Authority,
     /// A DNS name and every name under it, on any port: `example.com`
     /// matches `example.com`, `a.example.com` and `example.com:8443`, but

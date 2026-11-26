@@ -2,8 +2,11 @@
 //! in `schema.rhype`) and the admin changes to it (docs/decisions/0008).
 //!
 //! Every change is written to rhypedb first and then applied to the policy
-//! in force, under one lock, so the in-memory policy is always the stored
-//! one. A change whose write fails changes nothing in memory either.
+//! in force, under one lock, so the in-memory policy follows the stored
+//! one. A write that fails may still have committed (its answer lost), so
+//! after any failed write the stored policy is read back and put in force
+//! before the error is reported ([`PolicyStore::resync`]): the policy in
+//! force is then whatever rhypedb holds, never a guess.
 //! Like the replay ledger (decision 0001), one process owns the policy:
 //! another process writing the same database would not be seen until its
 //! next restart.
@@ -206,6 +209,18 @@ impl PolicyStore {
         let _write = self.write.lock().await;
         let mut snapshot = self.loaded()?;
         let previous = snapshot.mode;
+        if let Err(e) = self.write_mode(mode, by, now).await {
+            self.resync().await;
+            return Err(e.into());
+        }
+        snapshot.mode = mode;
+        snapshot.mode_set = Some((by.to_owned(), now));
+        self.policy.install(snapshot);
+        Ok(previous)
+    }
+
+    /// Store `mode`: update the setting row, or create it the first time.
+    async fn write_mode(&self, mode: FederationMode, by: &str, now: i64) -> Result<(), DbError> {
         let update = Ql::new("FederationSetting.filter(.name == ")
             .str(SETTING_NAME)
             .raw(").update({ mode: ")
@@ -227,10 +242,22 @@ impl PolicyStore {
                 .raw(" })");
             self.db.write_one::<SettingRow>(&create).await?;
         }
-        snapshot.mode = mode;
-        snapshot.mode_set = Some((by.to_owned(), now));
-        self.policy.install(snapshot);
-        Ok(previous)
+        Ok(())
+    }
+
+    /// After a failed write, which may have committed: put the stored
+    /// policy in force. If even that read fails, the policy in force stays
+    /// as it was (the last one known stored) and the failure is logged;
+    /// the next change, or a restart, reads it again.
+    async fn resync(&self) {
+        match self.read().await {
+            Ok(snapshot) => self.policy.install(snapshot),
+            Err(e) => tracing::error!(
+                error = %e,
+                "federation policy write failed and could not be read back; \
+                 the policy in force may differ from the stored one until the next change"
+            ),
+        }
     }
 
     /// Validate `add` and store it as a rule by `by`.
@@ -280,10 +307,15 @@ impl PolicyStore {
             .raw(", created_at: ")
             .unix_seconds(now)
             .raw(" })");
-        match self.db.write_one::<RuleRow>(&q).await {
-            Ok(_) => {}
-            Err(DbError::Conflict(_)) => return Err(PolicyError::Duplicate),
-            Err(e) => return Err(e.into()),
+        if let Err(e) = self.db.write_one::<RuleRow>(&q).await {
+            // A conflict means the rule is stored although the policy in
+            // force lacks it (a create that committed with its answer
+            // lost): reading back puts it in force.
+            self.resync().await;
+            return Err(match e {
+                DbError::Conflict(_) => PolicyError::Duplicate,
+                e => e.into(),
+            });
         }
         snapshot.list_mut(rule.list).insert(rule.clone());
         self.policy.install(snapshot);
@@ -298,7 +330,10 @@ impl PolicyStore {
         let q = Ql::new("FederationRule.filter(.rule_id == ")
             .str(&rule.id)
             .raw(").delete()");
-        self.db.execute(&q).await?;
+        if let Err(e) = self.db.execute(&q).await {
+            self.resync().await;
+            return Err(e.into());
+        }
         snapshot.list_mut(rule.list).remove(&rule.id);
         self.policy.install(snapshot);
         Ok(rule)

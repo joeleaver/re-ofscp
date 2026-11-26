@@ -501,3 +501,48 @@ async fn a_flood_of_negatives_leaves_a_peers_cached_documents_intact() {
     }
     all_cached(&keys, &victims, key).await;
 }
+
+/// The resolver judges the provider before its cache: an unloaded policy
+/// is a temporary refusal and a denial is final, cached key or not
+/// (§4.6 "No fetch is allowed", §8 *Authorization*).
+#[tokio::test]
+async fn the_policy_is_decided_before_the_cache_is_consulted() {
+    use re_ofscp_types::federation::{FederationMode, RuleList, RuleScope};
+
+    use crate::federation::{Rule, Snapshot};
+
+    let policy = Arc::new(FederationPolicy::unloaded());
+    let clock = Arc::new(TestClock(AtomicI64::new(T)));
+    let outbound = OutboundClient::new(&OutboundConfig::new(Vec::new(), policy.clone())).unwrap();
+    let keys = RemoteKeys::new(Arc::new(outbound), clock);
+    let bob = remote("bob@chat.evil.example");
+    cache(
+        &keys,
+        &bob,
+        SigningKey::from_bytes(&[11; 32]).verifying_key(),
+        T + 600,
+    );
+
+    let r = keys.resolve(&bob, "dk_1", false, &client()).await;
+    assert_eq!(retry_after(r), crate::federation::UNKNOWN_RETRY_SECS);
+
+    let mut deny = Snapshot {
+        mode: FederationMode::Denylist,
+        ..Snapshot::default()
+    };
+    deny.deny.insert(Rule {
+        id: "r1".to_owned(),
+        list: RuleList::Deny,
+        scope: RuleScope::Domain,
+        value: "evil.example".to_owned(),
+        note: String::new(),
+        created_by: "test".to_owned(),
+        created_at: 0,
+    });
+    policy.install(deny);
+    let r = keys.resolve(&bob, "dk_1", false, &client()).await;
+    assert!(matches!(r, Err(KeyError::Denied(_))), "{r:?}");
+
+    policy.install(Snapshot::default());
+    assert!(keys.resolve(&bob, "dk_1", false, &client()).await.is_ok());
+}

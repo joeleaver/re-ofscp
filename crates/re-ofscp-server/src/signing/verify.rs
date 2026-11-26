@@ -143,8 +143,9 @@ pub enum VerifyError {
     /// Step 5: body digest mismatch.
     #[error("X-OFSCP-Content-Digest does not match the body")]
     Digest,
-    /// Step 6: the federation policy denies the signer's provider (§4.6,
-    /// §8 *Authorization*): `403` `forbidden`.
+    /// Step 6 (§8.1 step 2 for provider signers): the federation policy
+    /// denies the signer's provider (§4.6, §8 *Authorization*,
+    /// lost-conn/ofscp#25): `403` `forbidden`.
     #[error("federation with the signer's provider is not permitted")]
     Forbidden,
     /// Step 6: the federation policy has not loaded yet, so no remote

@@ -19,8 +19,28 @@ builds on:
 - §7.1: a WebSocket authenticated as an actor whose provider *becomes*
   denied closes at once with `4001`.
 
-The spec does not say how a policy is expressed. That part is this
-provider's design.
+lost-conn/ofscp#25 (merged as 0faa3df, after the OFSCP oracle answered
+this change's questions) then settled the rest:
+
+- The inbound check MUST answer `403`. It covers every *signed* request on
+  every route, public routes included, judged by the `X-OFSCP-Actor`
+  domain or the `X-OFSCP-Provider` authority. Unsigned requests carry no
+  provider identity, so they are answered regardless.
+- For user signers, the check sits at the start of §4.5 step 6. For
+  provider signers, it sits at the start of §8.1 step 2. In both cases it
+  comes after §4.5 steps 1–5 and before any key or discovery fetch. Step 7
+  never succeeds, so the nonce is never recorded.
+- What an entry matches is the provider's choice. Entries and authorities
+  are compared in canonical form, and the provider's own authority is
+  never subject to the policy.
+- An entry naming a host without a port SHOULD match that host on every
+  port.
+- The check on the WebSocket `authenticate` actor is a MUST (§8.5): an
+  `error` event, then close `4001`.
+- A signed `GET` of a public or discoverable group is subject to the
+  policy (§5.5).
+
+How a policy is expressed is this provider's design.
 
 ## Decision
 
@@ -33,8 +53,14 @@ provider's design.
   except providers on the denylist. Switching modes never loses rules, so
   an operator can prepare an allowlist before switching to it.
 - **Two rule scopes.**
-  - `authority`: one exact canonical provider authority (§2.4: lowercase
-    host, default port 443 dropped), e.g. `peer.example:8443`.
+  - `authority`: one host, in canonical form (§2.4: lowercase, default
+    port 443 dropped).
+    - Without a port (`peer.example`), it matches that host on *every*
+      port, as ofscp#25 recommends. So the canonical `peer.example:443`
+      also matches every port, and a rule cannot single out port 443
+      alone.
+    - With a port (`peer.example:8443`), it matches only that port.
+    - It never matches subdomains.
   - `domain`: that DNS name and every name under it, on any port, e.g.
     `evil.example` covers `evil.example`, `chat.evil.example` and
     `evil.example:8443`. Domain rules never match IP-literal hosts. Use an
@@ -62,8 +88,10 @@ provider's design.
 
 ### Where it applies
 
-- **Never to this provider's own authority.** Local signers are not
-  federation. An empty allowlist cuts off every remote provider, but this
+- **Never to this provider's own authority.** Local signers, and any
+  request this provider makes to itself, are not federation. The policy
+  object is built knowing this provider's authority and always permits
+  it, even before the policy loads, on every path that consults it. An empty allowlist cuts off every remote provider, but this
   provider's own accounts keep working.
 - **Verifier (§4.5).** The check sits at the start of step 6, after the
   replay *check* (step 4) and the digest (step 5), and before any key is
@@ -109,7 +137,13 @@ provider would then federate with anyone after every restart.
 - The policy in force is an in-memory snapshot behind a `tokio::sync::watch`
   channel (`federation::FederationPolicy`), read lock-free on the hot
   paths. Every change is written to rhypedb first, then installed in
-  memory, under one mutex. A failed write changes nothing.
+  memory, under one mutex.
+- A failed write may still have committed, with only its answer lost.
+  So after any failed write, and after a `Conflict` the in-memory check
+  did not predict, the store reads the stored policy back and puts it in
+  force before it reports the error. The policy in force is then what
+  rhypedb holds. If that read fails too, the failure is logged and the
+  next change or a restart reads the policy again.
 - As with the replay ledger (decision 0001), one process owns the policy.
   A second process writing the same database would not be seen until its
   next restart.
@@ -142,20 +176,19 @@ if the provider is already denied, or at the first policy change that
 denies it. It ignores the unknown state. It never resolves once the policy
 is dropped (shutdown). It is tested in `federation::tests`.
 
-## Questions put to the OFSCP oracle
+## The OFSCP oracle's answers
 
-These were asked on 2026-11-26. No answer had arrived when this change
-merged. The defaults above are the conservative readings, and this section
-gets updated with whatever the oracle answers:
+Three questions went to the oracle on 2026-11-26:
 
-1. Are a denied provider's *unsigned* requests to public endpoints still
-   answered? (Default: yes. Signed requests from a denied signer get `403`
-   on every route.)
-2. Is rule granularity left to the provider? (Default: exact authority, or
-   domain plus subdomains, with no registrable grouping.)
-3. Does the `403` belong at the start of step 6, after the replay check
-   and the digest? (Default: yes. That is the step #20 names, and it keeps
-   the nonce unrecorded.)
+1. Are a denied provider's unsigned public requests still answered?
+2. Is rule granularity left to the provider?
+3. Where does the `403` sit in the step order?
+
+It confirmed each default above, and lost-conn/ofscp#25 records the
+answers (see Context). The review of that PR added one thing that changed
+this design: a portless entry matches every port. No group routes exist
+here yet. When they do, a signed `GET` of a group goes through the same
+verifier, so §5.5 is covered.
 
 ## Consequences
 

@@ -61,7 +61,7 @@ pub fn list_label(list: RuleList) -> &'static str {
 /// A scope as people read it.
 pub fn scope_label(scope: RuleScope) -> &'static str {
     match scope {
-        RuleScope::Authority => "Exact provider",
+        RuleScope::Authority => "Host (port optional)",
         RuleScope::Domain => "Domain and subdomains",
     }
 }

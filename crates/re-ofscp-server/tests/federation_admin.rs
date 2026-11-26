@@ -96,7 +96,7 @@ async fn the_policy_starts_open_and_roles_gate_each_change() {
     };
     let added = find("federation.rule_add", "ok");
     assert_eq!(added["admin"], "ops");
-    assert_eq!(added["target"], "deny domain Evil.Example");
+    assert_eq!(added["target"], "deny domain evil.example");
     let set = find("federation.mode", "ok");
     assert_eq!(set["admin"], "root");
     assert_eq!(set["target"], "denylist");
@@ -203,6 +203,56 @@ async fn bad_rules_are_refused() {
     )
     .await;
     assert_eq!(res.status.as_u16() / 100, 4);
+}
+
+/// A create that committed but whose answer was lost leaves the rule
+/// stored yet not in force; the retry's conflict reads it back, so it is
+/// in force and listed, not merely "already on the list".
+#[tokio::test]
+async fn a_stored_rule_missing_from_memory_is_read_back_on_conflict() {
+    use re_ofscp_server::db::Ql;
+    use re_ofscp_server::federation::store::rule_id;
+    use re_ofscp_types::federation::{RuleList, RuleScope};
+
+    let env = env().await;
+    let root = owner(&env).await;
+    let id = rule_id(RuleList::Deny, RuleScope::Domain, "evil.example");
+    let q = Ql::new("FederationRule.create({ rule_id: ")
+        .str(&id)
+        .raw(", list: \"deny\", scope: \"domain\", value: \"evil.example\"")
+        .raw(", note: \"\", created_by: \"root\", created_at: ")
+        .unix_seconds(1_800_000_000)
+        .raw(" })");
+    env.state.db.execute(&q).await.unwrap();
+    assert!(
+        env.state
+            .federation
+            .policy()
+            .snapshot()
+            .unwrap()
+            .deny
+            .is_empty()
+    );
+
+    let add = rule("deny", "domain", "evil.example");
+    let res = call(
+        &env,
+        Method::POST,
+        "/api/admin/federation/rules",
+        Some(add),
+        &root,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.json);
+    let res = call(&env, Method::GET, "/api/admin/federation", None, &root).await;
+    assert_eq!(res.json["deny"][0]["id"], id.as_str());
+    let snapshot = env.state.federation.policy().snapshot().unwrap();
+    assert!(
+        snapshot
+            .deny
+            .get(RuleScope::Domain, "evil.example")
+            .is_some()
+    );
 }
 
 #[tokio::test]

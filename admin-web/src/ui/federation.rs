@@ -357,7 +357,7 @@ pub fn FederationScreen() -> NodeHandle {
                     div { class: "grow",
                         TextInput {
                             label: "Provider or domain",
-                            description: "A domain (evil.example) or, for an exact provider, host or host:port.",
+                            description: "A domain (evil.example, with its subdomains), or a host: host on every port, host:port for one port.",
                             disabled: {move || !may(Action::EditFederationRules)},
                             value_fn: move || value.get(),
                             oninput: move |v: String| value.set(v),

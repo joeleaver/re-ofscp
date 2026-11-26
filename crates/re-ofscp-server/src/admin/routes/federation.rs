@@ -12,6 +12,7 @@ use axum::response::{IntoResponse, Response};
 use re_ofscp_types::admin::AdminRole;
 use re_ofscp_types::federation::{
     AddFederationRule, FederationPolicyView, FederationRuleView, SetFederationMode,
+    canonical_rule_value,
 };
 
 use super::{SERVER_ERROR, internal};
@@ -121,12 +122,11 @@ pub async fn add_rule(
     ctx: AdminCtx,
     Json(req): Json<AddFederationRule>,
 ) -> Result<Response, Problem> {
-    let target = format!(
-        "{} {} {}",
-        req.list.as_str(),
-        req.scope.as_str(),
-        req.value.trim()
-    );
+    // The canonical value when it is one, so refusals and successes name
+    // a rule the same way; the trimmed input otherwise.
+    let value =
+        canonical_rule_value(req.scope, &req.value).unwrap_or_else(|_| req.value.trim().to_owned());
+    let target = format!("{} {} {value}", req.list.as_str(), req.scope.as_str());
     ctx.require(&state, AdminRole::Operator, "federation.rule_add", &target)
         .await?;
     let note = req.note.as_deref().unwrap_or("").trim().to_owned();

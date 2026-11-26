@@ -147,7 +147,7 @@ impl AppStateBuilder {
             Some(client) => client,
             None => Arc::new(OutboundClient::new(&OutboundConfig::new(
                 config.outbound_allow_hosts.clone(),
-                Arc::new(FederationPolicy::unloaded()),
+                Arc::new(FederationPolicy::unloaded_for(config.domain.clone())),
             ))?),
         };
         let policy = outbound.policy().clone();

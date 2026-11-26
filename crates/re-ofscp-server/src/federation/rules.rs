@@ -94,18 +94,21 @@ impl RuleSet {
         all
     }
 
-    /// Whether a rule matches `authority`: an authority rule naming it, or
-    /// a domain rule naming its host or a name its host is under. An IP
-    /// literal is matched by authority rules only (domain rules are never
-    /// addresses).
+    /// Whether a rule matches `authority`: an authority rule naming it
+    /// exactly, an authority rule naming its host without a port (which
+    /// matches that host on every port, §8 *Authorization*,
+    /// lost-conn/ofscp#25), or a domain rule naming its host or a name its
+    /// host is under. An IP literal is matched by authority rules only
+    /// (domain rules are never addresses).
     pub fn matches(&self, authority: &Authority) -> bool {
-        if self.authorities.contains_key(authority.as_str()) {
+        let host = host_of(authority.as_str());
+        if self.authorities.contains_key(authority.as_str()) || self.authorities.contains_key(host)
+        {
             return true;
         }
         if self.domains.is_empty() {
             return false;
         }
-        let host = host_of(authority.as_str());
         if host.parse::<std::net::Ipv4Addr>().is_ok() {
             return false;
         }
@@ -203,17 +206,21 @@ mod tests {
     }
 
     #[test]
-    fn authority_rules_match_exactly_one_provider() {
+    fn authority_rules_match_one_host_and_a_port_narrows_them() {
+        // No port: that host on every port (ofscp#25), never its subdomains.
         let s = set(&[(RuleScope::Authority, "evil.example")]);
         assert!(s.matches(&a("evil.example")));
-        assert!(!s.matches(&a("evil.example:8443")));
+        assert!(s.matches(&a("evil.example:8443")));
         assert!(!s.matches(&a("a.evil.example")));
+        assert!(!s.matches(&a("evil.example2")));
+        // A port: exactly that provider.
         let s = set(&[(RuleScope::Authority, "evil.example:8443")]);
         assert!(s.matches(&a("evil.example:8443")));
         assert!(!s.matches(&a("evil.example")));
+        assert!(!s.matches(&a("evil.example:9443")));
         let s = set(&[(RuleScope::Authority, "203.0.113.7")]);
         assert!(s.matches(&a("203.0.113.7")));
-        assert!(!s.matches(&a("203.0.113.7:8443")));
+        assert!(s.matches(&a("203.0.113.7:8443")));
     }
 
     #[test]
