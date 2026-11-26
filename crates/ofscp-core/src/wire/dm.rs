@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Actor, DmId};
 
-use super::{Attachment, Content, Message, MessageReference, MetadataObject, Paged, Timestamp};
+use super::{
+    Attachment, Content, Message, MessageReference, MetadataObject, Paged, Timestamp, some,
+};
 
 /// A private conversation, as `GET /api/me/dms` lists it (§7.4).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -35,19 +37,35 @@ pub struct DmMessageCreate {
     /// The client's own id for it.
     pub client_message_id: String,
     /// The recipient. Clients should name them (§7.4).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "some",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub to: Option<Actor>,
     /// What it says.
     pub content: Content,
     /// Files attached.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "some",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub attachments: Option<Vec<Attachment>>,
     /// Who it mentions; authoritative for notifications when present
     /// (§5.3, §10.1).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "some",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub mentions: Option<Vec<Actor>>,
     /// The message it replies to.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "some",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub reference: Option<MessageReference>,
 }
 

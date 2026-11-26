@@ -120,40 +120,81 @@ pub struct Message {
 #[serde(rename_all = "camelCase")]
 pub struct MessageCreate {
     /// The client's own id for it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "some",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub client_message_id: Option<String>,
     /// What it is (a plain message when left out).
-    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "type",
+        deserialize_with = "some",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub kind: Option<MessageType>,
     /// What it says.
     pub content: Content,
     /// Files attached, uploaded first to `/api/media`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "some",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub attachments: Option<Vec<Attachment>>,
     /// The message it replies to (kind `reply`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "some",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub reference: Option<MessageReference>,
     /// Tags.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "some",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub tags: Option<Vec<String>>,
     /// Who it mentions, set by the author's client (§5.3, *Mentions*).
     /// When present it is authoritative for mention notifications (§10.1);
     /// when absent, mentions are parsed from the text.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "some",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub mentions: Option<Vec<Actor>>,
     /// An article's title, plain text (§5.3); ignored on other types.
     /// When absent, a level-1 heading opening the body is the title.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "some",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub title: Option<String>,
     /// An article's summary, plain text (§5.3); ignored on other types.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "some",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub summary: Option<String>,
     /// An article's cover: the id of one of its own `attachments` (§5.3);
     /// ignored on other types.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "some",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub cover: Option<LocalId>,
     /// Extension data.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "some",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub metadata: Option<Vec<MetadataObject>>,
 }
 
@@ -341,5 +382,43 @@ mod tests {
         let both: MessageUpdate =
             serde_json::from_value(json!({"cover": "att_1", "tags": []})).unwrap();
         assert!(!both.is_empty() && !both.has_only_article_fields());
+    }
+
+    /// A create request has no `null` anywhere: the schema allows none, and
+    /// §5.3 makes a non-string article `title` or `summary` a 400. (Only an
+    /// edit gives `null` a meaning; a received `Message` stays lenient.)
+    #[test]
+    fn a_create_refuses_null_instead_of_reading_it_as_absent() {
+        let fields = [
+            "clientMessageId",
+            "type",
+            "attachments",
+            "reference",
+            "tags",
+            "mentions",
+            "title",
+            "summary",
+            "cover",
+            "metadata",
+        ];
+        for field in fields {
+            let mut body = json!({"content": {"mime": "text/plain", "text": "hi"}});
+            body[field] = serde_json::Value::Null;
+            assert!(
+                serde_json::from_value::<MessageCreate>(body).is_err(),
+                "{field}: null accepted"
+            );
+        }
+        let dm_fields = ["to", "attachments", "mentions", "reference"];
+        for field in dm_fields {
+            let mut body = json!({
+                "clientMessageId": "c1", "content": {"mime": "text/plain", "text": "hi"}
+            });
+            body[field] = serde_json::Value::Null;
+            assert!(
+                serde_json::from_value::<super::super::DmMessageCreate>(body).is_err(),
+                "dm {field}: null accepted"
+            );
+        }
     }
 }
