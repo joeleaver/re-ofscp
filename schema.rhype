@@ -13,7 +13,7 @@ type User {
     // do not verify.
     status: String
     created_at: DateTime @indexed
-    // Public profile (§5.1.1, §6.3; docs/decisions/0008). Added after the
+    // Public profile (§5.1.1, §6.3; docs/decisions/0009). Added after the
     // first deploy: accounts created before then lack these fields, which
     // read back as absent and mean "none" (`profile_updated_at` falls back
     // to `created_at`). The empty string also means "none" for `avatar` and
@@ -163,7 +163,7 @@ type FederationRule {
     created_at: DateTime
 }
 
-// A user's privacy settings (§6.1, §6.6; docs/decisions/0008). One row per
+// A user's privacy settings (§6.1, §6.6; docs/decisions/0009). One row per
 // account, created on its first `PUT /api/me/privacy`; an account without
 // one has the defaults. The lists hold canonical actors (§2.2) as JSON
 // arrays of strings.

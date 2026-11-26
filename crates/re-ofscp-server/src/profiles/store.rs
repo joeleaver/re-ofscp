@@ -18,7 +18,7 @@ use crate::timefmt::unix;
 use rhypedb_client::Row;
 
 /// The defaults for an account that has never saved privacy settings
-/// (docs/decisions/0008; the same as Forumall's).
+/// (docs/decisions/0009; the same as Forumall's).
 pub const DEFAULT_PRESENCE_VISIBILITY: Visibility = Visibility::SharedGroups;
 /// See [`DEFAULT_PRESENCE_VISIBILITY`].
 pub const DEFAULT_PROFILE_VISIBILITY: Visibility = Visibility::Public;

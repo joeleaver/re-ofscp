@@ -1,5 +1,5 @@
 //! User profiles, presence, membership listing and privacy settings
-//! (spec §5.1, §6; docs/decisions/0008).
+//! (spec §5.1, §6; docs/decisions/0009).
 //!
 //! [`Profiles`] decides what a [`Viewer`] sees of a subject; the routes in
 //! [`routes`] only translate HTTP. The same methods are what the WebSocket

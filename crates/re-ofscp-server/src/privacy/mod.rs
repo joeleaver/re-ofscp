@@ -14,7 +14,7 @@
 //! Until groups (§5.2) and contacts (§6.7) exist on this provider, the
 //! implementations are [`NoGroupsHosted`] and [`NoContacts`]: they answer
 //! truthfully that no one shares a group and no one is a contact, so those
-//! tiers admit only the subject and the allow list (docs/decisions/0008).
+//! tiers admit only the subject and the allow list (docs/decisions/0009).
 
 pub mod seams;
 

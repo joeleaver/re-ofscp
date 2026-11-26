@@ -178,7 +178,7 @@ pub struct PrivacySettings {
 }
 
 /// `PUT /api/me/privacy` request (§6.6). An absent field is left unchanged
-/// (docs/decisions/0008).
+/// (docs/decisions/0009).
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PrivacyUpdate {

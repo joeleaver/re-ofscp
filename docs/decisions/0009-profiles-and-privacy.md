@@ -1,4 +1,4 @@
-# 0008: Profiles, privacy settings, presence and membership listing
+# 0009: Profiles, privacy settings, presence and membership listing
 
 - **Status:** accepted
 - **Date:** 2026-11-26

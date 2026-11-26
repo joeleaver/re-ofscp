@@ -19,7 +19,7 @@
 //! sees follows the subject's privacy settings (§6.1).
 //! A viewer who may not see something gets the same answer as if there
 //! were nothing to see, never `403`, so a refusal reveals nothing
-//! (docs/decisions/0008; spec behaviour settled in lost-conn/ofscp#26).
+//! (docs/decisions/0009; spec behaviour settled in lost-conn/ofscp#26).
 
 use axum::Json;
 use axum::extract::{Path, State};

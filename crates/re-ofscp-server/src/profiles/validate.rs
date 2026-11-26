@@ -1,6 +1,6 @@
 //! Checking profile, privacy and presence input before anything is stored
 //! (§6.3, §6.4, §6.6). Every failure is a `400` with the message as detail.
-//! The limits are this provider's own (docs/decisions/0008).
+//! The limits are this provider's own (docs/decisions/0009).
 
 use std::collections::BTreeSet;
 
@@ -96,7 +96,7 @@ pub fn metadata(field: &str, list: &[MetadataObject]) -> Result<(), Invalid> {
 ///
 /// Avatars: `null` removes the avatar. Any URL is refused for now: an
 /// avatar must be an `Attachment` this provider hosts (§6.3 SHOULD), and it
-/// hosts no media until §5.8 is built (docs/decisions/0008). A URL that is
+/// hosts no media until §5.8 is built (docs/decisions/0009). A URL that is
 /// not `https` is refused with its own message (§6.3 MUST).
 pub fn profile_update(
     update: &re_ofscp_types::profile::ProfileUpdate,
