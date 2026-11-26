@@ -1,9 +1,12 @@
 //! Notification endpoints and their deliveries (spec §10), and Web Push
 //! (§10.3).
 
+use core::fmt;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use super::auth::REDACTED;
 use super::open_enum;
 use crate::{Authority, DmId, LocalId};
 
@@ -89,13 +92,23 @@ pub struct PushPublicKey {
     pub public_key: String,
 }
 
-/// A browser `PushSubscription`'s keys (§10.3).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A browser `PushSubscription`'s keys (§10.3). `Debug` hides `auth`, the
+/// subscription's shared secret.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PushKeys {
     /// The subscription's P-256 public key, base64url.
     pub p256dh: String,
     /// The authentication secret, base64url.
     pub auth: String,
+}
+
+impl fmt::Debug for PushKeys {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PushKeys")
+            .field("p256dh", &self.p256dh)
+            .field("auth", &REDACTED)
+            .finish()
+    }
 }
 
 /// `POST /api/push/subscribe` (§10.3). `endpoint` must be `https:`.
@@ -173,4 +186,24 @@ pub struct PushPayload {
     pub tag: String,
     /// Where it leads.
     pub data: PushData,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_push_auth_secret_stays_out_of_debug() {
+        let req = PushSubscribeRequest {
+            endpoint: "https://push.example/sub".to_owned(),
+            keys: PushKeys {
+                p256dh: "BPublicPoint".to_owned(),
+                auth: "s3cret-auth".to_owned(),
+            },
+        };
+        let shown = format!("{req:?}");
+        assert!(!shown.contains("s3cret-auth"), "{shown}");
+        assert!(shown.contains(REDACTED), "{shown}");
+        assert!(shown.contains("BPublicPoint"), "{shown}");
+    }
 }
