@@ -14,11 +14,11 @@ pub mod register;
 pub mod routes;
 pub mod store;
 
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 
 use re_ofscp_types::auth::RegistrationMode;
 use re_ofscp_types::{Authority, is_valid_handle};
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::Mutex;
 
 pub use bootstrap::{BOOTSTRAP_TTL_SECS, BootstrapTokens, IssueError};
 pub use invites::{InviteStore, InviteSummary, IssuedInvite, Revoked};
@@ -53,6 +53,13 @@ pub struct Revocation {
     pub handle: String,
     /// The key, or `None` for every key of the account.
     pub key_id: Option<String>,
+}
+
+/// Told of every [`Revocation`], synchronously, as it is announced (the
+/// WebSocket layer, which closes the connections it concerns).
+pub trait RevocationListener: Send + Sync + std::fmt::Debug {
+    /// `r` took effect: the key no longer verifies.
+    fn revoked(&self, r: &Revocation);
 }
 
 /// Why an account could not be created.
@@ -110,7 +117,7 @@ pub struct Accounts {
     /// Serializes device-key registration, so the per-account key cap holds
     /// exactly (registration is rare).
     pub key_registration: Mutex<()>,
-    revocations: broadcast::Sender<Revocation>,
+    listeners: RwLock<Vec<Arc<dyn RevocationListener>>>,
 }
 
 impl Accounts {
@@ -132,7 +139,6 @@ impl Accounts {
             store.clone(),
             remote,
         ));
-        let (revocations, _) = broadcast::channel(1024);
         Self {
             domain,
             registration,
@@ -146,7 +152,7 @@ impl Accounts {
             // 5 free failures, then 60 s doubling to 1 h.
             login_backoff: FailureBackoff::new(5, 60, 3600, 100_000),
             key_registration: Mutex::new(()),
-            revocations,
+            listeners: RwLock::new(Vec::new()),
         }
     }
 
@@ -191,14 +197,23 @@ impl Accounts {
         Ok(())
     }
 
-    /// Subscribe to key revocations (for the WebSocket layer, §4.7.1).
-    pub fn revocations(&self) -> broadcast::Receiver<Revocation> {
-        self.revocations.subscribe()
+    /// Tell `listener` of every revocation from now on (§4.7.1).
+    pub fn on_revocation(&self, listener: Arc<dyn RevocationListener>) {
+        self.listeners
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(listener);
     }
 
+    /// Announce `r` once it has taken effect (the key no longer resolves).
     fn announce(&self, r: Revocation) {
-        // No subscribers yet is fine: nothing to close.
-        let _ = self.revocations.send(r);
+        let listeners = self
+            .listeners
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        for l in listeners.iter() {
+            l.revoked(&r);
+        }
     }
 }
 

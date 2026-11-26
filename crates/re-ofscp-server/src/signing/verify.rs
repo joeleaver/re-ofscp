@@ -15,7 +15,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use super::canonical::{self, CanonicalRequest};
-use super::keys::{KeyError, KeyResolver, Requester};
+use super::keys::{KeyError, KeyResolver, Requester, Resolved};
 use crate::federation::{Decision, FederationPolicy, UNKNOWN_RETRY_SECS};
 use crate::problem::Problem;
 use crate::replay::{
@@ -169,13 +169,13 @@ const LEDGER_RETRY_SECS: u64 = 2;
 /// Verifies signed requests for one provider.
 #[derive(Clone)]
 pub struct Verifier {
-    authority: Authority,
-    skew_secs: i64,
-    replay: Arc<ReplayStore>,
+    pub(super) authority: Authority,
+    pub(super) skew_secs: i64,
+    pub(super) replay: Arc<ReplayStore>,
     ledger: Arc<dyn NonceLedger>,
-    keys: Arc<dyn KeyResolver>,
-    policy: Arc<FederationPolicy>,
-    clock: Arc<dyn Clock>,
+    pub(super) keys: Arc<dyn KeyResolver>,
+    pub(super) policy: Arc<FederationPolicy>,
+    pub(super) clock: Arc<dyn Clock>,
 }
 
 /// The parts of an HTTP request the verifier reads.
@@ -253,6 +253,27 @@ impl Verifier {
             Signer::Provider(p) => p,
         };
         (*provider != self.authority).then_some(provider)
+    }
+
+    /// Step 6 begins with the federation policy, decided from the claimed
+    /// provider before any key is resolved (§4.5 step 6, §4.6 "No fetch is
+    /// allowed", §7.3 `forbidden`, §8.5): a cached key that would verify
+    /// must not rescue a denied signer. Signed HTTP and the WebSocket
+    /// handshake both start step 6 here.
+    pub(super) fn check_policy(&self, signer: &Signer) -> Result<(), VerifyError> {
+        let Some(provider) = self.remote_provider(signer) else {
+            return Ok(());
+        };
+        match self.policy.decide(provider) {
+            Decision::Permitted => Ok(()),
+            Decision::Denied => Err(VerifyError::Forbidden),
+            Decision::Unknown => Err(VerifyError::PolicyUnknown),
+        }
+    }
+
+    /// The federation policy remote signers are judged by.
+    pub fn policy(&self) -> &Arc<FederationPolicy> {
+        &self.policy
     }
 
     /// The shared replay store (the WebSocket handshake records into it too).
@@ -346,24 +367,10 @@ impl Verifier {
             return Err(VerifyError::Digest);
         }
 
-        // Step 6 begins with the federation policy, decided from the claimed
-        // provider before any key is resolved (§4.5 step 6, §4.6 "No fetch
-        // is allowed", §7.3 `forbidden`): a cached key that would verify
-        // must not rescue a denied signer.
-        if let Some(provider) = self.remote_provider(&pre.signer) {
-            match self.policy.decide(provider) {
-                Decision::Permitted => {}
-                Decision::Denied => return Err(VerifyError::Forbidden),
-                Decision::Unknown => return Err(VerifyError::PolicyUnknown),
-            }
-        }
+        self.check_policy(&pre.signer)?;
 
-        // Steps 6 and 7: resolve the key and verify. If a *cached* answer
-        // has no such key or its key does not verify, ask again with
-        // `fresh` so a newly registered or rotated key is honoured (§4.6,
-        // §8.1, lost-conn/ofscp#19). An answer fetched for this request is
-        // final: fetching it twice could not change it. Resolvers that fetch
-        // remotely rate-limit fresh lookups (see `KeyResolver`).
+        // Steps 6 and 7: resolve the key and verify, re-fetching once after
+        // a cached miss (see `resolve_and_check`).
         let canonical = CanonicalRequest {
             authority: self.authority.as_str(),
             method: req.method.as_str(),
@@ -374,15 +381,14 @@ impl Verifier {
             content_digest: &pre.digest,
         }
         .render();
-        match self.try_key(&pre, &canonical, false, requester).await {
-            Ok(()) => {}
-            Err(failure) if failure.retry => {
-                self.try_key(&pre, &canonical, true, requester)
-                    .await
-                    .map_err(|f| f.error)?;
-            }
-            Err(failure) => return Err(failure.error),
-        }
+        self.resolve_and_check(
+            &pre.signer,
+            &pre.key_id,
+            &pre.signature,
+            &canonical,
+            requester,
+        )
+        .await?;
 
         // Re-check and record atomically, on a fresh clock reading (reading
         // the body and resolving keys take time). The store re-checks
@@ -418,38 +424,60 @@ impl Verifier {
         })
     }
 
-    /// Resolve the key (step 6) and check the signature (step 7).
+    /// §4.5 steps 6 and 7: resolve `signer`'s key `key_id` and check
+    /// `signature` over `canonical`. If a *cached* answer has no such key
+    /// or its key does not verify, ask again with `fresh` so a newly
+    /// registered or rotated key is honoured (§4.6, §8.1,
+    /// lost-conn/ofscp#19). An answer fetched for this lookup is final:
+    /// fetching it twice could not change it. Resolvers that fetch remotely
+    /// rate-limit fresh lookups (see `KeyResolver`). Returns the answer
+    /// whose key verified.
+    pub(super) async fn resolve_and_check(
+        &self,
+        signer: &Signer,
+        key_id: &str,
+        signature: &str,
+        canonical: &str,
+        requester: &Requester,
+    ) -> Result<Resolved, VerifyError> {
+        let attempt = |fresh| self.try_key(signer, key_id, signature, canonical, fresh, requester);
+        match attempt(false).await {
+            Ok(resolved) => Ok(resolved),
+            Err(failure) if failure.retry => attempt(true).await.map_err(|f| f.error),
+            Err(failure) => Err(failure.error),
+        }
+    }
+
+    /// Resolve the key (step 6) and check the signature (step 7), once.
     async fn try_key(
         &self,
-        pre: &Precheck,
+        signer: &Signer,
+        key_id: &str,
+        signature: &str,
         canonical: &str,
         fresh: bool,
         requester: &Requester,
-    ) -> Result<(), KeyFailure> {
-        let resolved = match self
-            .keys
-            .resolve(&pre.signer, &pre.key_id, fresh, requester)
-            .await
-        {
+    ) -> Result<Resolved, KeyFailure> {
+        let resolved = match self.keys.resolve(signer, key_id, fresh, requester).await {
             Ok(resolved) => resolved,
             // The policy changed while the key was being resolved.
             Err(KeyError::Denied(_)) => return Err(KeyFailure::terminal(VerifyError::Forbidden)),
             Err(KeyError::Unresolvable(e)) => {
-                tracing::info!(error = %e, key_id = pre.key_id, "signer's keys are unresolvable");
+                tracing::info!(error = %e, key_id, "signer's keys are unresolvable");
                 return Err(KeyFailure::terminal(VerifyError::UnknownKey));
             }
             Err(KeyError::Unavailable {
                 reason,
                 retry_after,
             }) => {
-                tracing::warn!(error = %reason, key_id = pre.key_id, "signing keys unavailable");
+                tracing::warn!(error = %reason, key_id, "signing keys unavailable");
                 return Err(KeyFailure::terminal(VerifyError::KeysUnavailable {
                     retry_after,
                 }));
             }
         };
         let error = match resolved.key {
-            Some(key) if canonical::verify(&key, canonical, &pre.signature) => return Ok(()),
+            Some(key) if canonical::verify(&key, canonical, signature) => return Ok(resolved),
             Some(_) => VerifyError::Signature,
             None => VerifyError::UnknownKey,
         };
@@ -486,7 +514,7 @@ struct SigHeaders<'a> {
     signature: &'a str,
 }
 
-fn replay_error(e: ReplayError) -> VerifyError {
+pub(super) fn replay_error(e: ReplayError) -> VerifyError {
     match e {
         ReplayError::Replayed => VerifyError::Replayed,
         ReplayError::Expired => {

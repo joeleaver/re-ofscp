@@ -15,6 +15,7 @@ use crate::federation::FederationPolicy;
 use crate::outbound::OutboundConfig;
 use crate::remote_keys::budget::Standing::FirstTime;
 use crate::remote_keys::document::KeySet;
+use crate::signing::Lifetime;
 
 struct TestClock(AtomicI64);
 
@@ -80,7 +81,7 @@ async fn a_refused_fetch_still_uses_an_unexpired_cached_key() {
     cache(&keys, &alice, key, T + 30);
     assert_eq!(
         keys.resolve(&alice, "dk_1", true, &client()).await,
-        Ok(Resolved::cached(Some(key)))
+        Ok(Resolved::cached(Some(key)).lasting(Lifetime::Until(T + 30)))
     );
     // A key id the entry does not hold: 401.
     assert!(matches!(
@@ -107,7 +108,7 @@ async fn a_refusal_after_lookup_falls_back_the_same_way() {
     let refused = || Fetched::Refused("internal.example resolves to 10.0.0.1".to_owned());
     assert_eq!(
         keys.inner.settle(&source, "dk_1", refused(), false),
-        Ok(Resolved::cached(Some(key)))
+        Ok(Resolved::cached(Some(key)).lasting(Lifetime::Until(T + 30)))
     );
     clock.0.store(T + 31, Ordering::SeqCst);
     assert!(matches!(
@@ -227,13 +228,13 @@ async fn a_client_over_budget_gets_503_or_an_unexpired_cached_key() {
     // A cache hit costs nothing, so it still works.
     assert_eq!(
         keys.resolve(&alice, "dk_1", false, &client()).await,
-        Ok(Resolved::cached(Some(key)))
+        Ok(Resolved::cached(Some(key)).lasting(Lifetime::Until(T + 30)))
     );
     // A re-fetch would need the budget: the unexpired cached key stands in,
     // and without one it is 503 until a token is back.
     assert_eq!(
         keys.resolve(&alice, "dk_1", true, &client()).await,
-        Ok(Resolved::cached(Some(key)))
+        Ok(Resolved::cached(Some(key)).lasting(Lifetime::Until(T + 30)))
     );
     assert_eq!(
         retry_after(keys.resolve(&alice, "dk_2", true, &client()).await),
@@ -320,7 +321,7 @@ async fn hosts_under_an_unknown_suffix_are_refused_at_no_cost() {
     cache(&keys, &odd, key, T + 30);
     assert_eq!(
         keys.resolve(&odd, "dk_1", true, &client()).await,
-        Ok(Resolved::cached(Some(key)))
+        Ok(Resolved::cached(Some(key)).lasting(Lifetime::Until(T + 30)))
     );
 }
 
@@ -374,7 +375,7 @@ async fn a_busy_target_costs_no_budget_and_no_refetch_interval() {
     }
     assert_eq!(
         keys.resolve(&alice, "dk_1", true, &client()).await,
-        Ok(Resolved::cached(Some(key)))
+        Ok(Resolved::cached(Some(key)).lasting(Lifetime::Until(T + 30)))
     );
     assert!(keys.inner.tables().flights.is_empty());
     assert_eq!(
@@ -443,7 +444,7 @@ async fn all_cached(keys: &RemoteKeys, victims: &[Signer], key: ed25519_dalek::V
     for victim in victims {
         assert_eq!(
             keys.resolve(victim, "dk_1", false, &client()).await,
-            Ok(Resolved::cached(Some(key)))
+            Ok(Resolved::cached(Some(key)).lasting(Lifetime::Until(T + 3600)))
         );
     }
     assert!(keys.inner.tables().flights.is_empty());
