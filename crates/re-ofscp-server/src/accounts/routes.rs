@@ -18,7 +18,8 @@ use re_ofscp_types::auth::{
     DeviceKeyRegistration, DeviceKeysResponse, ED25519, LoginRequest, PublicKey,
     RegistrationRequest, UserKeysResponse,
 };
-use re_ofscp_types::is_valid_handle;
+use re_ofscp_types::wire::KeyAlgorithm;
+use re_ofscp_types::{Actor, is_valid_handle};
 
 use super::{
     BOOTSTRAP_TTL_SECS, IssueError, MAX_DEVICE_KEYS, MAX_DEVICE_NAME_CHARS, RegisterError,
@@ -30,7 +31,7 @@ use crate::problem::Problem;
 use crate::ratelimit::Limited;
 use crate::signing::Authenticated;
 use crate::signing::canonical::decode_public_key;
-use crate::timefmt::rfc3339;
+use crate::timefmt::timestamp;
 
 /// How long verifiers may cache a user's keys (§4.7.1: SHOULD be short).
 pub const KEYS_CACHE_SECS: i64 = 300;
@@ -193,7 +194,7 @@ pub async fn register_device_key(
 
     // Validate the request before the token is consumed (it is consumed only
     // by a successful registration, §4.2).
-    let algorithm = req.algorithm.as_deref().unwrap_or(ED25519);
+    let algorithm = req.algorithm.as_ref().map_or(ED25519, KeyAlgorithm::as_str);
     if algorithm != ED25519 {
         return Err(Problem::bad_request().with_detail("algorithm must be Ed25519 (§4.3.3)"));
     }
@@ -278,7 +279,7 @@ pub async fn list_device_keys(
         .into_iter()
         .map(|k| DeviceKeyInfo {
             key_id: k.key_id,
-            algorithm: k.algorithm,
+            algorithm: KeyAlgorithm::from(k.algorithm.as_str()),
             public_key: k.public_key,
             device_name: k.device_name,
             created_at: k.created_at,
@@ -342,7 +343,7 @@ pub async fn user_keys(
             .into_iter()
             .map(|k| PublicKey {
                 key_id: k.key_id,
-                algorithm: k.algorithm,
+                algorithm: KeyAlgorithm::from(k.algorithm.as_str()),
                 public_key: k.public_key,
                 created_at: k.created_at,
             })
@@ -352,9 +353,9 @@ pub async fn user_keys(
     };
     let now = state.verifier.now();
     let body = UserKeysResponse {
-        actor: format!("{handle}@{}", accounts.domain),
+        actor: Actor::new(&handle, accounts.domain.clone()).map_err(internal)?,
         keys,
-        cache_until: rfc3339(now + KEYS_CACHE_SECS),
+        cache_until: timestamp(now + KEYS_CACHE_SECS),
     };
     Ok((
         [(

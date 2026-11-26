@@ -230,7 +230,7 @@ impl AppStateBuilder {
         let accounts = Arc::new(Accounts::new(
             config.domain.clone(),
             config.provider_key.published(),
-            config.registration,
+            config.registration.clone(),
             db.clone(),
             remote_keys,
         ));

@@ -210,19 +210,26 @@ async fn a_closed_provider_refuses_every_registration() {
     }
 }
 
+/// Unknown fields are ignored (spec §2.3), so an extra field neither fails
+/// the request nor grants anything: the account is an ordinary one.
 #[tokio::test]
-async fn unknown_fields_are_rejected() {
+async fn unknown_fields_are_ignored() {
     let env = env().await;
-    let (s, j, _, _) = send(
-        &env.app,
-        post_json(
-            "/api/auth/register",
-            json!({"handle": "carol", "password": "correct horse battery", "admin": true}),
-            "10.2.5.1",
-        ),
+    let token = invite(&env, None).await;
+    let (s, boot) = register_unchecked(
+        &env,
+        json!({
+            "handle": "carol",
+            "password": "correct horse battery",
+            "inviteToken": token,
+            "admin": true,
+        }),
+        "10.2.5.1",
     )
     .await;
-    assert_problem(s, &j, StatusCode::BAD_REQUEST, "bad_request");
+    assert_eq!(s, StatusCode::CREATED, "{boot}");
+    common::assert_valid(&common::schema("auth-bootstrap-response.json"), &boot);
+    assert!(boot.get("admin").is_none(), "{boot}");
 }
 
 #[tokio::test]

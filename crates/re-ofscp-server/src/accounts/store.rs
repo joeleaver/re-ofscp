@@ -13,6 +13,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use serde::Deserialize;
 
 use super::pending::Resolution;
+use ofscp_core::wire::Timestamp;
+
 use crate::db::{Db, DbError, Ql};
 
 /// Attempts at an account create aborted by a concurrent one
@@ -65,8 +67,8 @@ pub struct DeviceKey {
     pub algorithm: String,
     /// Device description.
     pub device_name: String,
-    /// RFC 3339 creation time.
-    pub created_at: String,
+    /// Creation time.
+    pub created_at: Timestamp,
 }
 
 /// An account-store failure.
@@ -150,7 +152,7 @@ struct KeyRow {
     public_key: String,
     algorithm: String,
     device_name: String,
-    created_at: String,
+    created_at: Timestamp,
 }
 
 impl From<KeyRow> for DeviceKey {

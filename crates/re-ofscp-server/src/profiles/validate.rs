@@ -5,7 +5,7 @@
 use std::collections::BTreeSet;
 
 use re_ofscp_types::Actor;
-use re_ofscp_types::profile::{Availability, MetadataObject, Patch};
+use re_ofscp_types::profile::{MetadataObject, Patch};
 
 use super::store::{PrivacyChanges, ProfileChanges, metadata_json};
 use crate::accounts::MAX_DISPLAY_NAME_CHARS;
@@ -191,14 +191,10 @@ pub fn privacy_update(
     })
 }
 
-/// A `PUT /api/me/presence` body. `offline` is derived from connection
-/// liveness and cannot be set (§7.5).
+/// A `PUT /api/me/presence` body. `offline`, derived from connection
+/// liveness (§7.5), cannot even be decoded: `SetAvailability` has no such
+/// value.
 pub fn presence_update(update: &re_ofscp_types::profile::PresenceUpdate) -> Result<(), Invalid> {
-    if update.availability == Availability::Offline {
-        return Err(invalid(
-            "availability offline cannot be set: it follows from having no live connection",
-        ));
-    }
     if let Some(status) = &update.status {
         text("status", status, MAX_STATUS_CHARS, false)?;
     }

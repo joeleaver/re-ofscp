@@ -9,7 +9,8 @@
 use std::sync::Arc;
 
 use re_ofscp_types::Actor;
-use re_ofscp_types::profile::{Availability, MetadataObject, Visibility};
+use re_ofscp_types::profile::{MetadataObject, SetAvailability, Visibility};
+use re_ofscp_types::wire::Timestamp;
 use serde::Deserialize;
 
 use crate::accounts::store::status;
@@ -223,13 +224,13 @@ impl PrivacyRow {
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredPresence {
     /// The explicit availability (`online`, `away` or `dnd`).
-    pub availability: Availability,
+    pub availability: SetAvailability,
     /// Free-text status, if set.
     pub status: Option<String>,
     /// Presence metadata.
     pub metadata: Vec<MetadataObject>,
-    /// When the user's last connection ended (RFC 3339), if ever.
-    pub last_seen: Option<String>,
+    /// When the user's last connection ended, if ever.
+    pub last_seen: Option<Timestamp>,
 }
 
 #[derive(Deserialize)]
@@ -238,13 +239,13 @@ struct PresenceRow {
     status: String,
     metadata: String,
     #[serde(default)]
-    last_seen: Option<String>,
+    last_seen: Option<Timestamp>,
 }
 
 impl PresenceRow {
     fn into_presence(self) -> Result<StoredPresence, DbError> {
         Ok(StoredPresence {
-            availability: Availability::parse(&self.availability)
+            availability: SetAvailability::parse(&self.availability)
                 .ok_or_else(|| decode("availability"))?,
             status: non_empty(Some(self.status)),
             metadata: metadata_from(Some(&self.metadata))?,
@@ -430,7 +431,7 @@ impl ProfileStore {
     pub async fn set_presence(
         &self,
         handle: &str,
-        availability: Availability,
+        availability: SetAvailability,
         status: Option<&str>,
         metadata: &[MetadataObject],
         now: i64,

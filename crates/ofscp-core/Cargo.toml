@@ -24,6 +24,8 @@ rand_core = { workspace = true }
 jiff = { workspace = true }
 zeroize = { workspace = true }
 
-[dev-dependencies]
+# `Value` for the open parts of the wire types (metadata, settings).
 serde_json = { workspace = true }
+
+[dev-dependencies]
 rand_core = { workspace = true, features = ["getrandom"] }

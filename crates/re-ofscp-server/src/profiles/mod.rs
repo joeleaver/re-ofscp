@@ -20,7 +20,7 @@ use re_ofscp_types::{Actor, Authority};
 
 use crate::db::{Db, DbError};
 use crate::privacy::{Liveness, Policy, RelError, Relationships, Viewer};
-use crate::timefmt::rfc3339;
+use crate::timefmt::timestamp;
 
 pub use store::{ProfileStore, StoredPresence, StoredPrivacy, StoredProfile};
 
@@ -84,11 +84,14 @@ impl Profiles {
     pub fn render(&self, profile: StoredProfile, with_bio: bool) -> UserProfile {
         UserProfile {
             id: user_ref::user_uri(&profile.handle, &self.domain),
-            domain: self.domain.to_string(),
+            domain: self.domain.clone(),
             display_name: Some(profile.display_name),
             avatar: profile.avatar,
             bio: profile.bio.filter(|_| with_bio),
-            updated_at: rfc3339(profile.updated_at),
+            // Guests (§4.8) are not implemented yet.
+            guest: None,
+            expires_at: None,
+            updated_at: timestamp(profile.updated_at),
             metadata: profile.metadata,
             handle: profile.handle,
         }
@@ -126,7 +129,7 @@ impl Profiles {
             },
             Some(p) => Presence {
                 availability: if connected {
-                    p.availability
+                    p.availability.into()
                 } else {
                     Availability::Offline
                 },
@@ -197,11 +200,11 @@ fn policy(privacy: &StoredPrivacy, visibility: re_ofscp_types::profile::Visibili
 /// `privacy` on the wire (§6.6).
 pub fn render_privacy(privacy: StoredPrivacy) -> PrivacySettings {
     PrivacySettings {
-        presence_visibility: privacy.presence,
-        profile_visibility: privacy.profile,
-        membership_visibility: privacy.membership,
-        allow_list: privacy.allow.iter().map(ToString::to_string).collect(),
-        deny_list: privacy.deny.iter().map(ToString::to_string).collect(),
+        presence_visibility: privacy.presence.into(),
+        profile_visibility: privacy.profile.into(),
+        membership_visibility: privacy.membership.into(),
+        allow_list: privacy.allow,
+        deny_list: privacy.deny,
         metadata: privacy.metadata,
     }
 }

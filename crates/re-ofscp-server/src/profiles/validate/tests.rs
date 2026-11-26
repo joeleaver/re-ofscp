@@ -142,7 +142,8 @@ fn no_actor_may_end_up_on_both_lists() {
 fn presence_cannot_be_set_offline_and_status_is_bounded() {
     assert!(presence(json!({"availability": "away", "status": "brb"})).is_ok());
     assert!(presence(json!({"availability": "online"})).is_ok());
-    assert!(presence(json!({"availability": "offline"})).is_err());
+    // `offline` is refused while decoding, before validation (§7.5).
+    assert!(serde_json::from_value::<PresenceUpdate>(json!({"availability": "offline"})).is_err());
     assert!(presence(json!({"availability": "dnd", "status": "a\nb"})).is_err());
     let long = "x".repeat(MAX_STATUS_CHARS + 1);
     assert!(presence(json!({"availability": "dnd", "status": long})).is_err());

@@ -6,14 +6,17 @@ the parts every implementation must get byte-for-byte right, written once.
 - `actor`: actors (`handle@domain`) and provider authorities, with the
   canonical forms of spec §2.2. Identity is always the pair
   `(handle, domain)`; nothing here reduces an actor to a bare handle.
-- `auth`: registration, login and device-key payloads (§4.1–§4.7).
-- `discovery`: the provider discovery document (§3.1, §8.1).
+- `auth`, `discovery`: the sign-in and discovery payloads (§3.1,
+  §4.1–§4.7, §8.1), re-exported from `wire`.
 - `dm`: the typed `DmId` and its derivation (§7.4).
 - `ids`: local ids, object URIs and refs (§2.2).
 - `signing`: the §4.4.2 canonical request string, the content digest, the
   §7.1 WebSocket `authenticate` string, the signing header names, and
   Ed25519 sign/verify; and the client side: `DeviceKey`, `Signer`,
   `generate_nonce` and `signing_timestamp`.
+- `wire`: the REST payloads of the whole spec (users, privacy, contacts,
+  groups, invites, messages, DMs, follows, read markers, notifications,
+  Web Push, discovery, problem details and the `errorCode` registry).
 
 Identifiers deserialize strictly: a non-canonical actor, authority or object
 URI is refused. A field where §2.2 allows converting opts in with
@@ -21,11 +24,17 @@ URI is refused. A field where §2.2 allows converting opts in with
 Timestamps are `jiff::Timestamp`, built without `std` so the crate cannot
 read the clock.
 
+Wire types ignore unknown fields (§2.3). Enumerations a provider answers
+are open: an unknown value is kept in `Other`, and equality goes through
+the wire string. Enumerations only a client sends are closed. Optional
+fields are left out when `None`. See `docs/decisions/0013-ofscp-core-wire.md`.
+
 The crate does no I/O, starts no async runtime, never reads a clock and
 never draws randomness (time and a `rand_core::CryptoRngCore` are passed
 in). It builds for `wasm32-unknown-unknown`. Its tests reproduce
-the spec's signing, WebSocket-auth and `dmId` vectors byte-for-byte, reading
-them from a sibling `../ofscp` checkout (or `OFSCP_SPEC_DIR`).
+the spec's signing, WebSocket-auth and `dmId` vectors byte-for-byte, and
+round-trip every REST sample, reading them from a sibling `../ofscp`
+checkout (or `OFSCP_SPEC_DIR`).
 
 ## Users
 
@@ -45,5 +54,5 @@ deliberately:
 ofscp-core = { git = "https://github.com/joeleaver/re-ofscp", rev = "<commit>" }
 ```
 
-See `docs/decisions/0011-ofscp-core.md` and `0015-ofscp-core-client.md` for why it exists and what belongs
-in it.
+See `docs/decisions/0011-ofscp-core.md`, `0015-ofscp-core-client.md` and
+`0013-ofscp-core-wire.md` for why it exists and what belongs in it.

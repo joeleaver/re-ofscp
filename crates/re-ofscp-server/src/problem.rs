@@ -19,12 +19,14 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use re_ofscp_types::Authority;
-use serde::Serialize;
+use re_ofscp_types::wire::{self, ProblemDetails};
 
 /// Content type of every error response.
 pub const PROBLEM_CONTENT_TYPE: &str = "application/problem+json";
 
-/// One registered error code (§7.3).
+/// One error code this provider answers with: a §7.3 registry code (the
+/// registry itself, with its statuses, is [`wire::ErrorCode`]; a test keeps
+/// [`REGISTRY`] equal to it) or one of its [`EXTENSIONS`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ErrorCode {
     /// The `errorCode` value.
@@ -331,18 +333,6 @@ impl IntoResponse for Problem {
     }
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ProblemJson<'a> {
-    #[serde(rename = "type")]
-    kind: String,
-    title: &'a str,
-    status: u16,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    detail: Option<&'a str>,
-    error_code: &'a str,
-}
-
 /// Where `type` URIs point: `https://{authority}/problems/`.
 #[derive(Debug, Clone)]
 pub struct ProblemBase(Arc<str>);
@@ -451,12 +441,13 @@ fn from_status(status: StatusCode) -> Problem {
 }
 
 fn write_body(base: &ProblemBase, mut res: Response, problem: &Problem) -> Response {
-    let body = ProblemJson {
+    let body = ProblemDetails {
         kind: base.type_uri(problem.code()),
-        title: problem.code.title,
+        title: Some(problem.code.title.to_owned()),
         status: problem.code.status,
-        detail: problem.detail(),
-        error_code: problem.code(),
+        error_code: Some(wire::ErrorCode::from(problem.code())),
+        detail: problem.detail().map(str::to_owned),
+        instance: None,
     };
     let bytes = serde_json::to_vec(&body).unwrap_or_default();
     res.headers_mut().remove(header::CONTENT_LENGTH);
@@ -508,6 +499,19 @@ mod tests {
             assert_eq!(p.status().as_u16(), c.status);
         }
         assert_eq!(Problem::internal().code(), "internal_error");
+    }
+
+    #[test]
+    fn the_registry_is_the_specs() {
+        let ours: Vec<(&str, u16)> = REGISTRY.iter().map(|c| (c.code, c.status)).collect();
+        let spec: Vec<(&str, u16)> = wire::ErrorCode::REGISTRY
+            .iter()
+            .map(|c| (c.as_str(), c.status().unwrap()))
+            .collect();
+        assert_eq!(ours, spec);
+        for c in EXTENSIONS {
+            assert!(!wire::ErrorCode::from(c.code).is_known(), "{}", c.code);
+        }
     }
 
     #[test]
