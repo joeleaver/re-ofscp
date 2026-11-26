@@ -275,6 +275,10 @@ impl ProfileStore {
     /// Apply `changes` to the active account `handle` in one update and
     /// stamp the change time (nothing is written if nothing changes).
     /// `None` if there is no such active account.
+    ///
+    /// The `status == active` guard is not compare-and-set (decision 0012):
+    /// racing a disable, the change may land on the just-disabled account.
+    /// That is harmless, since a disabled account's profile is not served.
     pub async fn update_profile(
         &self,
         handle: &str,

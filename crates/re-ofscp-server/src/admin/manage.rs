@@ -101,7 +101,11 @@ impl Admins {
         let step = totp::verify(&secret, code, now, admin.totp_last_step)
             .ok_or(ManageError::WrongCredential("that code is not valid"))?;
         self.reauth_backoff.succeed(&admin.username);
-        if !self.store.confirm_totp(admin, step).await? {
+        // Claim the code's step, as a sign-in does, so it is accepted once.
+        if !self.store.use_totp_step(&admin.username, step, now).await? {
+            return Err(ManageError::WrongCredential("that code was already used"));
+        }
+        if !self.store.confirm_totp(admin, step, now).await? {
             return Err(ManageError::Conflict(
                 "enrollment changed meanwhile; start again",
             ));
@@ -146,7 +150,7 @@ impl Admins {
             ));
         }
         let hash = self.passwords.hash(new).await?;
-        if !self.store.set_password(admin, &hash).await? {
+        if !self.store.set_password(admin, &hash, now).await? {
             return Err(ManageError::Conflict(
                 "your credentials changed meanwhile; sign in again",
             ));
@@ -270,7 +274,12 @@ impl Admins {
     /// lost device, and end their sessions: they enroll again at next
     /// sign-in. An owner cannot reset their own: a stolen session must not
     /// be able to strip its owner's second factor.
-    pub async fn reset_totp(&self, by: &Admin, username: &str) -> Result<(), ManageError> {
+    pub async fn reset_totp(
+        &self,
+        by: &Admin,
+        username: &str,
+        now: i64,
+    ) -> Result<(), ManageError> {
         if by.username == username {
             return Err(ManageError::Conflict("another owner must reset your TOTP"));
         }
@@ -282,7 +291,7 @@ impl Admins {
         if target.status != status::ACTIVE {
             return Err(ManageError::Conflict("that admin is disabled"));
         }
-        if !self.store.reset_totp(&target).await? {
+        if !self.store.reset_totp(&target, now).await? {
             return Err(ManageError::Conflict(
                 "that admin's credentials changed meanwhile; try again",
             ));

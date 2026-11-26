@@ -58,6 +58,16 @@ type RegistrationInvite {
     used_by: String
 }
 
+// The claim on an invite (docs/decisions/0012): a `RegistrationInvite` is
+// marked used only by the request that created this row, so one invite
+// makes one account however many registrations race. Deleted when a failed
+// registration releases the invite.
+type InviteClaim {
+    token_hash: String @unique
+    handle: String
+    claimed_at: DateTime
+}
+
 // The persistent replay ledger (spec §4.5 "Restarts"; docs/decisions/0001).
 // One row per accepted nonce, written before the request is accepted and
 // purged once expired. `key` is SHA-256 over (signer kind, key id, nonce).
@@ -72,9 +82,14 @@ type ReplayNonce {
     expires_at: DateTime @indexed
 }
 
-// The replay store's clock, persisted when the ledger is purged, so a nonce
-// purged as expired stays expired after a restart even if the wall clock had
-// stepped forward and was corrected (docs/decisions/0001). One row, "replay".
+// The replay store's clock, persisted before the ledger deletes anything, so
+// a nonce purged as expired stays expired after a restart even if the wall
+// clock had stepped forward and was corrected (docs/decisions/0001). The
+// type holds only this clock: one row per persisted value ("replay@{secs}";
+// the first deployments kept a single row, "replay"), and the clock is the
+// highest. Rows are created, never updated, and those below the newest are
+// deleted, so the clock never goes down however writers race
+// (docs/decisions/0012).
 type ReplayClock {
     name: String @unique
     high_water: DateTime
@@ -96,18 +111,34 @@ type Admin {
     totp_secret: String
     // A secret awaiting confirmation (sealed likewise), or empty.
     totp_pending: String
-    // The last accepted TOTP time step; a code is accepted only for a later
-    // step, so each code works once.
+    // The highest TOTP time step used; a code is accepted only for a later
+    // step. Each code works once because using it first claims its step in
+    // `AdminClaim` (docs/decisions/0012); this field also refuses older
+    // steps once their claims are gone.
     totp_last_step: i64
     // Set when another admin chose the password.
     password_change_required: Bool
     // Bumped whenever the admin's credentials change (TOTP confirmed or
     // reset, password changed). Each session records the value it was
-    // opened under and ends once it differs.
+    // opened under and ends once it differs. Only the holder of the
+    // `AdminClaim` on the next value may write it (docs/decisions/0012).
     credential_epoch: i64
     // The admin who created this one, or "setup".
     created_by: String
     created_at: DateTime
+}
+
+// A claim that serializes competing admin writes (docs/decisions/0012):
+// rhypedb's filtered updates are not compare-and-set, but a `@unique` create
+// is, so only the request that creates the claim proceeds. Keys are
+// "totp-step:{username}:{step}" (each TOTP code is accepted once) and
+// "epoch:{username}:{epoch}" (one credential change per epoch). Claims are
+// never updated; expired ones may be taken over, and are purged.
+type AdminClaim {
+    key: String @unique
+    username: String @indexed
+    created_at: DateTime
+    expires_at: DateTime @indexed
 }
 
 // A signed-in admin's session. Only the token's SHA-256 is stored.

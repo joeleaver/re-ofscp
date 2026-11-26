@@ -141,21 +141,22 @@ The spec says a provider SHOULD persist the store, and we do
     correction and a restart would bring back a nonce the purge had already
     deleted. The independent review confirmed that sequence, and
     `forward_clock_step_purge_then_restart_still_refuses_the_replay` pins it.
-- **Expired rows are replaced in place.** A nonce reused after its window
-  (§4.5 allows this) can hit a stale row that hasn't been purged yet.
-  - **How:** that row is overwritten with one conditional update, matching
-    `key` and `expires_at ≤ store clock`. There's never a moment without a
-    row covering the identity; a delete-then-create could lose it to a crash
-    or a failed create.
+- **Expired rows are replaced.** A nonce reused after its window (§4.5
+  allows this) can hit a stale row that hasn't been purged yet.
+  - **How** (superseded by decision 0012, which replaced an in-place
+    guarded overwrite): the clock is persisted to at least the store clock,
+    the expired row is deleted by id, and a new row is created under the
+    same `@unique` key. Losing the row to a crash in between is harmless,
+    as for a purge: the persisted clock keeps the old use expired, and the
+    new use is not accepted until its row exists.
   - **Which clock:** expiries are judged by the store's clock (what
     `record` returns), not a raw wall-clock reading.
-- **The clock only goes up.** The persisted clock is raised by a conditional
-  update (`high_water < X`). Within one process it is never lowered, because
-  purges run one at a time.
-- **Purges and overwrites are serialized.** rhypedb's filtered writes aren't
-  compare-and-set (see 0003), so purge batches and the expired-row overwrite
-  are serialized by an in-process lock. Otherwise a purge could delete a row
-  that was just overwritten with a live nonce. A review found this by
+- **The clock only goes up.** Each persisted value is a new `ReplayClock`
+  row, the clock is the highest, and only rows below it are pruned
+  (decision 0012), so racing writers cannot lower it.
+- **Rows are never updated** (decision 0012), so a purge's filter is exact
+  and can never delete a row just made live. This replaced an in-process
+  lock between purges and overwrites, after a review lost 5 of 900 rows by
   running 8 concurrent re-persists against a purge.
 
 ## Consequences
@@ -165,8 +166,10 @@ The spec says a provider SHOULD persist the store, and we do
   warm-up only applies when the ledger can't be read.
 - **Each signed request costs one write.** That's a rhypedb write on
   loopback, done after verification, so only authenticated requests pay it.
-- **Single instance only.** The in-memory store and the purge lock are
-  still the source of atomicity, so this design doesn't extend to several
-  server processes sharing one database, and that includes two processes
-  briefly overlapping during a deploy. Scaling out would make the ledger's `@unique` create
-  the atomic step, with the memory store as a cache in front of it.
+- **Single instance assumed, but the ledger no longer depends on it.**
+  The in-memory store is the first atomic step. Since decision 0012 the
+  ledger's `@unique` create is atomic on its own, so two processes sharing
+  the database (say, overlapping during a deploy) still record a given
+  nonce once. A nonce reused with a different timestamp inside its window
+  is caught across processes too, by the same key. What stays per process
+  is the warm-up and the memory store's quotas.

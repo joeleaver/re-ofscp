@@ -30,9 +30,10 @@
      handle → `403 invite_required`. The body is identical in every case.
   3. Invalid handle or password → `400`. Handle taken → `409`.
   4. Hash, then claim the invite and create the account. Both run under one
-     in-process lock: the claim is a conditional update
-     (`used == false && expires_at > now`), and a claim whose account can't
-     be created is released. The invite therefore stays usable after a
+     in-process lock: the claim is a `@unique` `InviteClaim` row, and only
+     its creator marks the invite used (decision 0012; a conditional update
+     on `used == false` alone is not atomic in rhypedb). A claim whose
+     account can't be created is released. The invite therefore stays usable after a
      failed registration, and of two registrations with one invite exactly
      one succeeds. After an ambiguous storage error the invite is released
      only if the account is confirmed absent.

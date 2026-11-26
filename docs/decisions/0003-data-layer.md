@@ -21,8 +21,8 @@ Three facts shape the data layer:
      queries run in parallel (`rhypedb-query` executor at c73cc88).
    - **Consequence:** `T.filter(.x <= n).update(...)` can modify, or delete, a
      row that no longer matches by the time it is written. Code that needs a
-     real conditional write has to serialize the competing paths itself, or
-     rely on a `@unique` create.
+     real conditional write must serialize the competing paths with a
+     `@unique` create; decision 0012 states the rule and the pattern.
 3. **One connection serializes its queries,** and after an I/O error the
    client refuses further use (`Closed`). Reconnecting is the caller's job.
 

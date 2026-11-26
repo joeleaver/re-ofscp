@@ -6,9 +6,12 @@
 //! is stored (`RegistrationInvite` in `schema.rhype`), and tokens are never
 //! logged.
 //!
-//! Claiming is one conditional update (`used == false && expires_at > now`)
-//! made while registration is serialized (see `Accounts::register`), so of
-//! two registrations presenting the same invite exactly one claims it.
+//! Claiming creates an `InviteClaim` row, `@unique` on the token hash, and
+//! only its creator marks the invite used (docs/decisions/0012), so of any
+//! number of registrations presenting the same invite exactly one claims
+//! it. Registration is also serialized in-process (see
+//! `Accounts::register`), so a failed registration releases its claim
+//! before anyone else looks.
 
 use std::sync::Arc;
 
@@ -77,6 +80,10 @@ pub struct InviteSummary {
     /// RFC 3339 expiry.
     pub expires_at: String,
 }
+
+/// Any row (only its id matters).
+#[derive(Deserialize)]
+struct Exists {}
 
 #[derive(Deserialize)]
 struct InviteRow {
@@ -164,7 +171,40 @@ impl InviteStore {
 
     /// Mark the invite used by `handle`, if it is still unused and
     /// unexpired at `now`. `false` if it was not (used meanwhile, expired).
+    ///
+    /// The `used == false` guard alone is not compare-and-set (decision
+    /// 0012), so the claim is made first as an `InviteClaim` row, `@unique`
+    /// on the token hash: of any number of registrations presenting the
+    /// invite, in this process or another, only the one that creates it
+    /// goes on to mark the invite used.
     pub async fn claim(&self, token_hash: &str, handle: &str, now: i64) -> Result<bool, DbError> {
+        let create = Ql::new("InviteClaim.create({ token_hash: ")
+            .str(token_hash)
+            .raw(", handle: ")
+            .str(handle)
+            .raw(", claimed_at: ")
+            .unix_seconds(now)
+            .raw(" })");
+        let mut claim_id = None;
+        for _ in 0..3 {
+            match self.db.write_one::<Exists>(&create).await {
+                Ok(row) => {
+                    claim_id = Some(row.id);
+                    break;
+                }
+                Err(DbError::Conflict(_)) => return Ok(false),
+                // Aborted by a concurrent create (nothing written): again,
+                // which then conflicts if that one landed.
+                Err(DbError::Contended(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let Some(claim_id) = claim_id else {
+            return Err(DbError::Contended(
+                "invite claim stayed contended".to_owned(),
+            ));
+        };
+        // Ours alone from here: no other request writes `used: true`.
         let q = Ql::new("RegistrationInvite.filter(.token_hash == ")
             .str(token_hash)
             .raw(" && .used == false && .expires_at > ")
@@ -174,7 +214,14 @@ impl InviteStore {
             .raw(", used_by: ")
             .str(handle)
             .raw(" })");
-        Ok(!self.db.write_rows(&q).await?.into_objects().is_empty())
+        if !self.db.write_rows(&q).await?.into_objects().is_empty() {
+            return Ok(true);
+        }
+        // Unusable (expired, revoked, or used before claims existed): drop
+        // our claim, which guards nothing.
+        let drop = Ql::new("InviteClaim.get(").uint(claim_id).raw(").delete()");
+        self.db.execute(&drop).await?;
+        Ok(false)
     }
 
     /// Up to `limit` invites usable at `now`, in no particular order.
@@ -200,6 +247,10 @@ impl InviteStore {
     /// flight may still complete, but if it fails and releases the claim the
     /// invite stays dead. ([`Revoked::Used`] then says it was already used
     /// or being used.)
+    ///
+    /// The `expires_at > now` guard is not compare-and-set (decision 0012),
+    /// and needs not be: concurrent revocations all write the same expiry,
+    /// and a claim racing a revocation is the in-flight registration above.
     pub async fn revoke(&self, token_hash: &str, now: i64) -> Result<Revoked, DbError> {
         #[derive(Deserialize)]
         struct UsedRow {
@@ -221,12 +272,18 @@ impl InviteStore {
     }
 
     /// Undo [`InviteStore::claim`] after the account could not be created,
-    /// so the invite stays usable.
+    /// so the invite stays usable. Only the claim's holder calls this. The
+    /// invite is marked unused before the claim is dropped, so a new claim
+    /// always finds it unused; the `used == true` guard is idempotent.
     pub async fn release(&self, token_hash: &str) -> Result<(), DbError> {
         let q = Ql::new("RegistrationInvite.filter(.token_hash == ")
             .str(token_hash)
             .raw(" && .used == true).update({ used: false })");
-        self.db.write_rows(&q).await.map(|_| ())
+        self.db.write_rows(&q).await?;
+        let drop = Ql::new("InviteClaim.filter(.token_hash == ")
+            .str(token_hash)
+            .raw(").delete()");
+        self.db.execute(&drop).await
     }
 }
 

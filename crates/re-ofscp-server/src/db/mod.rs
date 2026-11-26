@@ -30,6 +30,10 @@ pub use ql::Ql;
 /// How rhypedb begins the message for a violated `@unique` constraint.
 const UNIQUE_VIOLATION_PREFIX: &str = "engine error: unique constraint violated: ";
 
+/// How rhypedb begins the message for a write naming an object id that does
+/// not exist (`T.get(id).delete()` after someone else deleted it).
+const NOT_FOUND_PREFIX: &str = "engine error: object not found: ";
+
 /// How rhypedb reports a write-write conflict under snapshot isolation:
 /// a concurrent transaction committed a write to the same key first, and
 /// the losing transaction was aborted.
@@ -58,6 +62,10 @@ pub enum DbError {
     /// conflicting object may have been written.
     #[error("write conflict: {0}")]
     Contended(String),
+    /// The query named an object id that does not exist (deleted
+    /// meanwhile). Nothing was written.
+    #[error("object not found: {0}")]
+    NotFound(String),
     /// The server rejected the query (a bug in this code, or a schema
     /// mismatch).
     #[error("query rejected: {0}")]
@@ -79,6 +87,8 @@ impl DbError {
                 // `tests/db.rs` pins this against a real server.
                 if msg.starts_with(UNIQUE_VIOLATION_PREFIX) {
                     Self::Conflict(msg)
+                } else if msg.starts_with(NOT_FOUND_PREFIX) {
+                    Self::NotFound(msg)
                 } else if msg == WRITE_CONFLICT_MESSAGE {
                     Self::Contended(msg)
                 } else {

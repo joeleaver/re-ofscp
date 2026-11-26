@@ -76,7 +76,7 @@ async fn main() -> anyhow::Result<()> {
         state
             .admins
             .clone()
-            .purge_sessions_forever(std::sync::Arc::new(re_ofscp_server::signing::SystemClock)),
+            .purge_expired_forever(std::sync::Arc::new(re_ofscp_server::signing::SystemClock)),
     );
     let app = router(state);
     axum::serve(

@@ -299,6 +299,11 @@ impl AccountStore {
 
     /// Revoke `handle`'s active key `key_id` in one conditional update.
     /// `false` if no such active key belongs to `handle`.
+    ///
+    /// The `revoked == false` guard is not compare-and-set (decision 0012),
+    /// and needs not be: revoking is idempotent and one-way (nothing sets
+    /// `revoked` back), so racing revocations all leave the key revoked. At
+    /// worst two report `true` and `revoked_at` keeps the later time.
     pub async fn revoke_key(
         &self,
         handle: &str,
@@ -316,7 +321,8 @@ impl AccountStore {
     }
 
     /// Revoke every active key of `handle` (account disabled, password
-    /// reset). Returns the revoked key ids.
+    /// reset). Returns the revoked key ids. Idempotent like
+    /// [`AccountStore::revoke_key`], so its guard needs no serializing.
     pub async fn revoke_all_keys(&self, handle: &str, now: i64) -> Result<Vec<String>, StoreError> {
         let q = Ql::new("DeviceKey.filter(.handle == ")
             .str(handle)
