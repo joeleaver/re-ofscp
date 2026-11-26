@@ -180,15 +180,21 @@ async fn failed_handshakes_close_4001() {
         .await;
     assert_eq!(c.closed().await.0, 4001);
 
-    // An authenticate missing its fields.
+    // An authenticate missing its fields is a failed sign-in, answered as
+    // unauthorized before the 4001 (lost-conn/ofscp#27).
     let mut c = p.client("10.0.0.1").await;
     c.event().await;
-    c.command("authenticate", json!({"actor": ALICE})).await;
+    let id = c.command("authenticate", json!({"actor": ALICE})).await;
     let (code, events) = c.closed().await;
     assert_eq!(
-        (code, &events[0]["data"]["code"]),
-        (4001, &json!("bad_request"))
+        (
+            code,
+            &events[0]["data"]["code"],
+            &events[0]["data"]["status"]
+        ),
+        (4001, &json!("unauthorized"), &json!(401))
     );
+    assert_eq!(events[0]["correlationId"], id);
 }
 
 /// An `authenticate` captured from one connection is worthless on another:
@@ -215,6 +221,7 @@ async fn anything_before_authenticate_closes_4001() {
     for frame in [
         json!({"id": "cli_1", "type": "subscribe", "data": {"channels": ["chn_1"]}}).to_string(),
         json!({"id": "cli_1", "type": "ping", "data": {}}).to_string(),
+        json!({"type": "authenticate", "data": {}}).to_string(),
         "not json".to_owned(),
     ] {
         let mut c = p.client("10.0.0.1").await;
@@ -400,6 +407,11 @@ async fn unknown_types_are_ignored_and_unsupported_ones_refused() {
     );
     c.send_raw("[]").await;
     assert_eq!(c.event().await["data"]["code"], "bad_request");
+    // A command with no id is refused with no correlationId to give.
+    c.send_raw(r#"{"type": "ping", "data": {}}"#).await;
+    let e = c.event().await;
+    assert_eq!(e["data"]["code"], "bad_request");
+    assert!(e.get("correlationId").is_none(), "{e}");
     let ping = c.command("ping", json!({})).await;
     assert_eq!(c.event().await["correlationId"], ping);
 }

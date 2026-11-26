@@ -44,6 +44,12 @@ provider.
   - Optional fields are skipped when `None`. `metadata` and `attachments`
     read as empty when absent. A present `null` is refused where it means
     nothing, and means "clear" only in a `Patch<T>` field.
+  - `PresenceUpdate.metadata` is the exception: an `Option`, since its
+    samples use both forms (`presence-update-request` sends `[]`,
+    `ws-presence-set` leaves it out) and each must re-encode as it came.
+    Both mean the same: the update replaces the stored list, so absent
+    clears it. `new_metadata()` gives the list to store (empty when
+    absent); `null` is refused.
   - Identifiers deserialize strictly. No wire field opts into
     `actor::lenient`; `PrivacyUpdate`'s lists stay strings because this
     provider converts them itself (0009, §2.2), with its own bounds and
@@ -86,7 +92,8 @@ provider.
     that messages use them too.
   - The WebSocket samples of #24 (`groups.updated`, the article
     `message.update`) are WebSocket frames, which `wire` does not hold;
-    the roundtrip test skips `ws-*` samples.
+    the roundtrip test skips `ws-*` samples, and `ws_roundtrip.rs` covers
+    them (decision 0016).
 - **The `errorCode` registry** (§7.3, lost-conn/ofscp#17) is
   `wire::ErrorCode`, with `REGISTRY` and the fixed `status()` of each
   code. The server writes its problem bodies as `wire::ProblemDetails`,

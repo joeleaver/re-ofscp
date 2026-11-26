@@ -198,7 +198,7 @@ pub fn presence_update(update: &re_ofscp_types::profile::PresenceUpdate) -> Resu
     if let Some(status) = &update.status {
         text("status", status, MAX_STATUS_CHARS, false)?;
     }
-    metadata("metadata", &update.metadata)
+    metadata("metadata", update.new_metadata())
 }
 
 #[cfg(test)]

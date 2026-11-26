@@ -130,7 +130,7 @@ pub async fn set_presence(
             actor.handle(),
             update.availability,
             update.status.as_deref(),
-            &update.metadata,
+            update.new_metadata(),
             now,
         )
         .await

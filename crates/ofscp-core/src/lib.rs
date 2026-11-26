@@ -14,6 +14,8 @@
 //!   [`signing::DeviceKey`] and [`signing::Signer`].
 //! * [`wire`]: the REST payloads of the whole spec, with open enumerations
 //!   and the `errorCode` registry.
+//! * [`ws`]: the WebSocket envelope, commands, events and close codes
+//!   (§7.1).
 //!
 //! The crate does no I/O, starts no runtime and never reads a clock: time is
 //! always passed in, and so is randomness (a `rand_core::CryptoRngCore`). It
@@ -30,6 +32,7 @@ pub mod dm;
 pub mod ids;
 pub mod signing;
 pub mod wire;
+pub mod ws;
 
 pub use actor::{Actor, Authority, IdentError, is_valid_handle};
 pub use dm::{DmId, DmIdError, dm_id};

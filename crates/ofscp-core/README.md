@@ -17,6 +17,11 @@ the parts every implementation must get byte-for-byte right, written once.
 - `wire`: the REST payloads of the whole spec (users, privacy, contacts,
   groups, invites, messages, DMs, follows, read markers, notifications,
   Web Push, discovery, problem details and the `errorCode` registry).
+- `ws`: the WebSocket protocol (§7.1): the envelope, the commands a client
+  sends, the events a provider sends, and the close codes. An unknown
+  `type` is kept as `Other`. Frames are always sent with `ts` and `data`
+  (the caller supplies `ts`), and read without them. See
+  `docs/decisions/0016-ofscp-core-ws.md`.
 
 Identifiers deserialize strictly: a non-canonical actor, authority or object
 URI is refused. A field where §2.2 allows converting opts in with
@@ -32,9 +37,10 @@ fields are left out when `None`. See `docs/decisions/0013-ofscp-core-wire.md`.
 The crate does no I/O, starts no async runtime, never reads a clock and
 never draws randomness (time and a `rand_core::CryptoRngCore` are passed
 in). It builds for `wasm32-unknown-unknown`. Its tests reproduce
-the spec's signing, WebSocket-auth and `dmId` vectors byte-for-byte, and
-round-trip every REST sample, reading them from a sibling `../ofscp`
-checkout (or `OFSCP_SPEC_DIR`).
+the spec's signing, WebSocket-auth and `dmId` vectors byte-for-byte,
+round-trip every REST sample, and round-trip every WebSocket sample and
+validate the re-encoded frame against the spec's schemas, reading them from
+a sibling `../ofscp` checkout (or `OFSCP_SPEC_DIR`).
 
 ## Users
 
@@ -54,5 +60,6 @@ deliberately:
 ofscp-core = { git = "https://github.com/joeleaver/re-ofscp", rev = "<commit>" }
 ```
 
-See `docs/decisions/0011-ofscp-core.md`, `0015-ofscp-core-client.md` and
-`0013-ofscp-core-wire.md` for why it exists and what belongs in it.
+See `docs/decisions/0011-ofscp-core.md`, `0015-ofscp-core-client.md`,
+`0013-ofscp-core-wire.md` and `0016-ofscp-core-ws.md` for why it exists
+and what belongs in it.
