@@ -44,6 +44,21 @@ async fn main() -> anyhow::Result<()> {
             "replay ledger restore timed out; signed requests get 503 for one skew window"
         ),
     }
+    // Federation stays refused (503, nothing sent) until the policy loads.
+    let load_policy = match tokio::time::timeout(RESTORE_TIMEOUT, state.load_federation()).await {
+        Ok(Ok(())) => {
+            tracing::info!("federation policy loaded");
+            None
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "federation policy unavailable at startup; retrying");
+            Some(tokio::spawn(state.federation.clone().load_until_loaded()))
+        }
+        Err(_) => {
+            tracing::warn!("federation policy load timed out at startup; retrying");
+            Some(tokio::spawn(state.federation.clone().load_until_loaded()))
+        }
+    };
     let purge = tokio::spawn(state.clone().purge_ledger_forever());
     if state.admins.enabled() {
         tracing::info!("admin console enabled");
@@ -71,6 +86,9 @@ async fn main() -> anyhow::Result<()> {
     .with_graceful_shutdown(shutdown_signal())
     .await?;
     purge.abort();
+    if let Some(task) = load_policy {
+        task.abort();
+    }
     purge_sessions.abort();
     Ok(())
 }

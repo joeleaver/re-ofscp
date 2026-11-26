@@ -21,6 +21,10 @@
 //! | `POST /api/admin/admins` | owner | `admin.create` |
 //! | `PATCH /api/admin/admins/{username}` | owner | `admin.update` |
 //! | `POST /api/admin/admins/{username}/totp/reset` | owner | `admin.totp_reset` |
+//! | `GET /api/admin/federation` | read_only | — |
+//! | `PUT /api/admin/federation/mode` | owner | `federation.mode` |
+//! | `POST /api/admin/federation/rules` | operator | `federation.rule_add` |
+//! | `DELETE /api/admin/federation/rules/{id}` | operator | `federation.rule_remove` |
 //!
 //! "Any session" includes sessions still finishing setup; every other
 //! route needs a full one. Refusals (role, CSRF, restricted session) are
@@ -28,10 +32,11 @@
 
 mod accounts;
 mod admins;
+mod federation;
 mod session;
 
 use axum::Router;
-use axum::routing::{delete, get, patch, post};
+use axum::routing::{delete, get, patch, post, put};
 
 use crate::AppState;
 use crate::accounts::PasswordError;
@@ -76,6 +81,13 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/admin/admins/{username}/totp/reset",
             post(admins::reset_totp),
+        )
+        .route("/api/admin/federation", get(federation::get_policy))
+        .route("/api/admin/federation/mode", put(federation::set_mode))
+        .route("/api/admin/federation/rules", post(federation::add_rule))
+        .route(
+            "/api/admin/federation/rules/{id}",
+            delete(federation::remove_rule),
         )
         .layer(axum::extract::DefaultBodyLimit::max(ADMIN_BODY_LIMIT))
 }

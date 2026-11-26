@@ -11,6 +11,7 @@ use re_ofscp_types::{Actor, Authority};
 use time::OffsetDateTime;
 
 use super::*;
+use crate::federation::FederationPolicy;
 use crate::outbound::OutboundConfig;
 use crate::remote_keys::budget::Standing::FirstTime;
 use crate::remote_keys::document::KeySet;
@@ -32,7 +33,13 @@ fn resolver() -> (RemoteKeys, Arc<TestClock>) {
 /// A resolver whose outbound client allows `allow_hosts`.
 fn resolver_allowing(allow_hosts: Vec<Authority>) -> (RemoteKeys, Arc<TestClock>) {
     let clock = Arc::new(TestClock(AtomicI64::new(T)));
-    let client = Arc::new(OutboundClient::new(&OutboundConfig::new(allow_hosts)).unwrap());
+    let client = Arc::new(
+        OutboundClient::new(&OutboundConfig::new(
+            allow_hosts,
+            Arc::new(FederationPolicy::open()),
+        ))
+        .unwrap(),
+    );
     (RemoteKeys::new(client, clock.clone()), clock)
 }
 
@@ -349,7 +356,8 @@ async fn a_busy_target_costs_no_budget_and_no_refetch_interval() {
     let key = SigningKey::from_bytes(&[4; 32]).verifying_key();
     cache(&keys, &alice, key, T + 30);
     // Every slot of the target group is taken (by other subdomains).
-    let cap = OutboundConfig::new(Vec::new()).max_in_flight_per_target;
+    let cap = OutboundConfig::new(Vec::new(), Arc::new(FederationPolicy::open()))
+        .max_in_flight_per_target;
     let held: Vec<_> = (0..cap)
         .map(|i| {
             let host = Authority::parse_canonical(&format!("h{i}.example.com")).unwrap();
@@ -404,7 +412,8 @@ async fn a_budget_refusal_after_reserving_releases_the_in_flight_slot() {
     // refused by the empty bucket. More lookups than there are slots: had
     // a refusal kept its slot, the later ones would be refused as busy
     // (`Retry-After: 5`) instead.
-    let cap = OutboundConfig::new(Vec::new()).max_in_flight_per_target;
+    let cap = OutboundConfig::new(Vec::new(), Arc::new(FederationPolicy::open()))
+        .max_in_flight_per_target;
     for i in 0..2 * cap {
         let c = Requester::new(format!("client{i}"));
         let signer = remote(&format!("u{i:04}@remote.example.com"));
@@ -491,4 +500,49 @@ async fn a_flood_of_negatives_leaves_a_peers_cached_documents_intact() {
         }
     }
     all_cached(&keys, &victims, key).await;
+}
+
+/// The resolver judges the provider before its cache: an unloaded policy
+/// is a temporary refusal and a denial is final, cached key or not
+/// (§4.6 "No fetch is allowed", §8 *Authorization*).
+#[tokio::test]
+async fn the_policy_is_decided_before_the_cache_is_consulted() {
+    use re_ofscp_types::federation::{FederationMode, RuleList, RuleScope};
+
+    use crate::federation::{Rule, Snapshot};
+
+    let policy = Arc::new(FederationPolicy::unloaded());
+    let clock = Arc::new(TestClock(AtomicI64::new(T)));
+    let outbound = OutboundClient::new(&OutboundConfig::new(Vec::new(), policy.clone())).unwrap();
+    let keys = RemoteKeys::new(Arc::new(outbound), clock);
+    let bob = remote("bob@chat.evil.example");
+    cache(
+        &keys,
+        &bob,
+        SigningKey::from_bytes(&[11; 32]).verifying_key(),
+        T + 600,
+    );
+
+    let r = keys.resolve(&bob, "dk_1", false, &client()).await;
+    assert_eq!(retry_after(r), crate::federation::UNKNOWN_RETRY_SECS);
+
+    let mut deny = Snapshot {
+        mode: FederationMode::Denylist,
+        ..Snapshot::default()
+    };
+    deny.deny.insert(Rule {
+        id: "r1".to_owned(),
+        list: RuleList::Deny,
+        scope: RuleScope::Domain,
+        value: "evil.example".to_owned(),
+        note: String::new(),
+        created_by: "test".to_owned(),
+        created_at: 0,
+    });
+    policy.install(deny);
+    let r = keys.resolve(&bob, "dk_1", false, &client()).await;
+    assert!(matches!(r, Err(KeyError::Denied(_))), "{r:?}");
+
+    policy.install(Snapshot::default());
+    assert!(keys.resolve(&bob, "dk_1", false, &client()).await.is_ok());
 }

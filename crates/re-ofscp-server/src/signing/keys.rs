@@ -46,6 +46,11 @@ impl Resolved {
 /// A failure to resolve keys.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum KeyError {
+    /// The federation policy denies the signer's provider: no fetch, and no
+    /// cached key either (§4.6 "No fetch is allowed", §8 *Authorization*).
+    /// §4.5 step 6: `403` `forbidden`.
+    #[error("federation with {0} is denied by policy")]
+    Denied(String),
     /// No key for this signer can ever be checked: our outbound-request
     /// rules refuse to contact its provider (§4.6 "No fetch is allowed",
     /// §8 "Outbound requests"). §4.5 step 6: `401`.

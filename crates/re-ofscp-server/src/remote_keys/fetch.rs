@@ -67,6 +67,9 @@ pub enum Fetched {
     /// key matches. Never cached: the next fetch re-evaluates it from fresh
     /// DNS (lost-conn/ofscp#20).
     Refused(String),
+    /// The federation policy denied the provider while the fetch was being
+    /// prepared (§8 *Authorization*): `403`, whatever the cache holds.
+    Denied(String),
 }
 
 /// Fetch `source` through `reservation` (made by `client` for
@@ -82,6 +85,7 @@ pub async fn fetch(
     let res = match client.get_reserved(reservation).await {
         Ok(res) => res,
         Err(OutboundError::Refused(why)) => return Fetched::Refused(why),
+        Err(OutboundError::Denied(who)) => return Fetched::Denied(who),
         Err(e) => return Fetched::Failed(e.to_string()),
     };
     let now = now();

@@ -16,6 +16,7 @@ use ed25519_dalek::VerifyingKey;
 use http_body_util::{Either, Full};
 use hyper::body::{Body, Frame};
 use hyper::{Request, Response};
+use re_ofscp_server::federation::FederationPolicy;
 use re_ofscp_server::outbound::{OutboundClient, OutboundConfig};
 use re_ofscp_types::Authority;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -167,7 +168,7 @@ impl RemotePeer {
     /// Outbound settings trusting this peer's CA, with `allow` exempt from
     /// the address rule.
     pub fn config(&self, allow: Vec<Authority>) -> OutboundConfig {
-        let mut config = OutboundConfig::new(allow);
+        let mut config = OutboundConfig::new(allow, Arc::new(FederationPolicy::open()));
         config.extra_roots = vec![self.ca_der.clone()];
         config
     }

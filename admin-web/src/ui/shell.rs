@@ -8,6 +8,7 @@ use super::accounts::AccountsScreen;
 use super::admins::AdminsScreen;
 use super::audit::AuditScreen;
 use super::common::ErrorAlert;
+use super::federation::FederationScreen;
 use super::invites::InvitesScreen;
 use super::password::PasswordForm;
 use crate::logic::roles::{SECTIONS, Section, role_label, unavailable_reason};
@@ -95,6 +96,7 @@ pub fn Console() -> NodeHandle {
                         Section::Accounts => AccountsScreen {},
                         Section::Invites => InvitesScreen {},
                         Section::Admins => AdminsScreen {},
+                        Section::Federation => FederationScreen {},
                         Section::Audit => AuditScreen {},
                         Section::Profile => div { class: "panel",
                             Title { order: 3, "Change your password" }
