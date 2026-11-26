@@ -8,6 +8,7 @@
 
 pub mod audit;
 pub mod auth;
+pub mod claims;
 pub mod manage;
 pub mod routes;
 pub mod sessions;
@@ -348,11 +349,11 @@ impl Admins {
                 .ok_or(LoginError::Invalid { known })?;
             let fresh = self
                 .store
-                .use_totp_step(&admin.username, step)
+                .use_totp_step(&admin.username, step, now)
                 .await
                 .map_err(|e| refund_code(LoginError::Internal(e.to_string())))?;
             if !fresh {
-                // A concurrent sign-in used this code (or a later one).
+                // Another sign-in used this code first.
                 return Err(LoginError::Invalid { known });
             }
             self.code_backoff.succeed(&admin.username);
@@ -410,14 +411,19 @@ impl Admins {
         Ok(Some((session, admin)))
     }
 
-    /// Delete ended sessions, every minute, until the task is dropped.
-    pub async fn purge_sessions_forever(self: Arc<Self>, clock: Arc<dyn crate::signing::Clock>) {
+    /// Delete ended sessions and expired claims, every minute, until the
+    /// task is dropped.
+    pub async fn purge_expired_forever(self: Arc<Self>, clock: Arc<dyn crate::signing::Clock>) {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            if let Err(e) = self.sessions.purge(clock.now().unix_timestamp()).await {
+            let now = clock.now().unix_timestamp();
+            if let Err(e) = self.sessions.purge(now).await {
                 tracing::warn!(error = %e, "purging ended admin sessions failed");
+            }
+            if let Err(e) = self.store.purge_claims(now).await {
+                tracing::warn!(error = %e, "purging expired admin claims failed");
             }
         }
     }

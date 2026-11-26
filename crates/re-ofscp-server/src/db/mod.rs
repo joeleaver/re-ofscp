@@ -31,8 +31,9 @@ pub use ql::Ql;
 const UNIQUE_VIOLATION_PREFIX: &str = "engine error: unique constraint violated: ";
 
 /// How rhypedb begins the message for a write to an object that is gone:
-/// a filtered `update` or `delete` matched it on its snapshot, and it was
-/// deleted before the statement's write to it.
+/// either the query named an id that does not exist (`T.get(id).delete()`
+/// after someone else deleted it), or a filtered `update` or `delete`
+/// matched it on its snapshot and it was deleted before the write.
 const OBJECT_NOT_FOUND_PREFIX: &str = "engine error: object not found: ";
 
 /// How rhypedb reports a write-write conflict under snapshot isolation:
@@ -67,8 +68,8 @@ pub enum DbError {
     /// conflicting object may have been written.
     #[error("write conflict: {0}")]
     Contended(String),
-    /// An object the statement matched was deleted before the statement
-    /// wrote it. As for [`Self::Contended`], a statement that writes one
+    /// An object the statement named or matched was deleted before the
+    /// statement wrote it. As for [`Self::Contended`], a statement that writes one
     /// object wrote nothing and may be run again (its filter then no longer
     /// matches the object).
     #[error("object gone: {0}")]

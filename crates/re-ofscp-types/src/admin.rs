@@ -148,7 +148,8 @@ pub struct AccountView {
     pub handle: String,
     /// Display name.
     pub display_name: String,
-    /// `"active"` or `"disabled"`.
+    /// `"active"` or `"disabled"`, or `"pending"` for a registration in
+    /// flight (not an account yet: it cannot sign in).
     pub status: String,
     /// RFC 3339 creation time.
     pub created_at: String,

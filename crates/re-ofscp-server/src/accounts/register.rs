@@ -12,6 +12,7 @@ use super::invites::{
     DEFAULT_INVITE_TTL_SECS, IssuedInvite, MAX_INVITE_TTL_SECS, new_token, token_hash,
 };
 use super::password::check_length;
+use super::pending::{self, Held};
 use super::{Accounts, CreateError, PasswordError, StoreError, User, check_new_handle};
 use crate::db::DbError;
 
@@ -145,14 +146,27 @@ impl Accounts {
             .ok_or(RegisterError::InviteRequired)?;
         let invite = self
             .invites
-            .find_usable(&hash, now)
+            .find_live(&hash, now)
             .await?
             .ok_or(RegisterError::InviteRequired)?;
         if invite.handle.as_deref().is_some_and(|h| h != req.handle) {
             return Err(RegisterError::InviteRequired);
         }
+        // A used invite is spent, except to resume its own handle's
+        // registration when that never made the account (its request
+        // crashed or failed after redeeming; docs/decisions/0012): a
+        // pending registration is not an account, so `find_user` does not
+        // see it. The lookup only answers a caller holding this invite, for
+        // the handle it was redeemed for.
+        if let Some(by) = &invite.used_by
+            && (by != &req.handle || self.store.find_user(&req.handle).await?.is_some())
+        {
+            return Err(RegisterError::InviteRequired);
+        }
 
-        // 2. The handle and password, then hash.
+        // 2. The handle and password, then hash. The lookup only spares a
+        // hash for a handle that is plainly taken: it holds nothing, and
+        // the pending create below is what decides.
         check_new_handle(&req.handle).map_err(RegisterError::Invalid)?;
         check_length(&req.password)?;
         if self.store.find_user(&req.handle).await?.is_some() {
@@ -160,51 +174,28 @@ impl Accounts {
         }
         let password_hash = self.passwords.hash(&req.password).await?;
 
-        // 3. Claim the invite and create the account, serialized, so of two
-        // registrations with one invite exactly one claims it, and a claim
-        // whose account cannot be created is released before anyone else
-        // looks.
-        let _serial = self.registration_lock.lock().await;
-        if !self.invites.claim(&hash, &req.handle, now).await? {
-            return Err(RegisterError::InviteRequired);
-        }
-        match self
+        // 3. Hold the handle (a pending account), redeem the invite for it,
+        // then activate (docs/decisions/0012). The handle is decided first,
+        // so losing it never touches the invite; the redemption is never
+        // undone, so the invite only ever makes the account `req.handle`.
+        // A live pending account of this same invite is joined only with
+        // its password: a retried or duplicated request finishes it, while
+        // another password is a rival, refused until it goes stale. A
+        // failure from here on leaves an invisible pending account that a
+        // retry with this handle, invite and password finishes.
+        let held = match self
             .store
-            .create_user(&req.handle, &req.handle, &password_hash, now)
-            .await
+            .create_pending(&req.handle, &req.handle, &password_hash, &hash, now)
+            .await?
         {
-            Ok(user) => Ok(user),
-            Err(StoreError::HandleTaken) => {
-                self.release_invite(&hash, &req.handle).await;
-                Err(RegisterError::HandleTaken)
-            }
-            Err(e) => {
-                // Ambiguous: the write may have landed (say, a timeout after
-                // the row was stored). Release only if the account is
-                // certainly absent, or one invite could create two accounts.
-                match self.store.find_user(&req.handle).await {
-                    Ok(None) => self.release_invite(&hash, &req.handle).await,
-                    Ok(Some(_)) => {}
-                    Err(check) => tracing::error!(
-                        error = %check,
-                        handle = %req.handle,
-                        "could not tell whether a failed registration stored its account; \
-                         the invite stays spent"
-                    ),
+            Held::Created(p) => p,
+            Held::Joinable(p, stored) => {
+                if !self.passwords.verify(&req.password, Some(&stored)).await? {
+                    return Err(RegisterError::HandleTaken);
                 }
-                Err(e.into())
+                p
             }
-        }
-    }
-
-    async fn release_invite(&self, hash: &str, handle: &str) {
-        if let Err(e) = self.invites.release(hash).await {
-            tracing::error!(
-                error = %e,
-                handle = %handle,
-                "could not release an invite after a failed registration; \
-                 the invite stays spent"
-            );
-        }
+        };
+        pending::complete(&self.store, &self.invites, &hash, &held, now).await
     }
 }

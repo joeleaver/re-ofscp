@@ -224,6 +224,12 @@ impl PolicyStore {
     }
 
     /// Store `mode`: update the setting row, or create it the first time.
+    ///
+    /// The update has no guard to lose (decision 0012): setting the mode is
+    /// last-writer-wins by design, and writers in this process are
+    /// serialized by `write`. Two first-ever writes racing from different
+    /// processes meet at the `@unique` name: one create fails with
+    /// `Conflict`, and that admin retries.
     async fn write_mode(&self, mode: FederationMode, by: &str, now: i64) -> Result<(), DbError> {
         let update = Ql::new("FederationSetting.filter(.name == ")
             .str(SETTING_NAME)

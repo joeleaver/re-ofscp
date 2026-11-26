@@ -23,6 +23,17 @@ type User {
     // The profile's metadata list (§5.4), as a JSON array.
     profile_metadata: String
     profile_updated_at: DateTime
+    // A registration in flight (docs/decisions/0012). Registration creates
+    // the account first, with `pending: true`, so the `@unique` handle is
+    // the first thing it holds; it then redeems the invite and activates the
+    // account by setting `pending` to false (never back). A pending account
+    // is invisible: it cannot log in, has no keys or profile, and the admin
+    // lists mark it. `invite_hash` is the invite it registers with, and
+    // `pending_key` (random) names its `AccountSettlement`. Accounts created
+    // by admins, or before this field existed, have none of the three.
+    pending: Bool
+    invite_hash: String
+    pending_key: String
 }
 
 // A device key (§4.3.2), owned by the account with `handle`. Keys are found
@@ -43,8 +54,9 @@ type DeviceKey {
 
 // An account invite (§4.1.1, lost-conn/ofscp#18): single-use, time-limited,
 // optionally pinned to a handle. Only the token's SHA-256 is stored.
-// `used_at` and `used_by` describe the use only while `used` is true (a
-// registration that fails after claiming the invite releases it again).
+// `used_at` and `used_by` describe the use only while `used` is true
+// (`used` mirrors the `InviteRedemption`; an earlier version could set it
+// back to false).
 type RegistrationInvite {
     token_hash: String @unique
     // The pinned handle, absent when the invite is for any handle.
@@ -56,6 +68,31 @@ type RegistrationInvite {
     used: Bool
     used_at: DateTime
     used_by: String
+}
+
+// The redemption of an invite (docs/decisions/0012): created by the
+// registration holding the (pending) account for `handle`, before it is
+// activated, and never updated, deleted or taken over. The `@unique` create
+// decides which registration redeems a `RegistrationInvite`, and `handle`
+// is the only account it can ever make, so one invite makes at most one
+// account however requests race, stall or crash. `RegistrationInvite.used`
+// mirrors it.
+type InviteRedemption {
+    token_hash: String @unique
+    handle: String
+    redeemed_at: DateTime
+}
+
+// How a pending account was settled (docs/decisions/0012): `key` is its
+// `User.pending_key`, `outcome` is "activate" or "discard". Created once,
+// never updated or deleted. Only the creator of "activate" (or anyone
+// finishing it) clears `User.pending`; only "discard" lets anyone delete the
+// pending row. So a row being activated is never deleted, however late
+// either write lands.
+type AccountSettlement {
+    key: String @unique
+    outcome: String
+    settled_at: DateTime
 }
 
 // The persistent replay ledger (spec §4.5 "Restarts"; docs/decisions/0001).
@@ -72,9 +109,14 @@ type ReplayNonce {
     expires_at: DateTime @indexed
 }
 
-// The replay store's clock, persisted when the ledger is purged, so a nonce
-// purged as expired stays expired after a restart even if the wall clock had
-// stepped forward and was corrected (docs/decisions/0001). One row, "replay".
+// The replay store's clock, persisted before the ledger deletes anything, so
+// a nonce purged as expired stays expired after a restart even if the wall
+// clock had stepped forward and was corrected (docs/decisions/0001). The
+// type holds only this clock: one row per persisted value ("replay@{secs}";
+// the first deployments kept a single row, "replay"), and the clock is the
+// highest. Rows are created, never updated, and those below the newest are
+// deleted, so the clock never goes down however writers race
+// (docs/decisions/0012).
 type ReplayClock {
     name: String @unique
     high_water: DateTime
@@ -96,18 +138,34 @@ type Admin {
     totp_secret: String
     // A secret awaiting confirmation (sealed likewise), or empty.
     totp_pending: String
-    // The last accepted TOTP time step; a code is accepted only for a later
-    // step, so each code works once.
+    // The highest TOTP time step used; a code is accepted only for a later
+    // step. Each code works once because using it first claims its step in
+    // `AdminClaim` (docs/decisions/0012); this field also refuses older
+    // steps once their claims are gone.
     totp_last_step: i64
     // Set when another admin chose the password.
     password_change_required: Bool
     // Bumped whenever the admin's credentials change (TOTP confirmed or
     // reset, password changed). Each session records the value it was
-    // opened under and ends once it differs.
+    // opened under and ends once it differs. Only the holder of the
+    // `AdminClaim` on the next value may write it (docs/decisions/0012).
     credential_epoch: i64
     // The admin who created this one, or "setup".
     created_by: String
     created_at: DateTime
+}
+
+// A claim that serializes competing admin writes (docs/decisions/0012):
+// rhypedb's filtered updates are not compare-and-set, but a `@unique` create
+// is, so only the request that creates the claim proceeds. Keys are
+// "totp-step:{username}:{step}" (each TOTP code is accepted once) and
+// "epoch:{username}:{epoch}" (one credential change per epoch). Claims are
+// never updated; expired ones may be taken over, and are purged.
+type AdminClaim {
+    key: String @unique
+    username: String @indexed
+    created_at: DateTime
+    expires_at: DateTime @indexed
 }
 
 // A signed-in admin's session. Only the token's SHA-256 is stored.
