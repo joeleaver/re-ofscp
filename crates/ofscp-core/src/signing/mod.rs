@@ -7,6 +7,10 @@
 //! Only the pure parts live here. Checking the timestamp against a clock,
 //! the replay store, and finding the signer's key are the verifier's job:
 //! it calls these functions with values it has already obtained.
+//!
+//! The client side, [`Signer`] and [`DeviceKey`], builds on the same
+//! functions. The random generator and the time are passed in, so the crate
+//! needs neither an OS entropy source nor a clock.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
@@ -16,6 +20,10 @@ use sha2::{Digest, Sha256};
 /// The key types these functions take, re-exported so a consumer uses the
 /// same `ed25519-dalek` this crate was built against.
 pub use ed25519_dalek::{SigningKey, VerifyingKey};
+
+mod client;
+
+pub use client::{DeviceKey, Request, SignedHeaders, Signer, generate_nonce, signing_timestamp};
 
 /// Signing header names (§4.4.1, §8.1). Lowercase, as HTTP libraries store
 /// them; header names are case-insensitive on the wire.
@@ -106,24 +114,51 @@ pub struct CanonicalRequest<'a> {
 
 impl CanonicalRequest<'_> {
     /// Render the seven LF-joined lines, with no trailing newline.
-    pub fn render(&self) -> String {
+    ///
+    /// A component that itself contains an LF is refused: it would make the
+    /// string ambiguous (two different inputs, one canonical string), so a
+    /// signature over it could be replayed as a signature over the other.
+    pub fn render(&self) -> Result<String, CanonicalError> {
         let path = if self.path.is_empty() { "/" } else { self.path };
-        [
+        let query = canonical_query(self.query);
+        join_lines(&[
             self.authority,
             &self.method.to_ascii_uppercase(),
             path,
-            &canonical_query(self.query),
+            &query,
             self.timestamp,
             self.nonce,
             self.content_digest,
-        ]
-        .join("\n")
+        ])
     }
 }
 
+/// Why a canonical string could not be built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum CanonicalError {
+    /// A component contains an LF, the line separator (§4.4.2, §7.1).
+    #[error("a signed component contains a line break")]
+    LineBreak,
+}
+
+/// LF-join `lines`, refusing any line that contains an LF itself.
+fn join_lines(lines: &[&str]) -> Result<String, CanonicalError> {
+    if lines.iter().any(|line| line.contains('\n')) {
+        return Err(CanonicalError::LineBreak);
+    }
+    Ok(lines.join("\n"))
+}
+
 /// The four-line WebSocket `authenticate` canonical string (§7.1).
-pub fn ws_canonical_string(authority: &str, challenge_nonce: &str, timestamp: &str) -> String {
-    [authority, WS_AUTH_SEPARATOR, challenge_nonce, timestamp].join("\n")
+///
+/// Refuses a component containing an LF, as [`CanonicalRequest::render`]
+/// does.
+pub fn ws_canonical_string(
+    authority: &str,
+    challenge_nonce: &str,
+    timestamp: &str,
+) -> Result<String, CanonicalError> {
+    join_lines(&[authority, WS_AUTH_SEPARATOR, challenge_nonce, timestamp])
 }
 
 /// `base64(Ed25519_sign(key, utf8(canonical)))`.
@@ -202,6 +237,29 @@ mod tests {
         );
     }
 
+    /// The raw key inside the spec's negative SPKI sample
+    /// (`device-key-registration.spki.invalid.json`).
+    const RAW_KEY: &str = "Gb9ECWmYfAJ6tS1j/Mdc6rjxPXK5+f6tcyLn4Bv7B1M=";
+
+    /// §4.3.2 (spec #28): the key is padded standard base64. The same key
+    /// without its `=` is refused, not quietly accepted.
+    #[test]
+    fn unpadded_public_key_is_refused() {
+        assert!(decode_public_key(RAW_KEY).is_ok());
+        assert_eq!(
+            decode_public_key(RAW_KEY.trim_end_matches('=')),
+            Err(PublicKeyError::Base64)
+        );
+    }
+
+    /// §4.3.2 (spec #28): the key is the raw 32 bytes, so a DER
+    /// `SubjectPublicKeyInfo` wrapping (44 bytes) is refused.
+    #[test]
+    fn spki_public_key_is_refused() {
+        let spki = "MCowBQYDK2VwAyEAGb9ECWmYfAJ6tS1j/Mdc6rjxPXK5+f6tcyLn4Bv7B1M=";
+        assert_eq!(decode_public_key(spki), Err(PublicKeyError::Length));
+    }
+
     #[test]
     fn sign_verify_round_trip() {
         let key = SigningKey::from_bytes(&[9; 32]);
@@ -220,8 +278,48 @@ mod tests {
     fn ws_string_has_four_lines() {
         assert_eq!(
             ws_canonical_string("a.example", "n", "t"),
-            "a.example\nofscp-ws-authenticate\nn\nt"
+            Ok("a.example\nofscp-ws-authenticate\nn\nt".to_owned())
         );
+    }
+
+    /// An LF inside a component would let two inputs share one canonical
+    /// string, so both builders refuse it.
+    #[test]
+    fn line_breaks_in_components_are_refused() {
+        assert_eq!(
+            ws_canonical_string("a.example", "n", "2026-01-01T00:00:00Z\nX"),
+            Err(CanonicalError::LineBreak)
+        );
+        let base = CanonicalRequest {
+            authority: "a.example",
+            method: "GET",
+            path: "/x",
+            query: None,
+            timestamp: "t",
+            nonce: "n",
+            content_digest: EMPTY_BODY_DIGEST,
+        };
+        assert!(base.render().is_ok());
+        for bad in [
+            CanonicalRequest {
+                path: "/x\nGET",
+                ..base
+            },
+            CanonicalRequest {
+                nonce: "n\n",
+                ..base
+            },
+            CanonicalRequest {
+                query: Some("a=1\n"),
+                ..base
+            },
+            CanonicalRequest {
+                method: "GET\n",
+                ..base
+            },
+        ] {
+            assert_eq!(bad.render(), Err(CanonicalError::LineBreak));
+        }
     }
 
     #[test]
@@ -237,7 +335,7 @@ mod tests {
         };
         assert_eq!(
             c.render(),
-            format!("a.example\nGET\n/\n\nt\nn\n{EMPTY_BODY_DIGEST}")
+            Ok(format!("a.example\nGET\n/\n\nt\nn\n{EMPTY_BODY_DIGEST}"))
         );
     }
 }

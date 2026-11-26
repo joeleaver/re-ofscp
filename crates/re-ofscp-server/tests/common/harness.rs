@@ -229,7 +229,8 @@ impl Req {
             nonce: &self.nonce,
             content_digest: &digest,
         }
-        .render();
+        .render()
+        .unwrap();
         let signature = self
             .signature
             .clone()
@@ -328,7 +329,8 @@ pub fn signed_as(
         nonce: &nonce,
         content_digest: &digest,
     }
-    .render();
+    .render()
+    .unwrap();
     Request::builder()
         .method(method)
         .uri(path)

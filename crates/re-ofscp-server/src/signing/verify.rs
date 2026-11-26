@@ -380,7 +380,8 @@ impl Verifier {
             nonce: &pre.nonce,
             content_digest: &pre.digest,
         }
-        .render();
+        .render()
+        .map_err(|_| VerifyError::Headers("a signed component contains a line break"))?;
         self.resolve_and_check(
             &pre.signer,
             &pre.key_id,
