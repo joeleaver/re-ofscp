@@ -11,12 +11,15 @@
 //! `n + 1` and writes only if it created the claim. Every other edit read
 //! at `n` loses the claim, reads again and edits the newer revision.
 //!
-//! A claim is a lease, stamped with the clock when it is created: its
-//! holder writes once, at once (one statement, never retried, which the
-//! data layer times out after 10 s), so a claim that outlived
-//! [`LEASE_SECS`] unused belongs to a writer that died, and the next edit
-//! takes it over. Claims are never updated, so a filter over them is exact;
-//! [`GroupStore::purge_claims`] deletes the expired ones.
+//! A claim is a lease, stamped with the clock when it is created. Its
+//! holder writes once, at once, in one statement that is never retried.
+//! A claim that outlived [`LEASE_SECS`] unused is taken to belong to a
+//! writer that died, and the next edit takes it over. This assumes that
+//! the server applies the holder's statement within the lease. The data
+//! layer's 10 s timeout only stops the client waiting; it does not cancel
+//! the statement on the server (docs/decisions/0012). Claims are never
+//! updated, so a filter over them is exact; [`GroupStore::purge_claims`]
+//! deletes the expired ones.
 
 use serde::Deserialize;
 use time::OffsetDateTime;
@@ -26,8 +29,9 @@ use super::store::GroupStore;
 use crate::db::{DbError, Ql};
 
 /// How long a claim is held. Its holder writes in one statement right after
-/// claiming, and the data layer gives up on that statement after 10 s; past
-/// this the claim's writer is gone and the revision is free again.
+/// claiming, so a claim past this is taken to be a dead writer's, and its
+/// revision is free again. The data layer stops waiting for the statement
+/// after 10 s; the server is assumed to apply it well within this.
 pub const LEASE_SECS: i64 = 120;
 
 /// Claims deleted per purge statement, and statements per purge run.

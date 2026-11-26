@@ -123,7 +123,8 @@ where
 
 impl GroupStore {
     /// The one write a revision claim's holder makes. Run once, never
-    /// retried, so the claim's lease covers it (claims.rs): a write that
+    /// retried, so that it falls within the claim's lease, assuming the
+    /// server applies it promptly (claims.rs). A write that
     /// lost a conflict, or met its object deleted, wrote nothing and
     /// returns no rows, and the edit retries from a fresh read.
     async fn claimed_write(&self, q: &Ql) -> Result<rhypedb_client::QueryResult, DbError> {
@@ -445,13 +446,18 @@ impl GroupStore {
         Ok(channels)
     }
 
-    /// How many channels `group_id` has, pending ones included (so the
-    /// limit is conservative), counting at most `cap`.
-    pub async fn channel_count(&self, group_id: &str, cap: usize) -> Result<usize, DbError> {
+    /// How many channels `group_id` has, pending and deleting ones
+    /// included (so the limit is conservative).
+    ///
+    /// Read whole, with no `.limit`: rhypedb c73cc88 cuts a limited scan of
+    /// an index after N keys *including deleted rows'*, so a limited count
+    /// comes back short once channels have been deleted and would let
+    /// creates past the limit (docs/decisions/0010). The read is bounded
+    /// anyway: the limit itself keeps a group near `MAX_CHANNELS_PER_GROUP`
+    /// rows, plus creates in flight that take theirs back.
+    pub async fn channel_count(&self, group_id: &str) -> Result<usize, DbError> {
         let q = Ql::new("Channel.filter(.group_id == ")
             .str(group_id)
-            .raw(").limit(")
-            .uint(cap as u64)
             .raw(")");
         Ok(self.db.fetch::<serde::de::IgnoredAny>(&q).await?.len())
     }

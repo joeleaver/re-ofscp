@@ -78,6 +78,34 @@ async fn concurrent_creates_at_the_limit_never_pass_it() {
 }
 
 #[tokio::test]
+async fn deleted_channels_never_make_room_past_the_limit() {
+    // rhypedb c73cc88 counts deleted rows toward a limited index scan, so a
+    // limited count would come back short after deletes (decision 0010).
+    let env = env().await;
+    let alice = local(&env, "alice").await;
+    let gid = id(&create_group(&env, &alice, group_body("G", "group")).await);
+    let path = format!("/api/groups/{gid}/channels");
+    for _ in 0..MAX_CHANNELS_PER_GROUP - 1 {
+        create_channel(&env, &alice, &gid, json!({"type": "text"})).await;
+    }
+    for _ in 0..3 {
+        let cid = id(&create_channel(&env, &alice, &gid, json!({"type": "text"})).await);
+        let (s, p) = call(&env, Some(&alice), "DELETE", &format!("{path}/{cid}"), None).await;
+        assert_eq!(s, StatusCode::NO_CONTENT, "{p}");
+    }
+    // One place is left: the first create takes it, the second is refused.
+    create_channel(&env, &alice, &gid, json!({"type": "text"})).await;
+    let more = Some(json!({"type": "text"}));
+    let (s, p) = call(&env, Some(&alice), "POST", &path, more).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{p}");
+    let (_, list) = call(&env, Some(&alice), "GET", &path, None).await;
+    assert_eq!(
+        list["items"].as_array().unwrap().len(),
+        MAX_CHANNELS_PER_GROUP
+    );
+}
+
+#[tokio::test]
 async fn an_owner_holds_a_bounded_number_of_groups() {
     let env = env().await;
     let alice = local(&env, "alice").await;

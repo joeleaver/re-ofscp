@@ -29,9 +29,10 @@ const UPDATE_ATTEMPTS: usize = 5;
 /// The sweeper deletes pending rows older than [`PENDING_TTL`], and its
 /// delete is not conditional at the moment of writing (claims.rs), so an
 /// expiry that saw the row pending could delete it just after activation.
-/// Activating only well inside the TTL leaves that impossible but for a
-/// stall of minutes inside one statement, which the data layer's 10 s
-/// timeout rules out; a writer slower than this takes its row back.
+/// Activating only well inside the TTL leaves that impossible but for the
+/// server stalling one statement for minutes. The data layer's 10 s
+/// timeout only stops the client waiting and does not rule that out
+/// (docs/decisions/0012). A writer slower than this takes its row back.
 const ACTIVATE_WITHIN: Duration = PENDING_TTL.saturating_sub(Duration::from_secs(300));
 const _: () = assert!(
     PENDING_TTL.as_secs() >= 2 * 300,
@@ -405,13 +406,10 @@ impl Groups {
         Ok(())
     }
 
-    /// How many channels `group_id` has, counting at most one past the
-    /// limit.
+    /// How many channels `group_id` has (read whole; see
+    /// `GroupStore::channel_count`).
     async fn channel_count(&self, group_id: &str) -> Result<usize, GroupError> {
-        Ok(self
-            .store
-            .channel_count(group_id, MAX_CHANNELS_PER_GROUP + 1)
-            .await?)
+        Ok(self.store.channel_count(group_id).await?)
     }
 
     fn channel_changed(&self, group_id: &str, channel_id: &str) {

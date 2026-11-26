@@ -146,14 +146,19 @@ must be correct without it. The rule, per guard:
   refuse a stale read. A claim is a lease of `LEASE_SECS` (120 s),
   stamped with the clock when it is claimed (not the request's time,
   which earlier attempts may have aged). Its holder writes once, right
-  away, in one statement that is never retried and that the data layer
-  times out after 10 s; a write that loses a conflict wrote nothing, and
-  the edit starts over. A claim that outlived its lease unused belongs to
-  a dead writer, and the next edit takes it over (by deleting exactly that
+  away, in one statement that is never retried; a write that loses a
+  conflict wrote nothing, and the edit starts over. A claim that outlived
+  its lease unused is taken to belong to a dead writer, and the next edit takes it over (by deleting exactly that
   row, by id, then claiming again; a row already gone is fine). The
-  sweeper deletes expired claims. The residual is a holder stalled for
-  over 110 s between claiming and its write reaching the server, which
-  the timeouts rule out.
+  sweeper deletes expired claims. The design assumes that rhypedb applies
+  the holder's one statement within the lease. The 10 s data-layer
+  timeout does not enforce that: it is only the client socket's
+  read/write timeout. It stops the client waiting, but it does not cancel
+  the statement on the server. If the server sat on that statement for
+  over 120 s, another edit could take the claim over and write the same
+  revision, and the late statement would then undo that edit. Without
+  compare-and-set nothing on this side can close that gap. It needs a
+  server-side statement deadline or a guarded write.
 - **Status guards need no claim.** Every status transition is one-way
   (`pending → active`, `active → deleting`), deletes are final, and no edit
   writes `status`. So a guarded update that runs after its guard stopped
@@ -225,6 +230,16 @@ creates therefore never leave more than the limit, though a burst at the
 limit may all be refused. A channel listing fetches up to twice the limit,
 so channels about to be taken back cannot crowd real ones out.
 
+The channel count is read whole, with no `.limit`. On rhypedb c73cc88, a
+filter on one indexed field followed by `.limit(N)` is pushed down to an
+index scan, and that scan stops after N keys, *deleted rows included*.
+So a limited count comes back short by the number of recently deleted
+channels and lets creates past the limit. The test
+`deleted_channels_never_make_room_past_the_limit` reproduces this every
+time it runs. Reading the count whole is also bounded, because the limit
+keeps a group near 200 rows. Filters that `AND` (or `OR`) two fields
+don't push a limit down, so the listings and the owner count are exact.
+
 ### Requests
 
 - A request field set to `null` is refused (`400`); absent means "leave
@@ -266,5 +281,10 @@ closed: a group left out is neither shared nor listed.
   announces its change) and `access::join_gate`.
 - Switch the references to rhypedb links with `@on_delete(cascade)` once
   the pinned rhypedb supports linking on create.
+- rhypedb's limited index scan must count only live rows, as its type
+  scan already does. Until it does, a limited single-field filter can
+  return short. That affects other modules' limited reads too. For groups
+  it only affects liveness: the sweeper's batches can come back short, and
+  a purge run can stop early and leave the rest to the next run.
 - Once the managed rhypedb re-checks filters at write time, the claims can
   go. Until then they are the design, not a stopgap.
