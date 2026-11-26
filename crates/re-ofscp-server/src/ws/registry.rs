@@ -115,9 +115,10 @@ pub struct Limits {
     /// Subscriptions on one connection. Only channels the actor can read
     /// count towards it (§7.1 *Subscriptions*), so [`Registry::grant`]
     /// applies it, after the access checks. [`Registry::hold_new`] also
-    /// refuses, before any check, a `subscribe` naming more new channels
-    /// than the cap has room for: they could not fit even if all were
-    /// readable.
+    /// refuses, before any check, a `subscribe` naming more distinct
+    /// channels than the whole cap (lost-conn/ofscp#29): they could not fit
+    /// even on an empty connection. A list within the cap but beyond the
+    /// room left is let through, since only its readable channels count.
     pub max_subscriptions: usize,
     /// Events queued for one connection.
     pub outbound_queue: usize,
