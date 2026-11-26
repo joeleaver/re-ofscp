@@ -30,6 +30,18 @@ pub use ql::Ql;
 /// How rhypedb begins the message for a violated `@unique` constraint.
 const UNIQUE_VIOLATION_PREFIX: &str = "engine error: unique constraint violated: ";
 
+/// How rhypedb reports a write-write conflict under snapshot isolation:
+/// a concurrent transaction committed a write to the same key first, and
+/// the losing transaction was aborted.
+///
+/// rhypedb runs each object's write in its own transaction (a filtered
+/// `update` evaluates the filter on a snapshot, then updates each matching
+/// object separately), so a statement that touches one object is aborted
+/// whole and may be run again, but one that touches several may have
+/// applied to some before the conflict. Retrying is therefore the
+/// caller's decision (see [`DbError::Contended`]).
+const WRITE_CONFLICT_MESSAGE: &str = "engine error: write conflict";
+
 /// A data-layer failure.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DbError {
@@ -40,6 +52,12 @@ pub enum DbError {
     /// A `@unique` constraint rejected the write.
     #[error("unique constraint violated: {0}")]
     Conflict(String),
+    /// A concurrent write to the same object won, and this one was aborted.
+    /// For a statement that writes one object, nothing was written and it
+    /// may be run again; for one that writes several, those before the
+    /// conflicting object may have been written.
+    #[error("write conflict: {0}")]
+    Contended(String),
     /// The server rejected the query (a bug in this code, or a schema
     /// mismatch).
     #[error("query rejected: {0}")]
@@ -61,6 +79,8 @@ impl DbError {
                 // `tests/db.rs` pins this against a real server.
                 if msg.starts_with(UNIQUE_VIOLATION_PREFIX) {
                     Self::Conflict(msg)
+                } else if msg == WRITE_CONFLICT_MESSAGE {
+                    Self::Contended(msg)
                 } else {
                     Self::Query(msg)
                 }
