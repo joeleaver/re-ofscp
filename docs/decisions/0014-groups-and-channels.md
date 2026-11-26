@@ -59,8 +59,10 @@ for them.
 
 `Groups` broadcasts an `AccessChange` (group, channel, or one actor's
 membership) after every change that can alter access: a group or channel
-update or deletion, and adding, re-roling or removing a member. A live
-surface (the WebSocket core, through `ws::follow_groups` and
+update or deletion, and adding, re-roling or removing a member, including
+when the write returns an error (it may have committed). A live
+surface (the WebSocket core, through `ws::follow_groups`, which
+`AppStateBuilder::build` starts, and
 `ws::channels::GroupTopics`; decision 0010) subscribes, re-runs
 `can_read_channel` for
 what it holds, and ends a subscription with

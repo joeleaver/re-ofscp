@@ -80,11 +80,6 @@ async fn main() -> anyhow::Result<()> {
     );
     let sweep_groups = tokio::spawn(state.groups.clone().sweep_forever());
     let ws_recheck = tokio::spawn(state.ws.clone().recheck_forever());
-    // Subscriptions whose access a group change revokes end at once.
-    let ws_follow = tokio::spawn(re_ofscp_server::ws::follow_groups(
-        state.ws.clone(),
-        state.groups.clone(),
-    ));
     let hub = state.ws.clone();
     let app = router(state);
     axum::serve(
@@ -98,7 +93,6 @@ async fn main() -> anyhow::Result<()> {
     })
     .await?;
     ws_recheck.abort();
-    ws_follow.abort();
     purge.abort();
     if let Some(task) = load_policy {
         task.abort();

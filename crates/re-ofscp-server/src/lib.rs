@@ -91,6 +91,10 @@ pub enum BuildError {
     Outbound(#[from] outbound::BuildError),
     #[error("preparing the discovery document: {0}")]
     Discovery(#[from] discovery::PublishError),
+    /// The state starts background work (the WebSocket hub's group
+    /// follower), so it must be built inside a Tokio runtime.
+    #[error("the state must be built inside a Tokio runtime")]
+    NoRuntime,
 }
 
 /// Builds an [`AppState`]. Defaults: the wall clock, local keys from the
@@ -197,9 +201,16 @@ impl AppStateBuilder {
 
     /// Build the state. The replay store starts in its restart warm-up;
     /// [`AppState::restore_replay`] ends it once the ledger is reloaded.
-    /// Fails if the outbound HTTP client cannot be set up or the discovery
-    /// document cannot be serialized.
+    /// Fails if the outbound HTTP client cannot be set up, the discovery
+    /// document cannot be serialized, or it is called outside a Tokio
+    /// runtime.
+    ///
+    /// It starts, on the current runtime, the task that turns group access
+    /// changes into WebSocket re-checks (`ws::follow_groups`), so every
+    /// state revokes live subscriptions at once; the task ends when the
+    /// state is dropped.
     pub fn build(self) -> Result<AppState, BuildError> {
+        let runtime = tokio::runtime::Handle::try_current().map_err(|_| BuildError::NoRuntime)?;
         let config = self.config;
         let discovery = Arc::new(discovery::Published::new(&config)?);
         let outbound = match self.outbound {
@@ -276,6 +287,8 @@ impl AppStateBuilder {
             }),
         ));
         accounts.on_revocation(ws.clone());
+        // Subscriptions whose access a group change revokes end at once.
+        ws::follow_groups(&runtime, &ws, &groups);
         let liveness = self.liveness.unwrap_or_else(|| ws.clone());
         let profiles = Arc::new(Profiles::new(
             config.domain.clone(),

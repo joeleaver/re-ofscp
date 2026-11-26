@@ -37,7 +37,8 @@ use axum::response::{IntoResponse, Response};
 use re_ofscp_types::{Actor, Authority};
 use serde_json::Value;
 
-pub use self::channels::{GroupTopics, follow_groups};
+pub use self::channels::GroupTopics;
+pub(crate) use self::channels::follow_groups;
 use self::protocol::{Close, close};
 pub use self::registry::{AccessChange, Admitted, ConnId, Limits, Refused, Registry};
 pub use self::seams::{
@@ -196,6 +197,11 @@ impl Hub {
     /// Fan out an event of type `kind` with `data` to the subscribers of
     /// `topic` whose `include` admits it. No `correlationId`: no command
     /// of theirs caused it.
+    ///
+    /// It does not check access itself: a subscription a just-committed
+    /// change revoked stays live until the group follower holds it. Its
+    /// first production caller must close that window first (decision
+    /// 0010, "The window between a commit and its hold").
     pub fn publish(&self, topic: &str, kind: &str, data: Value) {
         let text: Arc<str> = protocol::event(kind, None, data, self.now()).into();
         self.registry.publish(topic, kind, &text);

@@ -349,3 +349,34 @@ async fn a_remote_member_is_not_its_local_namesake() {
         .unwrap();
     revoked(&env, &mut theirs, &cid).await;
 }
+
+#[tokio::test]
+async fn removing_a_remote_member_spares_its_local_namesake() {
+    let bob = remote("bob", "providerb.com");
+    let env = env_with_remotes(&[&bob]).await;
+    let owner = local(&env, "olive").await;
+    let local_bob = local(&env, "bob").await;
+    let (gid, cid) = group_with(&env, &owner, "group", text("group")).await;
+    join(&env, &gid, &bob, "member").await;
+    join(&env, &gid, &local_bob, "member").await;
+
+    let mut theirs = connect(&env, &bob).await;
+    subscribed(&mut theirs, &cid).await;
+    let mut ours = connect(&env, &local_bob).await;
+    subscribed(&mut ours, &cid).await;
+
+    env.state
+        .groups
+        .remove_member(&gid, &bob.id())
+        .await
+        .unwrap();
+    // Only `bob@providerb.com` loses access; `revoked`'s publish reaches
+    // local bob, who is neither held nor ended.
+    revoked(&env, &mut theirs, &cid).await;
+    let e = ours.event().await;
+    assert_eq!(e["data"], json!({"n": 1}), "{e}");
+    still_live(&env, &mut ours, &cid).await;
+    // And local bob is still a member as far as a fresh check goes.
+    let mut again = connect(&env, &local_bob).await;
+    subscribed(&mut again, &cid).await;
+}

@@ -188,7 +188,7 @@ Disabling an account closes all of its connections with `4003`.
 - `unsubscribe` acks every requested channel, with no `reason`.
 - **Re-checks.** The subsystem that changed access calls
   `Hub::access_changed(Topics | Actor | All)`. For groups,
-  `ws::follow_groups` (spawned by `main`) turns each
+  `ws::follow_groups` turns each
   `Groups::subscribe_changes` event into one:
   - `Channel` → `Topics([channel])`;
   - `Member` → `Actor(actor)`;
@@ -196,6 +196,17 @@ Disabling an account closes all of its connections with `4003`.
     (`GroupStore::channel_ids`, unlimited; bounded by the channel limit).
     If that read fails, `All`.
   - A lagged receiver lost changes it cannot name, so `All`.
+
+  `AppStateBuilder::build` starts the follower where it assembles the hub
+  and the groups, so no state can be built without immediate revocation
+  (building therefore needs a Tokio runtime). It holds neither alive and
+  ends when the state is dropped.
+
+  A group write announces its change whether it returned `Ok` or `Err`:
+  a write can commit and still fail to report it (the connection drops
+  after the commit), and a spurious announcement costs only a re-check.
+  Only a write known to have changed nothing (a filtered update that
+  matched no row, `set_role` on a non-member) goes unannounced.
 
   Deleting a group purges the channel rows that `Group` would be listed
   from, so `delete_group` also announces `Channel` for each of its
@@ -230,6 +241,32 @@ Disabling an account closes all of its connections with `4003`.
   A message may arrive twice across a resume, so clients dedupe by message
   id. The default `NoTimeline` truncates every resume, so clients backfill
   through REST history.
+
+- **The window between a commit and its hold (a requirement on
+  publishing).** A change takes effect in the database before any
+  subscription it concerns is held. In between, the announcement crosses
+  the broadcast channel to the follower task, and for a `Group` change
+  the follower also reads the group's channel ids from the database;
+  only then does `Hub::access_changed` hold the matching subscriptions.
+  An event published to a topic in that window reaches a subscriber whose
+  access the change has already revoked. Nothing publishes yet
+  (`Hub::publish` has no production caller), so this is latent. The PR
+  that first publishes (the message log) must close it, by one of:
+  - checking access at publish: the publisher re-runs the
+    `TopicAuthorizer` (or the effective-read-access rule) per subscriber
+    of the topic, or holds the topic's subscriptions and lets the re-check
+    release them, rather than fanning out blindly; or
+  - holding synchronously: the groups write path holds the concerned
+    subscriptions before the write returns, which needs subscriptions
+    tagged with their group (so a `Group` change needs no database read)
+    and the hold taken inside `Groups::changed`, not after the broadcast;
+    or
+  - a barrier: `Groups` numbers its changes, the follower records the last
+    one it has applied, and publishing waits until the follower has caught
+    up with every change announced before the message was committed.
+
+  Whichever it is, a test must publish between a revoking commit and the
+  follower's hold (with the follower paused) and see nothing delivered.
 
 ### Presence
 
