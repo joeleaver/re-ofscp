@@ -16,6 +16,7 @@ path = "src/main.rs"
 path = "src/lib.rs"
 
 [dependencies]
+ofscp-core = { workspace = true }
 re-ofscp-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

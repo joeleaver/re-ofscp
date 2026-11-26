@@ -1197,6 +1197,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ofscp-core"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "ed25519-dalek",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
 name = "oid-registry"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1406,6 +1418,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "jsonschema",
+ "ofscp-core",
  "psl",
  "rcgen",
  "re-ofscp-types",
@@ -1435,9 +1448,9 @@ dependencies = [
 name = "re-ofscp-types"
 version = "0.1.0"
 dependencies = [
+ "ofscp-core",
  "serde",
  "serde_json",
- "sha2",
 ]
 
 [[package]]

@@ -48,7 +48,8 @@ Each question should include:
 ## Layout
 
 - `crates/re-ofscp-server` is the provider. `lib.rs` holds the router and everything testable; `main.rs` only wires config, logging and shutdown. The binary is `re-ofscp`, and jkbase's Rust buildpack launches it.
-- `crates/re-ofscp-types` holds wire types shared with the admin UI. **It must have no I/O and no tokio**, because it also compiles for `wasm32-unknown-unknown`.
+- `crates/ofscp-core` is the shared OFSCP protocol core: actors and authorities, auth/device-key and discovery payloads, `dmId`, and the byte-exact signing primitives. Postrinch's OFSCP client pins it as a git dependency, so treat its public API as published. **No I/O, no tokio, no clock reads (pass time in), wasm-safe.** Pure protocol code goes here; anything needing server state (replay store, clock, key lookup, policy) stays in the server. See `docs/decisions/0011-ofscp-core.md`.
+- `crates/re-ofscp-types` holds the re-ofscp-specific wire types shared with the admin UI (admin API, federation policy, `Health`), and re-exports `ofscp-core`'s modules at their old paths. **It must have no I/O and no tokio**, because it also compiles for `wasm32-unknown-unknown`.
 - `admin-web` is the rinch admin UI. It is **not** a root-workspace member: it has its own empty `[workspace]` and is built with `trunk`. jkbase builds it with `context = "."` so it can path-depend on `crates/re-ofscp-types`. It is served under `/admin` (`public_url = "/admin/"`).
 - `schema.rhype` is the rhypedb schema; jkbase applies it on deploy. `tests/scaffold.rs` parses it with rhypedb's own parser, so a bad schema fails CI rather than the deploy.
 - **Data layer:** `crates/re-ofscp-server/src/db/` (see `docs/decisions/0003-data-layer.md`). Build every query with `db::Ql`, which only takes static text plus escaped typed literals. **Never format runtime values into query text by any other means.**

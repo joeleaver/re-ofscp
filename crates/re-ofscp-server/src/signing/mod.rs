@@ -1,6 +1,7 @@
 //! OFSCP request signing (spec §4.4–§4.6, §7.1, §8.1).
 //!
-//! * [`canonical`]: byte-exact canonical strings and Ed25519 sign/verify.
+//! * [`canonical`]: byte-exact canonical strings and Ed25519 sign/verify,
+//!   re-exported from [`ofscp_core::signing`].
 //! * [`keys`]: how the verifier finds signers' public keys.
 //! * [`verify`]: the §4.5 verification pipeline.
 //! * [`authenticate`]: middleware that verifies any request carrying
