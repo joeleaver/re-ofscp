@@ -80,7 +80,7 @@ async fn concurrent_creates_at_the_limit_never_pass_it() {
 #[tokio::test]
 async fn deleted_channels_never_make_room_past_the_limit() {
     // rhypedb c73cc88 counts deleted rows toward a limited index scan, so a
-    // limited count would come back short after deletes (decision 0010).
+    // limited count would come back short after deletes (decision 0014).
     let env = env().await;
     let alice = local(&env, "alice").await;
     let gid = id(&create_group(&env, &alice, group_body("G", "group")).await);
@@ -301,4 +301,27 @@ async fn a_pending_membership_is_not_reported_as_one() {
     );
     let retry = groups.add_member(&gid, &bob.id(), "member", now()).await;
     assert!(matches!(retry, Err(GroupError::Conflict(_))), "{retry:?}");
+}
+
+#[tokio::test]
+async fn a_channel_names_its_group_only_while_active() {
+    let env = env().await;
+    let alice = local(&env, "alice").await;
+    let groups = &env.state.groups;
+    let gid = id(&create_group(&env, &alice, group_body("G", "group")).await);
+    let cid = id(&create_channel(&env, &alice, &gid, json!({"type": "text"})).await);
+    assert_eq!(groups.channel_group(&cid).await.unwrap(), Some(gid.clone()));
+    assert_eq!(groups.channel_group("chn_unknown").await.unwrap(), None);
+    // A channel written but never confirmed is not there yet.
+    let pending = pending_channel(&env, &gid).await;
+    assert_eq!(groups.channel_group(&pending).await.unwrap(), None);
+    let path = format!("/api/groups/{gid}/channels/{cid}");
+    let (s, p) = call(&env, Some(&alice), "DELETE", &path, None).await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "{p}");
+    assert_eq!(groups.channel_group(&cid).await.unwrap(), None);
+    // A group being deleted names none of its channels, though their rows
+    // stay active until the purge.
+    let live = id(&create_channel(&env, &alice, &gid, json!({"type": "text"})).await);
+    assert!(groups.store.mark_deleting(&gid).await.unwrap());
+    assert_eq!(groups.channel_group(&live).await.unwrap(), None);
 }

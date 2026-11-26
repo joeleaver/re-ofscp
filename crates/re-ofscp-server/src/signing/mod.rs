@@ -4,6 +4,8 @@
 //!   re-exported from [`ofscp_core::signing`].
 //! * [`keys`]: how the verifier finds signers' public keys.
 //! * [`verify`]: the §4.5 verification pipeline.
+//! * [`ws`]: the WebSocket `authenticate` handshake (§7.1) and re-confirming
+//!   the key of a live connection.
 //! * [`authenticate`]: middleware that verifies any request carrying
 //!   `X-OFSCP-*` headers and exposes the result to handlers via
 //!   [`Authenticated`].
@@ -16,6 +18,7 @@
 pub mod canonical;
 pub mod keys;
 pub mod verify;
+pub mod ws;
 
 use std::sync::Arc;
 
@@ -26,10 +29,14 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use re_ofscp_types::{Actor, Authority};
 
-pub use keys::{KeyError, KeyFuture, KeyResolver, Requester, Resolved, StaticKeys};
+pub use keys::{
+    KeyError, KeyFuture, KeyResolver, Lifetime, ReconfirmFuture, Reconfirmed, Requester, Resolved,
+    StaticKeys, classify,
+};
 pub use verify::{
     Clock, Precheck, RequestParts, Signer, SystemClock, Verified, Verifier, VerifyError,
 };
+pub use ws::{WsAuthenticate, WsPrecheck, WsVerified};
 
 use crate::client::{Peer, client_keys_by};
 use crate::problem::Problem;

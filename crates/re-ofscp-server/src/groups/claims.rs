@@ -1,6 +1,6 @@
 //! Revision claims (`GroupClaim` in `schema.rhype`): `@unique` rows that
 //! make an edit of a group or channel the only edit of its revision
-//! (docs/decisions/0010).
+//! (docs/decisions/0014).
 //!
 //! rhypedb's filtered `update` is not compare-and-set: the filter is
 //! evaluated first and each matching row is then written by its own
@@ -17,7 +17,7 @@
 //! writer that died, and the next edit takes it over. This assumes that
 //! the server applies the holder's statement within the lease. The data
 //! layer's 10 s timeout only stops the client waiting; it does not cancel
-//! the statement on the server (docs/decisions/0012). Claims are never
+//! the statement on the server (docs/decisions/0014). Claims are never
 //! updated, so a filter over them is exact; [`GroupStore::purge_claims`]
 //! deletes the expired ones.
 

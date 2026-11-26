@@ -1,5 +1,5 @@
 //! Concurrent edits of groups and channels: every edit that answers `200`
-//! is its own revision, none undone by another (docs/decisions/0010:
+//! is its own revision, none undone by another (docs/decisions/0014:
 //! rhypedb's filtered updates are not compare-and-set, so edits are
 //! serialized by revision claims). Over a real rhypedb-server.
 

@@ -12,7 +12,7 @@
 //! The `sharedGroups` and `contacts` tiers depend on state other modules
 //! own, reached through two seams, [`GroupMemberships`] and [`Contacts`].
 //! The app answers group memberships from its groups (`groups::Groups`,
-//! docs/decisions/0010). Until contacts (§6.7) exist on this provider, the
+//! docs/decisions/0014). Until contacts (§6.7) exist on this provider, the
 //! contacts seam is [`NoContacts`]: it answers truthfully that no one is a
 //! contact, so that tier admits only the subject and the allow list
 //! (docs/decisions/0009). [`NoGroupsHosted`] stays the default of a bare

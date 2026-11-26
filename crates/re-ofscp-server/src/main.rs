@@ -79,13 +79,20 @@ async fn main() -> anyhow::Result<()> {
             .purge_sessions_forever(std::sync::Arc::new(re_ofscp_server::signing::SystemClock)),
     );
     let sweep_groups = tokio::spawn(state.groups.clone().sweep_forever());
+    let ws_recheck = tokio::spawn(state.ws.clone().recheck_forever());
+    let hub = state.ws.clone();
     let app = router(state);
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
+    .with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        // Upgraded sockets are not drained by axum: close them first.
+        hub.shutdown().await;
+    })
     .await?;
+    ws_recheck.abort();
     purge.abort();
     if let Some(task) = load_policy {
         task.abort();

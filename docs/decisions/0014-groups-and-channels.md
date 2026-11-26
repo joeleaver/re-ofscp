@@ -1,4 +1,4 @@
-# 0010: Groups, channels and effective read access
+# 0014: Groups, channels and effective read access
 
 - **Status:** accepted
 - **Date:** 2026-11-26

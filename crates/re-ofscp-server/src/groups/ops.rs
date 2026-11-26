@@ -32,7 +32,7 @@ const UPDATE_ATTEMPTS: usize = 5;
 /// Activating only well inside the TTL leaves that impossible but for the
 /// server stalling one statement for minutes. The data layer's 10 s
 /// timeout only stops the client waiting and does not rule that out
-/// (docs/decisions/0012). A writer slower than this takes its row back.
+/// (docs/decisions/0014). A writer slower than this takes its row back.
 const ACTIVATE_WITHIN: Duration = PENDING_TTL.saturating_sub(Duration::from_secs(300));
 const _: () = assert!(
     PENDING_TTL.as_secs() >= 2 * 300,
@@ -105,6 +105,20 @@ impl Groups {
             return Err(GroupError::Forbidden(GROUP_HIDDEN));
         }
         Ok(ReadableGroup { group, standing })
+    }
+
+    /// The group id of active channel `channel_id`, for callers that know
+    /// only the channel (the §7.1 `subscribe` command names channels
+    /// alone). `None` unless both the channel and its group are active (a
+    /// group being deleted keeps its channel rows active until purged).
+    /// This answers no access question: follow it with
+    /// [`Self::read_channel`], which hides a channel the caller cannot read
+    /// exactly as a missing one.
+    pub async fn channel_group(&self, channel_id: &str) -> Result<Option<String>, GroupError> {
+        let Some(group_id) = self.store.channel_group(channel_id).await? else {
+            return Ok(None);
+        };
+        Ok(self.store.group(&group_id).await?.map(|_| group_id))
     }
 
     /// The channel, if it exists and the caller has effective read access

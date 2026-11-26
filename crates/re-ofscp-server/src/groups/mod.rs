@@ -1,4 +1,4 @@
-//! Groups and channels (spec §5.2, §5.2.1, §5.5, §11; docs/decisions/0010).
+//! Groups and channels (spec §5.2, §5.2.1, §5.5, §11; docs/decisions/0014).
 //!
 //! - [`access`]: the one effective-read-access and permission rule.
 //! - [`model`]: stored shapes and request → state.

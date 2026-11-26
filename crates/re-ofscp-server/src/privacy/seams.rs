@@ -102,9 +102,9 @@ impl Contacts for NoContacts {
     }
 }
 
-/// [`Liveness`] for a provider without the WebSocket endpoint: nobody is
-/// connected, so everyone's presence reads `offline` (§7.5). Replaced when
-/// the WebSocket (§7.1) lands.
+/// [`Liveness`] that sees no connections: everyone's presence reads
+/// `offline` (§7.5). A provider's own default is its WebSocket hub (§7.1);
+/// this is for states built without real-time connections in mind.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoConnections;
 

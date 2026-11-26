@@ -452,7 +452,7 @@ impl GroupStore {
     /// Read whole, with no `.limit`: rhypedb c73cc88 cuts a limited scan of
     /// an index after N keys *including deleted rows'*, so a limited count
     /// comes back short once channels have been deleted and would let
-    /// creates past the limit (docs/decisions/0010). The read is bounded
+    /// creates past the limit (docs/decisions/0014). The read is bounded
     /// anyway: the limit itself keeps a group near `MAX_CHANNELS_PER_GROUP`
     /// rows, plus creates in flight that take theirs back.
     pub async fn channel_count(&self, group_id: &str) -> Result<usize, DbError> {
@@ -479,6 +479,18 @@ impl GroupStore {
             Some(row) => row.data.decode().map(Some),
             None => Ok(None),
         }
+    }
+
+    /// The group of active channel `channel_id`, if there is one. Channel
+    /// ids are unique across groups (`@unique`).
+    pub async fn channel_group(&self, channel_id: &str) -> Result<Option<String>, DbError> {
+        let q = Ql::new("Channel.filter(.channel_id == ")
+            .str(channel_id)
+            .raw(" && .status == ")
+            .str(status::ACTIVE)
+            .raw(")");
+        let rows = self.db.fetch::<GroupIdRow>(&q).await?;
+        Ok(rows.into_iter().next().map(|r| r.data.group_id))
     }
 
     /// Write `fields` to `channel` as its next revision, under that
