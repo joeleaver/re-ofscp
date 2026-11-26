@@ -340,7 +340,7 @@ impl AccountStore {
         match self.db.execute(&q).await {
             // Deleted (or being deleted) by another who found it discarded;
             // a caller that retries its create reads the handle again.
-            Ok(()) | Err(DbError::NotFound(_) | DbError::Contended(_)) => Ok(()),
+            Ok(()) | Err(DbError::Vanished(_) | DbError::Contended(_)) => Ok(()),
             Err(e) => Err(e.into()),
         }
     }

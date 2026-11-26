@@ -11,10 +11,12 @@
 //!
 //! The `sharedGroups` and `contacts` tiers depend on state other modules
 //! own, reached through two seams, [`GroupMemberships`] and [`Contacts`].
-//! Until groups (§5.2) and contacts (§6.7) exist on this provider, the
-//! implementations are [`NoGroupsHosted`] and [`NoContacts`]: they answer
-//! truthfully that no one shares a group and no one is a contact, so those
-//! tiers admit only the subject and the allow list (docs/decisions/0009).
+//! The app answers group memberships from its groups (`groups::Groups`,
+//! docs/decisions/0014). Until contacts (§6.7) exist on this provider, the
+//! contacts seam is [`NoContacts`]: it answers truthfully that no one is a
+//! contact, so that tier admits only the subject and the allow list
+//! (docs/decisions/0009). [`NoGroupsHosted`] stays the default of a bare
+//! [`Relationships`].
 
 pub mod seams;
 

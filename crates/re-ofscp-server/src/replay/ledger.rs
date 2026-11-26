@@ -330,7 +330,7 @@ impl RhypeLedger {
             .raw(").delete()");
         match self.db.execute(&prune).await {
             // A concurrent prune deleted a row first.
-            Ok(()) | Err(DbError::NotFound(_) | DbError::Contended(_)) => {}
+            Ok(()) | Err(DbError::Vanished(_) | DbError::Contended(_)) => {}
             Err(e) => tracing::warn!(error = %e, "pruning old replay clock rows failed"),
         }
         Ok(())
@@ -374,7 +374,7 @@ impl NonceLedger for RhypeLedger {
                     let q = Ql::new("ReplayNonce.get(").uint(row.id).raw(").delete()");
                     match self.db.execute(&q).await {
                         // Deleted (or being deleted) by a purge or a concurrent reuser.
-                        Ok(()) | Err(DbError::NotFound(_) | DbError::Contended(_)) => {}
+                        Ok(()) | Err(DbError::Vanished(_) | DbError::Contended(_)) => {}
                         Err(e) => return Err(unavailable(e)),
                     }
                 }
@@ -447,7 +447,7 @@ impl NonceLedger for RhypeLedger {
                 match self.db.execute(&q).await {
                     // A row it selected was deleted meanwhile (by a reuse):
                     // the statement stopped there; the next batch goes on.
-                    Ok(()) | Err(DbError::NotFound(_) | DbError::Contended(_)) => {}
+                    Ok(()) | Err(DbError::Vanished(_) | DbError::Contended(_)) => {}
                     Err(e) => return Err(unavailable(e)),
                 }
                 let probe = Ql::new("ReplayNonce.filter(.expires_at <= ")

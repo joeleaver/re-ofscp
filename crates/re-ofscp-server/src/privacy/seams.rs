@@ -65,8 +65,8 @@ pub struct Relationships {
 }
 
 impl Default for Relationships {
-    /// What is true on this provider today: it hosts no groups and stores no
-    /// contacts.
+    /// No groups hosted and no contacts stored. The app replaces the
+    /// groups seam with its own groups (`AppStateBuilder::build`).
     fn default() -> Self {
         Self {
             groups: Arc::new(NoGroupsHosted),
@@ -76,7 +76,8 @@ impl Default for Relationships {
 }
 
 /// [`GroupMemberships`] for a provider that hosts no groups: nobody shares
-/// one and nobody belongs to one. Replaced when groups (§5.2) land.
+/// one and nobody belongs to one. The app answers from its own groups
+/// (`groups::Groups`); this is the default of a bare [`Relationships`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoGroupsHosted;
 

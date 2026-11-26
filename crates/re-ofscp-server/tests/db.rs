@@ -398,14 +398,14 @@ async fn a_legacy_replay_clock_row_is_honoured_then_pruned() {
     assert_eq!(rows[0].data.name, "replay@6000");
 }
 
-/// A write naming an object id that no longer exists is `NotFound`, which
+/// A write naming an object id that no longer exists is `Vanished`, which
 /// the ledger and the admin claims treat as "already deleted".
 #[tokio::test]
-async fn deleting_a_missing_object_is_not_found() {
+async fn deleting_a_missing_object_is_vanished() {
     let server = RhypeServer::start();
     let db = db(&server);
     let q = Ql::new("ReplayNonce.get(").uint(987_654).raw(").delete()");
-    assert!(matches!(db.execute(&q).await, Err(DbError::NotFound(_))));
+    assert!(matches!(db.execute(&q).await, Err(DbError::Vanished(_))));
 }
 
 /// A purge racing re-persists of the same (expired) nonces must not delete
@@ -488,4 +488,20 @@ async fn concurrent_unique_creates_are_conflicts_or_contended() {
         .await
         .unwrap();
     assert_eq!(rows.len(), 1);
+}
+
+/// A write to an object that is gone is [`DbError::Vanished`] (a filtered
+/// `update` meets this when the object it matched is deleted before the
+/// write). Pins rhypedb's message for it.
+#[tokio::test]
+async fn writing_a_deleted_object_is_vanished() {
+    let server = RhypeServer::start();
+    let db = db(&server);
+    let q = Ql::new("GroupClaim.get(")
+        .uint(987_654)
+        .raw(").update({ key: \"x\" })");
+    match db.execute(&q).await {
+        Err(DbError::Vanished(_)) => {}
+        other => panic!("{other:?}"),
+    }
 }

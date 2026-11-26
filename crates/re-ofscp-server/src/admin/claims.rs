@@ -126,7 +126,7 @@ impl Claims {
             let delete = Ql::new("AdminClaim.get(").uint(held.id).raw(").delete()");
             match self.db.execute(&delete).await {
                 // Deleted (or being deleted) by a concurrent taker.
-                Ok(()) | Err(DbError::NotFound(_) | DbError::Contended(_)) => {}
+                Ok(()) | Err(DbError::Vanished(_) | DbError::Contended(_)) => {}
                 Err(e) => return Err(e),
             }
         }
@@ -149,7 +149,7 @@ impl Claims {
             match self.db.execute(&q).await {
                 // A claim it selected was deleted meanwhile (taken over):
                 // the statement stopped there; the next batch goes on.
-                Ok(()) | Err(DbError::NotFound(_) | DbError::Contended(_)) => {}
+                Ok(()) | Err(DbError::Vanished(_) | DbError::Contended(_)) => {}
                 Err(e) => return Err(e),
             }
             let probe = Ql::new("AdminClaim.filter(.expires_at <= ")

@@ -283,7 +283,7 @@ async fn memberships_follow_membership_visibility() {
 }
 
 #[tokio::test]
-async fn without_groups_hosted_the_listing_is_empty() {
+async fn with_no_groups_the_listing_is_empty() {
     let env = env().await;
     let alice = local(&env, "alice").await;
     let bob = local(&env, "bob").await;

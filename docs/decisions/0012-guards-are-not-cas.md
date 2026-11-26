@@ -20,7 +20,7 @@ work (PR #16) showed what that means in practice:
   fail with `engine error: write conflict` (`DbError::Contended`). Nothing
   of that object was written.
 - A write naming an object id that no longer exists fails with
-  `engine error: object not found: …` (`DbError::NotFound`). This includes
+  `engine error: object not found: …` (`DbError::Vanished`). This includes
   a filtered `delete` whose snapshot named a row someone else deleted
   first: the statement stops there.
 - A `create` on a `@unique` field **is** atomic: of 32 concurrent creates
