@@ -244,10 +244,18 @@ impl Groups {
                 lost_claim(attempt).await;
                 continue;
             }
-            if let Some(updated) = self.store.update_group(&group, &fields, now).await? {
-                self.changed(AccessChange::Group {
-                    group_id: group_id.to_owned(),
-                });
+            let written = self.store.update_group(&group, &fields, now).await;
+            // A failed write may have committed (see `announce_unless`).
+            announce_unless(
+                &written,
+                |w| w.is_none(),
+                || {
+                    self.changed(AccessChange::Group {
+                        group_id: group_id.to_owned(),
+                    });
+                },
+            );
+            if let Some(updated) = written? {
                 return Ok(updated.to_wire());
             }
         }
@@ -266,14 +274,47 @@ impl Groups {
         if group.owner != *actor {
             return Err(GroupError::Forbidden("only the owner may delete a group"));
         }
-        if !self.store.mark_deleting(group_id).await? {
+        // A failed mark may have committed (the group is then hidden): tell
+        // live readers now, as every revoking write does. On success the
+        // channels and the group are announced below, in that order.
+        let marked = self.store.mark_deleting(group_id).await;
+        announce_unless(
+            &marked,
+            |_| true,
+            || {
+                self.changed(AccessChange::Group {
+                    group_id: group_id.to_owned(),
+                });
+            },
+        );
+        if !marked? {
             return Err(GroupError::NotFound(NO_GROUP));
+        }
+        // Live readers (WebSocket subscriptions) find a group's channels
+        // through its channel rows, which the purge removes: name every
+        // channel now, while the rows are still there. They are read after
+        // `mark_deleting`, so none that was readable is missed (none
+        // becomes readable afterwards). If they cannot be read, the purge
+        // is left to the sweeper, so whoever receives the `Group` change
+        // can still find them.
+        let channels = self.store.channel_ids(group_id).await;
+        if let Ok(ids) = &channels {
+            for channel_id in ids {
+                self.channel_changed(group_id, channel_id);
+            }
         }
         self.changed(AccessChange::Group {
             group_id: group_id.to_owned(),
         });
-        if let Err(e) = self.store.purge_group(group_id).await {
-            tracing::warn!(error = %e, group_id, "purging a deleted group failed; the sweeper will finish it");
+        match channels {
+            Ok(_) => {
+                if let Err(e) = self.store.purge_group(group_id).await {
+                    tracing::warn!(error = %e, group_id, "purging a deleted group failed; the sweeper will finish it");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, group_id, "listing a deleted group's channels failed; the sweeper will purge it");
+            }
         }
         Ok(())
     }
@@ -399,8 +440,15 @@ impl Groups {
                 lost_claim(attempt).await;
                 continue;
             }
-            if let Some(updated) = self.store.update_channel(&channel, &fields, now).await? {
-                self.channel_changed(group_id, channel_id);
+            let written = self.store.update_channel(&channel, &fields, now).await;
+            announce_unless(
+                &written,
+                |w| w.is_none(),
+                || {
+                    self.channel_changed(group_id, channel_id);
+                },
+            );
+            if let Some(updated) = written? {
                 return Ok(updated.to_wire());
             }
         }
@@ -415,9 +463,15 @@ impl Groups {
         channel_id: &str,
     ) -> Result<(), GroupError> {
         self.managed_channel(actor, group_id, channel_id).await?;
-        self.store.delete_channel(group_id, channel_id).await?;
-        self.channel_changed(group_id, channel_id);
-        Ok(())
+        let deleted = self.store.delete_channel(group_id, channel_id).await;
+        announce_unless(
+            &deleted,
+            |_| false,
+            || {
+                self.channel_changed(group_id, channel_id);
+            },
+        );
+        Ok(deleted?)
     }
 
     /// How many channels `group_id` has (read whole; see
@@ -497,18 +551,32 @@ impl Groups {
         role: &str,
     ) -> Result<bool, GroupError> {
         member_role(role)?;
-        let set = self.store.set_role(group_id, actor, role).await?;
-        if set {
-            self.member_changed(group_id, actor);
-        }
-        Ok(set)
+        let set = self.store.set_role(group_id, actor, role).await;
+        announce_unless(&set, |set| !set, || self.member_changed(group_id, actor));
+        Ok(set?)
     }
 
     /// End a membership (the §5.7 seam). Announces the change.
     pub async fn remove_member(&self, group_id: &str, actor: &Actor) -> Result<(), GroupError> {
-        self.store.remove_member(group_id, actor).await?;
-        self.member_changed(group_id, actor);
-        Ok(())
+        let removed = self.store.remove_member(group_id, actor).await;
+        announce_unless(&removed, |_| false, || self.member_changed(group_id, actor));
+        Ok(removed?)
+    }
+}
+
+/// Run `announce` after a write that may have changed access: always, unless
+/// it succeeded and `unchanged` says it wrote nothing. A write that failed
+/// is announced too: it may have committed before the failure reached us
+/// (the connection dropped after the commit), and live readers must not
+/// keep access it revoked until the next periodic re-check. A spurious
+/// announcement costs only a re-check.
+fn announce_unless<T, E>(
+    written: &Result<T, E>,
+    unchanged: impl FnOnce(&T) -> bool,
+    announce: impl FnOnce(),
+) {
+    if !matches!(written, Ok(w) if unchanged(w)) {
+        announce();
     }
 }
 
@@ -528,3 +596,7 @@ async fn lost_claim(attempt: usize) {
     let factor = u32::try_from(attempt).unwrap_or(u32::MAX);
     tokio::time::sleep(CLAIM_BACKOFF.saturating_mul(factor)).await;
 }
+
+#[cfg(test)]
+#[path = "ops_tests.rs"]
+mod tests;

@@ -262,6 +262,14 @@ async fn only_the_owner_deletes_and_everything_goes_with_the_group() {
     assert_eq!(s, StatusCode::FORBIDDEN, "{p}");
     let (s, _) = call(&env, Some(&alice), "DELETE", &path, None).await;
     assert_eq!(s, StatusCode::NO_CONTENT);
+    // Each channel is named before the purge removes its row, then the group.
+    assert_eq!(
+        changes.recv().await.unwrap(),
+        AccessChange::Channel {
+            group_id: gid.clone(),
+            channel_id: id(&c),
+        }
+    );
     assert_eq!(
         changes.recv().await.unwrap(),
         AccessChange::Group {

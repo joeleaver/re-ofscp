@@ -2,8 +2,9 @@
 //! conservative defaults until those subsystems land:
 //!
 //! * [`TopicAuthorizer`]: effective read access to a channel (§11.3,
-//!   security requirement 5), from the groups module. Default
-//!   [`NoTopics`]: nothing is readable.
+//!   security requirement 5). The provider runs
+//!   [`super::channels::GroupTopics`], over the groups module; [`NoTopics`]
+//!   (nothing is readable) serves tests without a database.
 //! * [`Timeline`]: replaying a channel's timeline after a resume cursor
 //!   (§7.1 "Resuming after a disconnect"), from the message log. Default
 //!   [`NoTimeline`]: every resume is truncated, so clients backfill
@@ -44,8 +45,7 @@ pub trait TopicAuthorizer: Send + Sync {
     fn check<'a>(&'a self, actor: &'a Actor, topic: &'a str) -> AccessFuture<'a>;
 }
 
-/// No topics at all: until channel topics are wired in, every subscribe
-/// is answered `not_found`.
+/// No topics at all: every subscribe is answered `not_found`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoTopics;
 

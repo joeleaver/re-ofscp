@@ -9,11 +9,14 @@
 //! * [`lease`]: re-confirming a remote actor's key.
 //! * [`seams`]: what other subsystems plug in (channel access, the message
 //!   timeline, federation policy).
+//! * [`channels`]: channel access from the groups module, and its access
+//!   changes fed into the re-checks.
 //!
 //! Other subsystems talk to connections through [`Hub`]: they publish
 //! events to a topic or an actor, report access changes, and force-close.
 
 pub mod access;
+pub mod channels;
 pub mod commands;
 pub mod conn;
 mod handshake;
@@ -34,6 +37,8 @@ use axum::response::{IntoResponse, Response};
 use re_ofscp_types::{Actor, Authority};
 use serde_json::Value;
 
+pub use self::channels::GroupTopics;
+pub(crate) use self::channels::follow_groups;
 use self::protocol::{Close, close};
 pub use self::registry::{AccessChange, Admitted, ConnId, Limits, Refused, Registry};
 pub use self::seams::{
@@ -113,7 +118,9 @@ impl Default for WsConfig {
     }
 }
 
-/// The subsystems a [`Hub`] consults.
+/// The subsystems a [`Hub`] consults. The provider's own are channel
+/// access from its groups ([`GroupTopics`]) and [`NoTimeline`]; the
+/// [`Default`] answers nothing at all readable (tests without a database).
 #[derive(Clone)]
 pub struct Seams {
     /// Channel access.
@@ -190,6 +197,11 @@ impl Hub {
     /// Fan out an event of type `kind` with `data` to the subscribers of
     /// `topic` whose `include` admits it. No `correlationId`: no command
     /// of theirs caused it.
+    ///
+    /// It does not check access itself: a subscription a just-committed
+    /// change revoked stays live until the group follower holds it. Its
+    /// first production caller must close that window first (decision
+    /// 0010, "The window between a commit and its hold").
     pub fn publish(&self, topic: &str, kind: &str, data: Value) {
         let text: Arc<str> = protocol::event(kind, None, data, self.now()).into();
         self.registry.publish(topic, kind, &text);
