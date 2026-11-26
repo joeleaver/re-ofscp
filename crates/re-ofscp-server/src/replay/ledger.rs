@@ -447,8 +447,9 @@ impl NonceLedger for RhypeLedger {
                     .uint(PURGE_BATCH)
                     .raw(").delete()");
                 match self.db.execute(&q).await {
-                    // A row it selected was deleted meanwhile (by a reuse):
-                    // the statement stopped there; the next batch goes on.
+                    // A row deleted meanwhile is skipped (rhypedb 7b78190); a
+                    // conflict that outlasts rhypedb's own retries is left to
+                    // the next batch. `Vanished` remains for an older server.
                     Ok(()) | Err(DbError::Vanished(_) | DbError::Contended(_)) => {}
                     Err(e) => return Err(unavailable(e)),
                 }

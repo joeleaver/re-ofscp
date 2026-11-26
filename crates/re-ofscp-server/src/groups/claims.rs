@@ -113,8 +113,9 @@ impl GroupStore {
                 .uint(PURGE_BATCH)
                 .raw(").delete()");
             match self.db.execute(&q).await {
-                // A row the snapshot matched was deleted meanwhile (taken
-                // over); the delete stopped there, so go round again.
+                // A row deleted meanwhile is skipped (rhypedb 7b78190); a
+                // conflict that outlasts rhypedb's own retries is left to the
+                // next batch. `Vanished` remains for an older server.
                 Ok(()) | Err(DbError::Vanished(_) | DbError::Contended(_)) => {}
                 Err(e) => return Err(e),
             }
