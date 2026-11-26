@@ -1,4 +1,4 @@
-# 0008: Groups, channels and effective read access
+# 0009: Groups, channels and effective read access
 
 - **Status:** accepted
 - **Date:** 2026-11-26
@@ -146,8 +146,11 @@ it sends.
   sweeper deletes pending rows older than `PENDING_TTL` (600 s), so they
   never accumulate, and this relies on no request taking any particular
   time: a create slower than that finds its row gone and fails cleanly.
-- A sweeper pass carries on past a group whose purge fails, logging it,
-  and leaves it for the next pass.
+- A sweeper pass carries on past a failed step (expiry, or one group's
+  purge), logging it and leaving it for the next pass.
+- `add_member` answers a pending membership (another add in flight, or a
+  dead writer's row awaiting expiry) with `409` (retry), never with
+  "already a member".
 
 ### Limits
 
@@ -165,7 +168,10 @@ it sends.
 | Path ids | `[A-Za-z0-9_-]{1,128}`, otherwise `404` |
 
 Count limits are checked before a write and again after it, and a create
-that finds itself over the limit takes back what it wrote. The channel
+that finds itself over the limit takes back what it wrote. (One residual
+case: a process that dies between writing a group and rechecking the
+owner limit can leave that owner one group over it. The group is real and
+usable, so it is not taken back later.) The channel
 count includes pending rows, so it errs on the safe side; the group count
 includes only active groups, so a deletion frees its place at once. Concurrent
 creates therefore never leave more than the limit, though a burst at the

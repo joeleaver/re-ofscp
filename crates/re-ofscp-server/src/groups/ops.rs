@@ -381,8 +381,19 @@ impl Groups {
             .group(group_id)
             .await?
             .ok_or(GroupError::NotFound(NO_GROUP))?;
-        if group.owner == *actor || !self.store.add_member(group_id, actor, role, now).await? {
+        if group.owner == *actor {
             return Ok(false);
+        }
+        if !self.store.add_member(group_id, actor, role, now).await? {
+            // A row exists. An active one is a membership; a pending one is
+            // another add in flight, or a dead writer's row awaiting expiry.
+            // That is not a membership, so it must not be reported as one.
+            return match self.store.role_of(group_id, actor).await? {
+                Some(_) => Ok(false),
+                None => Err(GroupError::Conflict(
+                    "the membership is being recorded; retry",
+                )),
+            };
         }
         // Confirm as for channels: a membership never outlives its group.
         if self.store.group(group_id).await?.is_none() {

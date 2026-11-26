@@ -255,3 +255,22 @@ async fn memberships_refuse_the_owner_role_and_deleted_groups() {
     assert!(matches!(gone, Err(GroupError::NotFound(_))), "{gone:?}");
     assert_eq!(groups.store.role_of(&gid, &bob.id()).await.unwrap(), None);
 }
+
+#[tokio::test]
+async fn a_pending_membership_is_not_reported_as_one() {
+    let env = env().await;
+    let alice = local(&env, "alice").await;
+    let bob = local(&env, "bob").await;
+    let gid = id(&create_group(&env, &alice, group_body("G", "group")).await);
+    let groups = &env.state.groups;
+    // A writer died after writing, before confirming.
+    assert!(
+        groups
+            .store
+            .add_member(&gid, &bob.id(), "member", now())
+            .await
+            .unwrap()
+    );
+    let retry = groups.add_member(&gid, &bob.id(), "member", now()).await;
+    assert!(matches!(retry, Err(GroupError::Conflict(_))), "{retry:?}");
+}

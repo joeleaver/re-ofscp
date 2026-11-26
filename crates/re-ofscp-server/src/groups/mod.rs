@@ -1,4 +1,4 @@
-//! Groups and channels (spec §5.2, §5.2.1, §5.5, §11; docs/decisions/0008).
+//! Groups and channels (spec §5.2, §5.2.1, §5.5, §11; docs/decisions/0009).
 //!
 //! - [`access`]: the one effective-read-access and permission rule.
 //! - [`model`]: stored shapes and request → state.
@@ -155,9 +155,11 @@ impl Groups {
     /// (older than [`PENDING_TTL`]). A group whose purge fails is logged
     /// and left for the next pass; the rest of the pass goes on.
     pub async fn sweep(&self, now: i64) -> Result<usize, DbError> {
-        self.store
-            .expire_pending(now.saturating_sub(PENDING_TTL.as_secs() as i64))
-            .await?;
+        // Expiry failing must not hold up the purges (nor the reverse).
+        let cutoff = now.saturating_sub(PENDING_TTL.as_secs() as i64);
+        if let Err(e) = self.store.expire_pending(cutoff).await {
+            tracing::warn!(error = %e, "expiring pending group rows failed");
+        }
         let mut purged = 0;
         loop {
             let batch = self.store.deleting(SWEEP_BATCH).await?;

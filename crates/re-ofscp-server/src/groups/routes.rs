@@ -17,8 +17,9 @@
 //! local ones do, by their full `handle@domain`. On the single-channel
 //! routes a channel the caller cannot read, for any §11.3 reason (an
 //! unreadable group included), is `404`, as one that does not exist
-//! (lost-conn/ofscp#26). Group-level routes answer an unreadable group `403`. Provider signatures read
-//! as anonymous and are refused where a user must act.
+//! (lost-conn/ofscp#26). Group-level routes answer an unreadable group
+//! `403`. Provider signatures read as anonymous and are refused where a
+//! user must act.
 
 use axum::Json;
 use axum::extract::{FromRequestParts, Path, State};

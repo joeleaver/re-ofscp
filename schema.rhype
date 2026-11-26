@@ -127,7 +127,7 @@ type AdminAudit {
 // A group (spec §5.2), hosted here. Channels and memberships refer to it by
 // `group_id` (its local id), not by a relation field: rhypedb at the pinned
 // commit cannot link inside `create`, so a relation would make every channel
-// create two non-atomic statements (docs/decisions/0008). Groups are deleted
+// create two non-atomic statements (docs/decisions/0009). Groups are deleted
 // in two steps: `status` goes to "deleting" (the group disappears from every
 // surface at once), then its channels, memberships and finally the group row
 // are removed; a sweeper finishes any deletion a crash interrupted.

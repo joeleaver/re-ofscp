@@ -344,8 +344,10 @@ impl GroupStore {
             .raw(" && .created_at < ")
             .unix_seconds(cutoff)
             .raw(").delete()");
-        self.db.execute(&channels).await?;
-        self.expire_pending_members(cutoff).await
+        // Try both, so one failing does not leave the other's rows.
+        let channels = self.db.execute(&channels).await;
+        let members = self.expire_pending_members(cutoff).await;
+        channels.and(members)
     }
 
     /// Up to `limit` active channels of `group_id`, oldest first.
