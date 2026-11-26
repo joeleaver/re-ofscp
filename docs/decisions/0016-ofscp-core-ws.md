@@ -121,7 +121,7 @@ types*, *Authentication*).
   one; we read any (see the lenient decode above).
 - **`data` is required, and an object on every standard command.** A
   re-sent unknown frame passes a non-null `data` through untouched; only
-  `null` (or no `data`) becomes `{}`. That is what `known_data` does.
+  `null` (or no `data`) becomes `{}`, when `Envelope::encode` writes it.
 - **How a provider answers bad frames** (the server, decision 0010, follows
   these; `crates/re-ofscp-server/tests/ws.rs` covers each):
   - a standard command other than `authenticate` whose `data` does not

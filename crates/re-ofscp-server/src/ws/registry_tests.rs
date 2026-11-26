@@ -7,7 +7,6 @@ fn limits() -> Limits {
         per_actor: 2,
         per_remote_group: 2,
         max_subscriptions: 2,
-        max_channels_per_command: 3,
         outbound_queue: 4,
         held_max: 2,
     }
@@ -27,7 +26,7 @@ fn text(s: &str) -> Arc<str> {
 
 /// Subscribe connection `id` to `topic` and grant it: its generation.
 fn subscribe(r: &Registry, id: ConnId, topic: &str) -> u64 {
-    let g = r.hold_new(id, &[topic.to_owned()], None).unwrap()[0].generation;
+    let g = r.hold_new(id, &[topic.to_owned()], None).unwrap().unwrap()[0].generation;
     r.grant(id, &[(topic.to_owned(), g)], None, |_| Vec::new())
         .unwrap();
     g
@@ -43,7 +42,7 @@ fn grant_all(
 ) -> Result<Vec<String>, OverCap> {
     let include = only.map(|k| Arc::new(HashSet::from([k.to_owned()])));
     let topics: Vec<String> = topics.iter().map(|&t| t.to_owned()).collect();
-    let holds = r.hold_new(id, &topics, include.clone()).unwrap();
+    let holds = r.hold_new(id, &topics, include.clone()).unwrap()?;
     let granted: Vec<(String, u64)> = topics
         .into_iter()
         .zip(holds)
@@ -52,8 +51,8 @@ fn grant_all(
     r.grant(id, &granted, include, |_| Vec::new())
 }
 
-fn fresh(holds: Option<Vec<Hold>>) -> Option<Vec<bool>> {
-    holds.map(|h| h.into_iter().map(|h| h.fresh).collect())
+fn fresh(holds: Option<Result<Vec<Hold>, OverCap>>) -> Option<Vec<bool>> {
+    holds.map(|h| h.unwrap().into_iter().map(|h| h.fresh).collect())
 }
 
 fn drain(rx: &mut mpsc::Receiver<Arc<str>>) -> Vec<String> {
@@ -107,7 +106,10 @@ fn fan_out_respects_include_and_holds() {
     } = r.admit("c").unwrap();
     r.authenticate(id, &actor("alice@a.example"), "k").unwrap();
     let include = Some(Arc::new(HashSet::from(["message.created".to_owned()])));
-    let holds = r.hold_new(id, &["ch".to_owned()], include.clone()).unwrap();
+    let holds = r
+        .hold_new(id, &["ch".to_owned()], include.clone())
+        .unwrap()
+        .unwrap();
     assert!(holds[0].fresh);
     r.publish("ch", "message.created", &text("held"));
     r.publish("ch", "reaction.added", &text("filtered"));
@@ -217,23 +219,39 @@ fn the_subscription_cap_is_all_or_none() {
     assert!(drain(&mut rx).is_empty());
 }
 
-/// Holding is not capped: a `subscribe` may list more channels than fit,
-/// as long as the readable ones (the ones granted) do.
+/// A `subscribe` may list more channels than the room left, within the
+/// whole cap, as long as the readable ones (the ones granted) fit
+/// (lost-conn/ofscp#29).
 #[test]
 fn unreadable_topics_do_not_count_towards_the_cap() {
     let r = Registry::new(limits(), local());
     let Admitted { id, .. } = r.admit("c").unwrap();
     r.authenticate(id, &actor("alice@a.example"), "k").unwrap();
     subscribe(&r, id, "a");
-    let topics = ["b".to_owned(), "x".to_owned(), "y".to_owned()];
-    let holds = r.hold_new(id, &topics, None).unwrap();
-    for (t, h) in topics.iter().zip(&holds).skip(1) {
-        assert_eq!(r.end(id, t, h.generation), Ended::Pending);
-    }
+    // Room for one, two listed (the whole cap), one readable.
+    let topics = ["b".to_owned(), "x".to_owned()];
+    let holds = r.hold_new(id, &topics, None).unwrap().unwrap();
+    assert_eq!(r.end(id, "x", holds[1].generation), Ended::Pending);
     let acked = r.grant(id, &[("b".to_owned(), holds[0].generation)], None, |_| {
         Vec::new()
     });
     assert_eq!(acked, Ok(vec!["b".to_owned()]));
+}
+
+/// More distinct channels than the whole cap are refused before any are
+/// held: they could not fit even if all were readable (lost-conn/ofscp#29).
+#[test]
+fn more_channels_than_the_cap_are_refused_before_holding() {
+    let r = Registry::new(limits(), local());
+    let Admitted { id, .. } = r.admit("c").unwrap();
+    r.authenticate(id, &actor("alice@a.example"), "k").unwrap();
+    let topics = ["a".to_owned(), "b".to_owned(), "c".to_owned()];
+    assert_eq!(r.hold_new(id, &topics, None), Some(Err(OverCap)));
+    // Nothing was held: each is new again.
+    assert_eq!(
+        fresh(r.hold_new(id, &topics[..2], None)),
+        Some(vec![true, true])
+    );
 }
 
 /// A re-check that outlives its subscription (the client unsubscribed and
@@ -251,7 +269,7 @@ fn a_stale_recheck_cannot_touch_a_new_subscription() {
     let old = subscribe(&r, id, "ch");
     let stale = r.hold_matching(&AccessChange::Actor(alice)).remove(0);
     assert!(r.unsubscribe(id, "ch"));
-    let new = r.hold_new(id, &["ch".to_owned()], None).unwrap()[0];
+    let new = r.hold_new(id, &["ch".to_owned()], None).unwrap().unwrap()[0];
     assert!(new.fresh);
     assert_ne!(new.generation, old);
 
@@ -280,7 +298,7 @@ fn a_subscription_ended_while_pending_is_not_acknowledged() {
     } = r.admit("c").unwrap();
     let alice = actor("alice@a.example");
     r.authenticate(id, &alice, "k").unwrap();
-    let g = r.hold_new(id, &["ch".to_owned()], None).unwrap()[0].generation;
+    let g = r.hold_new(id, &["ch".to_owned()], None).unwrap().unwrap()[0].generation;
     let check = r.hold_matching(&AccessChange::Actor(alice)).remove(0);
     assert_eq!(r.end(id, "ch", check.generation), Ended::Pending);
     let acked = r.grant(id, &[("ch".to_owned(), g)], None, |_| vec![text("ack")]);
@@ -297,7 +315,7 @@ fn slow_consumers_and_overfull_holds_close_1013() {
         events: _rx,
     } = r.admit("c").unwrap();
     r.authenticate(id, &actor("alice@a.example"), "k").unwrap();
-    r.hold_new(id, &["ch".to_owned()], None).unwrap();
+    r.hold_new(id, &["ch".to_owned()], None).unwrap().unwrap();
     for _ in 0..2 {
         r.publish("ch", "message.created", &text("kept"));
     }

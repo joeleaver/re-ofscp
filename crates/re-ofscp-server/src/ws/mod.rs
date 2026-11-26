@@ -111,7 +111,6 @@ impl Default for WsConfig {
                 per_actor: 16,
                 per_remote_group: 1_000,
                 max_subscriptions: 500,
-                max_channels_per_command: 500,
                 outbound_queue: 256,
                 held_max: 1_024,
             },

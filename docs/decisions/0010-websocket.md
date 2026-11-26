@@ -130,10 +130,15 @@ reasons, RFC 6455 codes otherwise. It is going into the spec as a SHOULD.
     answer is the `subscription_limit` error (no `subscribed`, no
     `not_found`). A channel already subscribed and listed again does not
     count.
-  - 500 channels listed in one `subscribe` or `unsubscribe`, readable or
-    not (`400 bad_request` beyond). This bounds the access checks one
-    command causes; it is not the subscription cap, and the spec names no
-    such limit.
+  - No limit on how many channels one `subscribe` or `unsubscribe` lists
+    (the spec names none); the 64 KiB frame cap bounds a command. Channels
+    are deduplicated first. A `subscribe` naming more distinct channels
+    than the whole cap could not fit even if all were readable, so it is
+    answered `subscription_limit` at once, without checking any access:
+    the MAY clause of lost-conn/ofscp#29 (in review). A list within the
+    cap is always checked, even if longer than the room left, and the
+    readable-only count above decides. A long, well-formed list is never
+    `bad_request`.
 - Each connection has a bounded outbound queue (256). A client that does
   not read is closed `1013`, without the backlog.
 
