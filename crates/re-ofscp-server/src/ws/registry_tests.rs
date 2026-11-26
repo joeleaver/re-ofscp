@@ -24,6 +24,17 @@ fn text(s: &str) -> Arc<str> {
     Arc::from(s)
 }
 
+/// Subscribe connection `id` to `topic` and grant it: its generation.
+fn subscribe(r: &Registry, id: ConnId, topic: &str) -> u64 {
+    let g = r.hold_new(id, &[topic.to_owned()], None).unwrap()[0].generation;
+    r.grant(id, &[(topic.to_owned(), g)], |_| Vec::new());
+    g
+}
+
+fn fresh(holds: Option<Vec<Hold>>) -> Option<Vec<bool>> {
+    holds.map(|h| h.into_iter().map(|h| h.fresh).collect())
+}
+
 fn drain(rx: &mut mpsc::Receiver<Arc<str>>) -> Vec<String> {
     let mut out = Vec::new();
     while let Ok(t) = rx.try_recv() {
@@ -75,15 +86,16 @@ fn fan_out_respects_include_and_holds() {
     } = r.admit("c").unwrap();
     r.authenticate(id, &actor("alice@a.example"), "k").unwrap();
     let include = Some(Arc::new(HashSet::from(["message.created".to_owned()])));
-    assert_eq!(
-        r.hold_new(id, &["ch".to_owned()], include),
-        Some(vec![true])
-    );
+    let holds = r.hold_new(id, &["ch".to_owned()], include).unwrap();
+    assert!(holds[0].fresh);
     r.publish("ch", "message.created", &text("held"));
     r.publish("ch", "reaction.added", &text("filtered"));
     assert!(drain(&mut rx).is_empty(), "held while access is checked");
-    r.release(id, "ch");
-    assert_eq!(drain(&mut rx), ["held"]);
+    let acked = r.grant(id, &[("ch".to_owned(), holds[0].generation)], |live| {
+        vec![text(&format!("ack {}", live.join(",")))]
+    });
+    assert_eq!(acked, ["ch"]);
+    assert_eq!(drain(&mut rx), ["ack ch", "held"], "the ack comes first");
     r.publish("ch", "message.created", &text("live"));
     assert_eq!(drain(&mut rx), ["live"]);
     r.publish("other", "message.created", &text("not subscribed"));
@@ -100,13 +112,12 @@ fn a_revoked_hold_drops_what_it_kept() {
     } = r.admit("c").unwrap();
     let alice = actor("alice@a.example");
     r.authenticate(id, &alice, "k").unwrap();
-    r.hold_new(id, &["ch".to_owned()], None).unwrap();
-    r.release(id, "ch");
+    let g = subscribe(&r, id, "ch");
     let held = r.hold_matching(&AccessChange::Actor(alice));
     assert_eq!(held.len(), 1);
-    assert_eq!(held[0].topic, "ch");
+    assert_eq!((held[0].topic.as_str(), held[0].generation), ("ch", g));
     r.publish("ch", "message.created", &text("after the change"));
-    assert!(r.unsubscribe(id, "ch"));
+    assert_eq!(r.end(id, "ch", g), Ended::Active);
     assert!(drain(&mut rx).is_empty(), "nothing leaks after revocation");
     r.publish("ch", "message.created", &text("later"));
     assert!(drain(&mut rx).is_empty());
@@ -122,8 +133,7 @@ fn hold_matching_selects_by_topic_actor_or_all() {
     r.authenticate(a, &actor("alice@a.example"), "k").unwrap();
     r.authenticate(b, &actor("bob@a.example"), "k").unwrap();
     for (id, t) in [(a, "x"), (a, "y"), (b, "y")] {
-        r.hold_new(id, &[t.to_owned()], None).unwrap();
-        r.release(id, t);
+        subscribe(&r, id, t);
     }
     let _ = unauth;
     let topics = |held: Vec<Held>| {
@@ -147,15 +157,64 @@ fn the_subscription_cap_is_all_or_none() {
     let r = Registry::new(limits(), local());
     let Admitted { id, .. } = r.admit("c").unwrap();
     r.authenticate(id, &actor("alice@a.example"), "k").unwrap();
-    assert_eq!(r.hold_new(id, &["a".to_owned()], None), Some(vec![true]));
+    subscribe(&r, id, "a");
     assert_eq!(
         r.hold_new(id, &["b".to_owned(), "c".to_owned()], None),
         None
     );
     assert_eq!(
-        r.hold_new(id, &["a".to_owned(), "b".to_owned()], None),
+        fresh(r.hold_new(id, &["a".to_owned(), "b".to_owned()], None)),
         Some(vec![false, true])
     );
+}
+
+/// A re-check that outlives its subscription (the client unsubscribed and
+/// subscribed again meanwhile) neither releases nor ends the new one.
+#[test]
+fn a_stale_recheck_cannot_touch_a_new_subscription() {
+    let r = Registry::new(limits(), local());
+    let Admitted {
+        id,
+        shared: _shared,
+        events: mut rx,
+    } = r.admit("c").unwrap();
+    let alice = actor("alice@a.example");
+    r.authenticate(id, &alice, "k").unwrap();
+    let old = subscribe(&r, id, "ch");
+    let stale = r.hold_matching(&AccessChange::Actor(alice)).remove(0);
+    assert!(r.unsubscribe(id, "ch"));
+    let new = r.hold_new(id, &["ch".to_owned()], None).unwrap()[0];
+    assert!(new.fresh);
+    assert_ne!(new.generation, old);
+
+    r.publish("ch", "message.created", &text("held for the new check"));
+    r.release(id, "ch", stale.generation);
+    assert!(drain(&mut rx).is_empty(), "a stale release flushes nothing");
+    assert_eq!(r.end(id, "ch", stale.generation), Ended::Missing);
+
+    r.grant(id, &[("ch".to_owned(), new.generation)], |_| Vec::new());
+    assert_eq!(drain(&mut rx), ["held for the new check"]);
+}
+
+/// A subscription a re-check ends before its `subscribe` acknowledges it
+/// is never acknowledged, and it ends silently (the `subscribe` refuses
+/// it).
+#[test]
+fn a_subscription_ended_while_pending_is_not_acknowledged() {
+    let r = Registry::new(limits(), local());
+    let Admitted {
+        id,
+        shared: _shared,
+        events: mut rx,
+    } = r.admit("c").unwrap();
+    let alice = actor("alice@a.example");
+    r.authenticate(id, &alice, "k").unwrap();
+    let g = r.hold_new(id, &["ch".to_owned()], None).unwrap()[0].generation;
+    let check = r.hold_matching(&AccessChange::Actor(alice)).remove(0);
+    assert_eq!(r.end(id, "ch", check.generation), Ended::Pending);
+    let acked = r.grant(id, &[("ch".to_owned(), g)], |_| vec![text("ack")]);
+    assert!(acked.is_empty());
+    assert!(drain(&mut rx).is_empty());
 }
 
 #[test]

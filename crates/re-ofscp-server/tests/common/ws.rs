@@ -10,12 +10,15 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::SigningKey;
 use futures_util::{SinkExt as _, StreamExt as _};
+use re_ofscp_server::federation::{Rule, Snapshot};
 use re_ofscp_server::replay::NoLedger;
 use re_ofscp_server::signing::Clock as _;
 use re_ofscp_server::signing::canonical::{sign, ws_canonical_string};
 use re_ofscp_server::timefmt::rfc3339;
 use re_ofscp_server::ws::{Limits, Seams, WsConfig};
 use re_ofscp_server::{AppState, AppStateBuilder, Config, router};
+use re_ofscp_types::Authority;
+use re_ofscp_types::federation::{FederationMode, RuleList, RuleScope};
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
@@ -310,4 +313,22 @@ impl Provider {
             .await;
         c
     }
+}
+
+/// A denylist policy denying `provider`.
+pub fn denying(provider: &Authority) -> Snapshot {
+    let mut s = Snapshot {
+        mode: FederationMode::Denylist,
+        ..Snapshot::default()
+    };
+    s.deny.insert(Rule {
+        id: "r1".to_owned(),
+        list: RuleList::Deny,
+        scope: RuleScope::Authority,
+        value: provider.to_string(),
+        note: String::new(),
+        created_by: "owner".to_owned(),
+        created_at: 0,
+    });
+    s
 }

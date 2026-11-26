@@ -1,5 +1,5 @@
 //! The WebSocket transport (spec §7.1) at `/api/ws`
-//! (docs/decisions/0008-websocket.md).
+//! (docs/decisions/0010-websocket.md).
 //!
 //! * [`protocol`]: the envelope, events, errors and close codes.
 //! * [`conn`]: one connection, from the `auth.challenge` to its close.
@@ -61,14 +61,19 @@ pub struct WsConfig {
     /// How long a connection may stay silent, no `pong` or other traffic,
     /// before it is closed (§7.1: RECOMMENDED 60 s).
     pub idle_timeout: Duration,
-    /// How often a connection checks whether its key needs re-confirming.
+    /// Longest a connection waits between checks of its key's lease. It
+    /// wakes when the next re-confirmation or `cache_until` is due anyway;
+    /// this bounds how late a jump of the clock is noticed.
     pub lease_tick: Duration,
     /// How often every subscription's access is re-checked, as a backstop
     /// to [`Hub::access_changed`].
     pub recheck_interval: Duration,
-    /// Largest message accepted from an authenticated client, in bytes.
+    /// Largest message accepted, in bytes, enforced by the transport as
+    /// the message arrives (so it is also the most buffered for a client
+    /// that has not authenticated yet). Larger closes `1009`.
     pub max_message_bytes: usize,
-    /// Largest message accepted before authentication, in bytes.
+    /// Largest message accepted before authentication, in bytes (an
+    /// `authenticate` is well under 1 KiB). Larger closes `1009`.
     pub max_preauth_bytes: usize,
     /// Commands one connection may send in a burst.
     pub command_burst: u32,
@@ -89,7 +94,7 @@ impl Default for WsConfig {
             idle_timeout: Duration::from_secs(60),
             lease_tick: Duration::from_secs(5),
             recheck_interval: Duration::from_secs(300),
-            max_message_bytes: crate::signing::MAX_SIGNED_BODY,
+            max_message_bytes: 64 * 1024,
             max_preauth_bytes: 8 * 1024,
             command_burst: 40,
             commands_per_sec: 20,

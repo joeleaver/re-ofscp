@@ -9,7 +9,7 @@ use std::time::Duration;
 use common::harness::new_key;
 use common::key_setup::{Setup, cached, client, fetched, nth_client, unavailable};
 use common::remote_peer::{DISCOVERY_PATH, Reply, discovery_doc, keys_doc, keys_path};
-use re_ofscp_server::signing::{KeyResolver, Requester, Signer};
+use re_ofscp_server::signing::{KeyResolver, Lifetime, Requester, Signer};
 use re_ofscp_server::timefmt::rfc3339;
 use re_ofscp_types::Actor;
 
@@ -182,7 +182,12 @@ async fn joining_a_fetch_under_way_is_free() {
         s.resolve_as(&broke, &slow, "dk_1", false).await,
         fetched(Some(k))
     );
-    assert_eq!(first.await.unwrap(), fetched(Some(k)));
+    // Resolved directly, so with the lifetime of the document it fetched.
+    let until = Lifetime::Until(s.now() + 600);
+    assert_eq!(
+        first.await.unwrap(),
+        fetched(Some(k)).map(|r| r.lasting(until))
+    );
     assert_eq!(s.hits("slow"), 1);
 }
 

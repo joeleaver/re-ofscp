@@ -75,6 +75,19 @@ impl Lease {
         self.held
     }
 
+    /// Seconds from `now` until [`Lease::poll`] may next have something to
+    /// do (`0`: now), or `None` if nothing is due until a re-confirmation
+    /// in flight settles, or ever.
+    pub fn due_in(&self, now: i64) -> Option<i64> {
+        let due = match (self.held, self.in_flight) {
+            (Lifetime::Unbounded, _) | (Lifetime::Uncached, true) => return None,
+            (Lifetime::Uncached, false) => self.next,
+            (Lifetime::Until(t), true) => t,
+            (Lifetime::Until(t), false) => self.next.min(t),
+        };
+        Some(due.saturating_sub(now).max(0))
+    }
+
     /// What to do at `now`. A [`Step::Reconfirm`] must be answered with
     /// [`Lease::settle`] before another is issued.
     pub fn poll(&mut self, now: i64) -> Step {
@@ -206,5 +219,19 @@ mod tests {
     fn local_keys_are_never_reconfirmed() {
         let mut lease = Lease::new(Lifetime::Unbounded, T);
         assert_eq!(lease.poll(i64::MAX - 1), Step::Idle);
+    }
+
+    #[test]
+    fn due_in_names_the_next_attempt_or_the_expiry() {
+        let mut l = Lease::new(Lifetime::Until(200), 0);
+        assert_eq!(l.due_in(0), Some(140), "the first attempt, 60 s ahead");
+        assert_eq!(l.due_in(150), Some(0));
+        assert_eq!(l.poll(150), Step::Reconfirm(Lifetime::Until(200)));
+        assert_eq!(l.due_in(150), Some(50), "in flight: only the expiry");
+        assert_eq!(Lease::new(Lifetime::Unbounded, 0).due_in(0), None);
+        let mut u = Lease::new(Lifetime::Uncached, 0);
+        assert_eq!(u.due_in(0), Some(UNCACHED_INTERVAL));
+        assert!(matches!(u.poll(UNCACHED_INTERVAL), Step::Reconfirm(_)));
+        assert_eq!(u.due_in(UNCACHED_INTERVAL), None);
     }
 }

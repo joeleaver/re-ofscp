@@ -11,19 +11,19 @@
 //! meanwhile. Topics that are not readable, or do not exist, are refused
 //! together in one `not_found` error naming them, so a subscribe cannot
 //! tell a private channel from a missing one
-//! (docs/decisions/0008-websocket.md).
+//! (docs/decisions/0010-websocket.md).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use ofscp_core::ws::{Subscribe, Subscribed, Unsubscribe, Unsubscribed};
 use re_ofscp_types::Actor;
-use serde::Deserialize;
-use serde_json::{Map, Value, json};
+use serde_json::json;
 use tokio::sync::mpsc;
 
 use super::Hub;
-use super::protocol::{self, Inbound, MAX_ID_LEN, WsError};
-use super::registry::{ConnId, ConnShared};
+use super::protocol::{self, ACCESS_REVOKED, Command, ErrorEvent as _, MAX_ID_LEN, WsError};
+use super::registry::{ConnId, ConnShared, Ended};
 use super::seams::TopicAccess;
 
 /// An authenticated connection, as its commands see it.
@@ -39,7 +39,7 @@ pub struct Session {
 }
 
 /// Run `commands` in order until the connection ends.
-pub async fn run(session: Session, mut commands: mpsc::Receiver<Inbound>) {
+pub async fn run(session: Session, mut commands: mpsc::Receiver<Command>) {
     while let Some(cmd) = commands.recv().await {
         match cmd.kind.as_str() {
             "subscribe" => session.subscribe(&cmd).await,
@@ -47,22 +47,6 @@ pub async fn run(session: Session, mut commands: mpsc::Receiver<Inbound>) {
             _ => {}
         }
     }
-}
-
-/// `subscribe` data (`ws/subscribe.json`).
-#[derive(Debug, Deserialize)]
-struct SubscribeData {
-    channels: Vec<String>,
-    #[serde(default)]
-    include: Option<Vec<String>>,
-    #[serde(default)]
-    since: Option<Map<String, Value>>,
-}
-
-/// `unsubscribe` data (`ws/unsubscribe.json`).
-#[derive(Debug, Deserialize)]
-struct UnsubscribeData {
-    channels: Vec<String>,
 }
 
 /// The topics of a command, deduplicated in order, or why they are not
@@ -111,10 +95,14 @@ impl Session {
         self.send(e.to_event(Some(correlation), self.hub.now()));
     }
 
-    async fn subscribe(&self, cmd: &Inbound) {
+    async fn subscribe(&self, cmd: &Command) {
         let hub = &self.hub;
-        let parsed = serde_json::from_value::<SubscribeData>(cmd.data.clone())
-            .map_err(|_| WsError::bad_request("subscribe needs channels, an array of channel ids"))
+        let parsed = serde_json::from_value::<Subscribe>(cmd.data.clone())
+            .map_err(|_| {
+                WsError::bad_request(
+                    "subscribe needs channels, an array of channel ids (and string cursors in since)",
+                )
+            })
             .and_then(|d| {
                 let t = topics(d.channels, hub.registry.limits().max_subscriptions)?;
                 Ok((t, d.include, d.since.unwrap_or_default()))
@@ -124,75 +112,96 @@ impl Session {
             Err(e) => return self.error(&cmd.id, &e),
         };
         let include = include.map(|kinds| Arc::new(kinds.into_iter().collect::<HashSet<_>>()));
-        let Some(fresh) = hub.registry.hold_new(self.id, &topics, include) else {
+        let Some(holds) = hub.registry.hold_new(self.id, &topics, include) else {
             let cap = hub.registry.limits().max_subscriptions;
             let e = WsError::subscription_limit(format!("at most {cap} channels per connection"));
             return self.error(&cmd.id, &e);
         };
         let mut granted = Vec::new();
-        let mut truncated = Vec::new();
-        let mut replays = Vec::new();
+        let mut fresh = HashSet::new();
+        let mut truncated = HashSet::new();
+        let mut replays: HashMap<String, Vec<String>> = HashMap::new();
         let mut refused = Vec::new();
         let mut revoked = Vec::new();
         let mut unavailable = Vec::new();
-        for (topic, is_new) in topics.iter().zip(fresh) {
-            let cursor = since.get(topic).and_then(Value::as_str);
-            match self.decide(topic, cursor).await {
+        for (topic, hold) in topics.iter().zip(holds) {
+            let g = hold.generation;
+            if hold.fresh {
+                fresh.insert(topic.clone());
+            }
+            match self
+                .decide(topic, since.get(topic).map(String::as_str))
+                .await
+            {
                 Verdict::Granted {
                     replay,
                     truncated: cut,
                 } => {
-                    granted.push(topic.clone());
+                    granted.push((topic.clone(), g));
                     if cut {
-                        truncated.push(topic.clone());
+                        truncated.insert(topic.clone());
                     }
-                    replays.push(replay);
+                    replays.insert(topic.clone(), replay);
                 }
-                // An existing subscription the actor can no longer read
-                // ends as access lost, however it was found out.
-                Verdict::Refused if !is_new => {
-                    hub.registry.unsubscribe(self.id, topic);
-                    revoked.push(topic.clone());
-                }
-                Verdict::Refused => {
-                    hub.registry.unsubscribe(self.id, topic);
-                    refused.push(topic.clone());
-                }
-                Verdict::Unavailable if is_new => {
-                    hub.registry.unsubscribe(self.id, topic);
+                // A subscription the client had and can no longer read ends
+                // as access lost, however it was found out. Ended already
+                // (by a re-check, which said so), it needs nothing more.
+                Verdict::Refused => match hub.registry.end(self.id, topic, g) {
+                    Ended::Active => revoked.push(topic.clone()),
+                    Ended::Pending => refused.push(topic.clone()),
+                    Ended::Missing if hold.fresh => refused.push(topic.clone()),
+                    Ended::Missing => {}
+                },
+                Verdict::Unavailable if hold.fresh => {
+                    hub.registry.end(self.id, topic, g);
                     unavailable.push(topic.clone());
                 }
                 // The existing grant stands; the periodic re-check will
                 // check it again.
-                Verdict::Unavailable => hub.registry.release(self.id, topic),
+                Verdict::Unavailable => hub.registry.release(self.id, topic, g),
             }
         }
         let now = hub.now();
-        if !granted.is_empty() {
-            let mut data = json!({ "channels": granted });
-            if !truncated.is_empty() {
-                data["truncated"] = json!(truncated);
+        let acked = hub.registry.grant(self.id, &granted, |live| {
+            let ack = Subscribed {
+                channels: live.to_vec(),
+                truncated: live
+                    .iter()
+                    .filter(|t| truncated.contains(*t))
+                    .cloned()
+                    .collect(),
+            };
+            let mut texts =
+                vec![protocol::event("subscribed", Some(&cmd.id), ack.to_value(), now).into()];
+            for topic in live {
+                texts.extend(replays.remove(topic).into_iter().flatten().map(Arc::from));
             }
-            self.send(protocol::event("subscribed", Some(&cmd.id), data, now));
-            for text in replays.into_iter().flatten() {
-                self.send(text);
-            }
-            for topic in &granted {
-                hub.registry.release(self.id, topic);
-            }
-        }
+            texts
+        });
+        // Granted, but ended by a re-check before it could be
+        // acknowledged: a new one is refused like any other unreadable
+        // channel (an existing one was told `unsubscribed` already).
+        refused.extend(
+            granted
+                .into_iter()
+                .map(|(t, _)| t)
+                .filter(|t| fresh.contains(t) && !acked.contains(t)),
+        );
         if !revoked.is_empty() {
-            let data = json!({ "channels": revoked, "reason": "access_revoked" });
-            self.send(protocol::event("unsubscribed", None, data, now));
+            let data = Unsubscribed {
+                channels: revoked,
+                reason: Some(ACCESS_REVOKED.to_owned()),
+            };
+            self.send(protocol::event("unsubscribed", None, data.to_value(), now));
         }
         if !refused.is_empty() {
             let e = WsError::not_found("no such channel, or it cannot be read")
-                .with_details(json!({ "channels": refused }));
+                .with_detail("channels", json!(refused));
             self.error(&cmd.id, &e);
         }
         if !unavailable.is_empty() {
             let e = WsError::service_unavailable("access could not be checked; retry shortly", 5)
-                .with_details(json!({ "channels": unavailable, "retryAfter": 5 }));
+                .with_detail("channels", json!(unavailable));
             self.error(&cmd.id, &e);
         }
     }
@@ -233,9 +242,9 @@ impl Session {
     /// `unsubscribe`: drop the subscriptions and acknowledge with an
     /// `unsubscribed` (no `reason`: the client asked) naming every channel
     /// requested, subscribed or not, so it is idempotent.
-    fn unsubscribe(&self, cmd: &Inbound) {
+    fn unsubscribe(&self, cmd: &Command) {
         let hub = &self.hub;
-        let parsed = serde_json::from_value::<UnsubscribeData>(cmd.data.clone())
+        let parsed = serde_json::from_value::<Unsubscribe>(cmd.data.clone())
             .map_err(|_| {
                 WsError::bad_request("unsubscribe needs channels, an array of channel ids")
             })
@@ -247,11 +256,14 @@ impl Session {
         for topic in &topics {
             hub.registry.unsubscribe(self.id, topic);
         }
-        let data = json!({ "channels": topics });
+        let data = Unsubscribed {
+            channels: topics,
+            reason: None,
+        };
         self.send(protocol::event(
             "unsubscribed",
             Some(&cmd.id),
-            data,
+            data.to_value(),
             hub.now(),
         ));
     }

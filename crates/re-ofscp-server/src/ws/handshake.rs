@@ -8,9 +8,12 @@
 //! `error` and close `4001`.
 //!
 //! A remote actor's provider is checked against federation policy before
-//! any key is fetched (§4.6). Revocations and policy changes that land
-//! while a handshake is verifying are caught by the hub's access epoch: if
-//! it moved, the new connection re-checks before it is acknowledged.
+//! any key is fetched (§4.6), and again once the connection is registered,
+//! just before `authenticated`: a denial that lands while the key is being
+//! resolved fails the handshake (`forbidden`, `4001`) rather than
+//! acknowledging a connection about to be closed. A local revocation that
+//! lands meanwhile is caught by the hub's access epoch: if it moved, the
+//! new connection re-checks its key before it is acknowledged.
 
 use std::sync::Arc;
 
@@ -19,28 +22,17 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use futures_util::StreamExt as _;
 use futures_util::stream::SplitStream;
-use serde::Deserialize;
-use serde_json::json;
+use ofscp_core::ws::{AuthChallenge, Authenticate, Authenticated};
 
 use super::Hub;
 use super::conn::read_error_close;
-use super::protocol::{self, Close, WsError, close};
+use super::protocol::{self, Close, ErrorEvent as _, WsError, close};
 use super::registry::{ConnId, ConnShared, Refused};
-use crate::federation::UNKNOWN_RETRY_SECS;
+use crate::federation::{Decision, UNKNOWN_RETRY_SECS};
 use crate::signing::{Lifetime, Reconfirmed, Requester, VerifyError, WsAuthenticate, WsVerified};
 
 /// Bytes of randomness in a challenge nonce (§7.1: at least 128 bits).
 pub const NONCE_BYTES: usize = 24;
-
-/// The `data` of an `authenticate` command (`ws/authenticate.json`).
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AuthData {
-    actor: String,
-    key_id: String,
-    timestamp: String,
-    signature: String,
-}
 
 /// What a connection needs for its handshake.
 pub(super) struct Handshake<'a> {
@@ -74,10 +66,11 @@ impl Handshake<'_> {
             protocol::event(
                 "auth.challenge",
                 None,
-                json!({
-                    "nonce": nonce,
-                    "expiresAt": crate::timefmt::rfc3339(now.saturating_add(ttl)),
-                }),
+                AuthChallenge {
+                    expires_at: crate::timefmt::rfc3339(now.saturating_add(ttl)),
+                    nonce: nonce.clone(),
+                }
+                .to_value(),
                 now,
             )
             .into(),
@@ -97,7 +90,7 @@ impl Handshake<'_> {
                 .close(Close::new(close::TOO_BIG, "message too big"));
             return None;
         }
-        let cmd = match protocol::parse(&text) {
+        let cmd = match protocol::parse_command(&text) {
             Ok(cmd) => cmd,
             Err(m) => {
                 self.fail(m.id.as_deref(), &WsError::bad_request(m.why));
@@ -109,7 +102,7 @@ impl Handshake<'_> {
             self.fail(Some(&cmd.id), &e);
             return None;
         }
-        let data: AuthData = match serde_json::from_value(cmd.data) {
+        let data: Authenticate = match serde_json::from_value(cmd.data) {
             Ok(d) => d,
             Err(_) => {
                 let e = WsError::bad_request(
@@ -125,7 +118,10 @@ impl Handshake<'_> {
                     protocol::event(
                         "authenticated",
                         Some(&cmd.id),
-                        json!({ "actor": verified.actor.to_string() }),
+                        Authenticated {
+                            actor: verified.actor.to_string(),
+                        }
+                        .to_value(),
                         hub.now(),
                     )
                     .into(),
@@ -134,7 +130,7 @@ impl Handshake<'_> {
                 Some(verified)
             }
             Err(Failure::Error(e, then)) => {
-                tracing::info!(conn = %self.id, code = e.code, why = %e.message, "WebSocket authentication failed");
+                tracing::info!(conn = %self.id, code = %e.code, why = %e.message, "WebSocket authentication failed");
                 self.shared
                     .deliver(e.to_event(Some(&cmd.id), hub.now()).into());
                 self.shared.close(then);
@@ -145,7 +141,7 @@ impl Handshake<'_> {
     }
 
     /// Verify `data` against `nonce` and register the connection.
-    async fn verify(&self, nonce: &str, data: &AuthData) -> Result<WsVerified, Failure> {
+    async fn verify(&self, nonce: &str, data: &Authenticate) -> Result<WsVerified, Failure> {
         let hub = self.hub;
         let verifier = &hub.verifier;
         let auth = WsAuthenticate {
@@ -183,7 +179,16 @@ impl Handshake<'_> {
                     Close::new(close::TRY_AGAIN, "connection cap reached"),
                 ),
             })?;
-        if verified.actor.is_local_to(&hub.local) && hub.access_epoch() != epoch {
+        if !verified.actor.is_local_to(&hub.local) {
+            // The connection now watches the policy (`conn`), but a denial
+            // installed while the key was resolved must not be answered
+            // `authenticated` first.
+            match verifier.policy().decide(verified.actor.domain()) {
+                Decision::Permitted => {}
+                Decision::Denied => return Err(Failure::verify(VerifyError::Forbidden)),
+                Decision::Unknown => return Err(Failure::verify(VerifyError::PolicyUnknown)),
+            }
+        } else if hub.access_epoch() != epoch {
             self.recheck(&verified).await?;
         }
         Ok(verified)
@@ -216,7 +221,7 @@ impl Handshake<'_> {
 
     /// Answer with `e` and close `4001`.
     fn fail(&self, correlation: Option<&str>, e: &WsError) {
-        tracing::info!(conn = %self.id, code = e.code, why = %e.message, "WebSocket handshake refused");
+        tracing::info!(conn = %self.id, code = %e.code, why = %e.message, "WebSocket handshake refused");
         self.shared
             .deliver(e.to_event(correlation, self.hub.now()).into());
         self.shared

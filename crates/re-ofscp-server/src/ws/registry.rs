@@ -13,6 +13,11 @@
 //! once every check passed, or dropped with the subscription if one
 //! failed. So no event reaches a connection whose access is in doubt, and
 //! none is lost to one whose access holds.
+//!
+//! Each subscription has a *generation*, fresh whenever it is created. A
+//! check acts only on the generation it checked, so a slow re-check of a
+//! subscription the client has since dropped and made again cannot
+//! release or end the new one.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -150,6 +155,29 @@ pub struct Held {
     pub actor: Actor,
     /// The topic.
     pub topic: String,
+    /// The subscription's generation.
+    pub generation: u64,
+}
+
+/// A subscription [`Registry::hold_new`] held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hold {
+    /// It was created by this hold: not acknowledged to the client yet.
+    pub fresh: bool,
+    /// Its generation.
+    pub generation: u64,
+}
+
+/// What [`Registry::end`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ended {
+    /// No such subscription (of that generation): nothing changed.
+    Missing,
+    /// It was still waiting for its first grant, so the client never had
+    /// it; the `subscribe` that made it reports it.
+    Pending,
+    /// An acknowledged subscription ended.
+    Active,
 }
 
 #[derive(Debug)]
@@ -157,6 +185,9 @@ struct Sub {
     include: Option<Arc<HashSet<String>>>,
     holds: u32,
     held: Vec<Arc<str>>,
+    generation: u64,
+    /// Not acknowledged yet: its `subscribe` is still checking it.
+    pending: bool,
 }
 
 #[derive(Debug)]
@@ -173,6 +204,7 @@ struct Conn {
 struct State {
     accepting: bool,
     next: u64,
+    next_generation: u64,
     conns: HashMap<ConnId, Conn>,
     by_actor: HashMap<Actor, HashSet<ConnId>>,
     by_client: HashMap<String, usize>,
@@ -206,6 +238,7 @@ impl Registry {
             state: Mutex::new(State {
                 accepting: true,
                 next: 1,
+                next_generation: 1,
                 conns: HashMap::new(),
                 by_actor: HashMap::new(),
                 by_client: HashMap::new(),
@@ -318,14 +351,14 @@ impl Registry {
     /// Hold subscriptions of connection `id` to `topics` (adding the new
     /// ones, with `include`), pending their access checks. All or none:
     /// if the new ones would take the connection past its cap, nothing
-    /// changes and `None` is returned. Otherwise, per topic, whether it is
-    /// new.
+    /// changes and `None` is returned. Otherwise, per topic, its hold.
+    /// Finish with [`Registry::grant`] and [`Registry::end`].
     pub fn hold_new(
         &self,
         id: ConnId,
         topics: &[String],
         include: Option<Arc<HashSet<String>>>,
-    ) -> Option<Vec<bool>> {
+    ) -> Option<Vec<Hold>> {
         let mut s = self.lock();
         let s = &mut *s;
         let conn = s.conns.get_mut(&id)?;
@@ -342,19 +375,29 @@ impl Registry {
                 Some(sub) => {
                     sub.holds += 1;
                     sub.include.clone_from(&include);
-                    fresh.push(false);
+                    fresh.push(Hold {
+                        fresh: sub.pending,
+                        generation: sub.generation,
+                    });
                 }
                 None => {
+                    let generation = s.next_generation;
+                    s.next_generation += 1;
                     conn.subs.insert(
                         topic.clone(),
                         Sub {
                             include: include.clone(),
                             holds: 1,
                             held: Vec::new(),
+                            generation,
+                            pending: true,
                         },
                     );
                     s.by_topic.entry(topic.clone()).or_default().insert(id);
-                    fresh.push(true);
+                    fresh.push(Hold {
+                        fresh: true,
+                        generation,
+                    });
                 }
             }
         }
@@ -403,32 +446,97 @@ impl Registry {
                     conn: id,
                     actor: actor.clone(),
                     topic: topic.clone(),
+                    generation: sub.generation,
                 });
             }
         }
         held
     }
 
-    /// One access check of `topic` on connection `id` passed: release its
-    /// hold, delivering what was kept once no check is left.
-    pub fn release(&self, id: ConnId, topic: &str) {
+    /// One access check of `topic` (of `generation`) on connection `id`
+    /// passed: release its hold, delivering what was kept once no check is
+    /// left.
+    pub fn release(&self, id: ConnId, topic: &str, generation: u64) {
         let mut s = self.lock();
         let Some(conn) = s.conns.get_mut(&id) else {
             return;
         };
-        let Some(sub) = conn.subs.get_mut(topic) else {
-            return;
-        };
+        if let Some(sub) = conn.subs.get_mut(topic)
+            && sub.generation == generation
+        {
+            Self::release_sub(&conn.shared, sub);
+        }
+    }
+
+    fn release_sub(shared: &ConnShared, sub: &mut Sub) {
         sub.holds = sub.holds.saturating_sub(1);
         if sub.holds == 0 {
             for text in sub.held.drain(..) {
-                conn.shared.deliver(text);
+                shared.deliver(text);
             }
         }
     }
 
+    /// A `subscribe` on connection `id` granted `topics` (each with the
+    /// generation it held): of those that still exist, under the lock,
+    /// deliver what `announce` makes of them (the `subscribed` ack and any
+    /// replay), then release their holds. So a subscription ended while
+    /// it was checked is never acknowledged, and nothing published on a
+    /// granted one reaches the client before its ack. Returns the topics
+    /// acknowledged.
+    pub fn grant(
+        &self,
+        id: ConnId,
+        topics: &[(String, u64)],
+        announce: impl FnOnce(&[String]) -> Vec<Arc<str>>,
+    ) -> Vec<String> {
+        let mut s = self.lock();
+        let Some(conn) = s.conns.get_mut(&id) else {
+            return Vec::new();
+        };
+        let live: Vec<String> = topics
+            .iter()
+            .filter(|(t, g)| conn.subs.get(t).is_some_and(|sub| sub.generation == *g))
+            .map(|(t, _)| t.clone())
+            .collect();
+        if live.is_empty() {
+            return live;
+        }
+        for text in announce(&live) {
+            conn.shared.deliver(text);
+        }
+        for topic in &live {
+            if let Some(sub) = conn.subs.get_mut(topic) {
+                sub.pending = false;
+                Self::release_sub(&conn.shared, sub);
+            }
+        }
+        live
+    }
+
+    /// End the subscription of connection `id` to `topic`, if it is still
+    /// of `generation`, and drop what it kept.
+    pub fn end(&self, id: ConnId, topic: &str, generation: u64) -> Ended {
+        let mut s = self.lock();
+        let Some(conn) = s.conns.get_mut(&id) else {
+            return Ended::Missing;
+        };
+        let pending = match conn.subs.get(topic) {
+            Some(sub) if sub.generation == generation => sub.pending,
+            _ => return Ended::Missing,
+        };
+        conn.subs.remove(topic);
+        unindex(&mut s.by_topic, topic, id);
+        if pending {
+            Ended::Pending
+        } else {
+            Ended::Active
+        }
+    }
+
     /// Drop the subscription of connection `id` to `topic`, and what it
-    /// kept. Returns whether there was one.
+    /// kept, whatever its generation (the client asked). Returns whether
+    /// there was one.
     pub fn unsubscribe(&self, id: ConnId, topic: &str) -> bool {
         let mut s = self.lock();
         let Some(conn) = s.conns.get_mut(&id) else {

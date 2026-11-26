@@ -5,7 +5,8 @@
 //!   concerns; one no longer readable ends with an unsolicited
 //!   `unsubscribed {reason: "access_revoked"}`. The subscriptions are held
 //!   while they are re-checked, so nothing published meanwhile reaches a
-//!   connection that turns out to have lost access. An authorizer that
+//!   connection that turns out to have lost access. A re-check acts only
+//!   on the subscription generation it checked. An authorizer that
 //!   cannot answer is retried; if it still cannot, the connection closes
 //!   with `1011` (fail closed), since its access can no longer be vouched
 //!   for.
@@ -24,12 +25,12 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use futures_util::StreamExt as _;
+use ofscp_core::ws::Unsubscribed;
 use re_ofscp_types::Actor;
-use serde_json::json;
 
 use super::Hub;
-use super::protocol::{self, Close, close};
-use super::registry::{AccessChange, Held};
+use super::protocol::{self, ACCESS_REVOKED, Close, close};
+use super::registry::{AccessChange, Ended, Held};
 use super::seams::{SeamError, TopicAccess};
 use crate::accounts::{Revocation, RevocationListener};
 use crate::privacy::Liveness;
@@ -42,8 +43,8 @@ const RECHECK_CONCURRENCY: usize = 16;
 const RECHECK_BACKOFF: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(2)];
 
 impl Hub {
-    /// The access epoch: it moves whenever a revocation or a federation
-    /// policy change is applied.
+    /// The access epoch: it moves whenever a local key or account
+    /// revocation is applied.
     pub(super) fn access_epoch(&self) -> u64 {
         self.epoch.load(Ordering::SeqCst)
     }
@@ -80,11 +81,14 @@ impl Hub {
         futures_util::stream::iter(held)
             .for_each_concurrent(RECHECK_CONCURRENCY, |h| async move {
                 match self.check_patiently(&h.actor, &h.topic).await {
-                    Ok(TopicAccess::Readable) => self.registry.release(h.conn, &h.topic),
+                    Ok(TopicAccess::Readable) => {
+                        self.registry.release(h.conn, &h.topic, h.generation);
+                    }
                     Ok(TopicAccess::Unreadable) => self.revoke_topic(&h),
+                    // A subscription dropped meanwhile needs nothing.
+                    Err(_) if self.registry.end(h.conn, &h.topic, h.generation) == Ended::Missing => {}
                     Err(e) => {
                         tracing::warn!(conn = %h.conn, topic = h.topic, error = %e, "access re-check failed; closing");
-                        self.registry.unsubscribe(h.conn, &h.topic);
                         if let Some(shared) = self.registry.shared(h.conn) {
                             shared.close(Close::new(
                                 close::INTERNAL,
@@ -110,15 +114,21 @@ impl Hub {
         result
     }
 
-    /// End a subscription whose access was lost, telling the client.
+    /// End a subscription whose access was lost, telling the client if it
+    /// had been acknowledged (an unacknowledged one is refused by the
+    /// `subscribe` that made it).
     fn revoke_topic(&self, h: &Held) {
-        if !self.registry.unsubscribe(h.conn, &h.topic) {
+        if self.registry.end(h.conn, &h.topic, h.generation) != Ended::Active {
             return;
         }
         tracing::info!(conn = %h.conn, actor = %h.actor, topic = h.topic, "subscription ended: access revoked");
         if let Some(shared) = self.registry.shared(h.conn) {
-            let data = json!({ "channels": [h.topic], "reason": "access_revoked" });
-            shared.deliver(protocol::event("unsubscribed", None, data, self.now()).into());
+            let data = Unsubscribed {
+                channels: vec![h.topic.clone()],
+                reason: Some(ACCESS_REVOKED.to_owned()),
+            };
+            shared
+                .deliver(protocol::event("unsubscribed", None, data.to_value(), self.now()).into());
         }
     }
 }

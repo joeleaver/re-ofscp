@@ -30,7 +30,7 @@ use super::Hub;
 use super::commands::{self, Session};
 use super::handshake::Handshake;
 use super::lease::{Lease, Outcome, Step};
-use super::protocol::{self, Close, Inbound, STANDARD_COMMANDS, WsError, close};
+use super::protocol::{self, Close, Command, ErrorEvent as _, STANDARD_COMMANDS, WsError, close};
 use super::registry::{ConnId, ConnShared};
 use crate::signing::{Reconfirmed, Requester, WsVerified};
 
@@ -203,7 +203,7 @@ impl Reader<'_> {
         let hub = self.hub;
         let config = hub.config;
         let (commands_tx, commands_rx) =
-            mpsc::channel::<Inbound>(usize::try_from(config.command_burst).unwrap_or(64).max(1));
+            mpsc::channel::<Command>(usize::try_from(config.command_burst).unwrap_or(64).max(1));
         let worker = tokio::spawn(commands::run(
             Session {
                 hub: hub.clone(),
@@ -217,7 +217,15 @@ impl Reader<'_> {
         let verified = Arc::new(verified);
         let start = Instant::now();
         let mut ping = tokio::time::interval_at(start + config.ping_interval, config.ping_interval);
-        let mut lease_tick = tokio::time::interval(config.lease_tick);
+        // When to poll the lease next: when it is due, but at least every
+        // `lease_tick`, so a clock that jumps (or a test clock) is noticed.
+        let lease_wake = |lease: &Lease| {
+            lease.due_in(hub.now()).map(|secs| {
+                let due = Duration::from_secs(u64::try_from(secs).unwrap_or(0));
+                Instant::now() + due.min(config.lease_tick)
+            })
+        };
+        let mut lease_at = lease_wake(&lease);
         let mut bucket = Bucket::new(config.command_burst, config.commands_per_sec, start);
         let mut last_seen = start;
         let mut pending: Option<Pending> = None;
@@ -237,7 +245,9 @@ impl Reader<'_> {
                     }
                 } => {
                     pending = None;
-                    match lease.settle(&found, hub.now()) {
+                    let outcome = lease.settle(&found, hub.now());
+                    lease_at = lease_wake(&lease);
+                    match outcome {
                         Outcome::Keep => {}
                         Outcome::Revoked => self.close(close::REVOKED, "credentials revoked"),
                         Outcome::Expired => self.close(close::AUTH_FAILED, "key could not be re-confirmed"),
@@ -258,10 +268,19 @@ impl Reader<'_> {
                 _ = ping.tick() => {
                     self.send(protocol::event("ping", None, json!({}), hub.now()));
                 }
-                _ = lease_tick.tick() => match lease.poll(hub.now()) {
-                    Step::Idle => {}
-                    Step::Expire => self.close(close::AUTH_FAILED, "key could not be re-confirmed"),
+                () = async {
+                    match lease_at {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => match lease.poll(hub.now()) {
+                    Step::Idle => lease_at = lease_wake(&lease),
+                    Step::Expire => {
+                        lease_at = None;
+                        self.close(close::AUTH_FAILED, "key could not be re-confirmed");
+                    }
                     Step::Reconfirm(held) => {
+                        lease_at = lease_wake(&lease);
                         let (hub, verified, requester) = (hub.clone(), verified.clone(), self.requester.clone());
                         pending = Some(Box::pin(async move {
                             hub.verifier.reconfirm(&verified, held, &requester).await
@@ -311,14 +330,14 @@ impl Reader<'_> {
             self.close(close::POLICY, "command rate exceeded");
             return;
         }
-        let id = protocol::parse(text).ok().map(|c| c.id);
+        let id = protocol::parse_command(text).ok().map(|c| c.id);
         let e = WsError::too_many_requests("too many commands; slow down", 1);
         self.error(id.as_deref(), &e);
     }
 
     /// Handle one text message of an authenticated connection.
-    fn dispatch(&self, text: &str, commands: &mpsc::Sender<Inbound>) {
-        let cmd = match protocol::parse(text) {
+    fn dispatch(&self, text: &str, commands: &mpsc::Sender<Command>) {
+        let cmd = match protocol::parse_command(text) {
             Ok(cmd) => cmd,
             Err(m) => {
                 self.error(m.id.as_deref(), &WsError::bad_request(m.why));
