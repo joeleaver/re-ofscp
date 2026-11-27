@@ -223,6 +223,10 @@ type Group {
     // ownership transfer (lost-conn/ofscp#35). Absent = `created_at`: the
     // creator.
     owner_joined_at: DateTime
+    // When the current owner became the owner: written by an ownership
+    // transfer, and the owner's group-list `updatedAt` (§5.7,
+    // docs/decisions/0018). Absent = `created_at`: the creator.
+    owner_since: DateTime
     // The former owner of an ownership transfer not yet finished
     // (docs/decisions/0020). Absent = no transfer in progress.
     transfer_from: String

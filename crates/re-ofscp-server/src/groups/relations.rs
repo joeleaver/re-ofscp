@@ -12,16 +12,17 @@ use re_ofscp_types::Actor;
 
 use super::access::{self, Standing};
 use super::model::StoredGroup;
-use super::{Caller, Groups};
+use super::{Caller, Groups, MAX_GROUPS_PER_OWNER, MAX_MEMBERSHIPS_PER_ACTOR};
 use crate::db::DbError;
 use crate::privacy::seams::RelFuture;
 use crate::privacy::{GroupMemberships, RelError, Viewer};
 
-/// Most memberships (and most owned groups) read for one user. Owners hold
-/// at most `MAX_GROUPS_PER_OWNER` groups; joining is not bounded per user,
-/// so past this a lookup sees only some of a user's groups. It fails
-/// closed: a group left out is neither shared nor listed.
-const MAX_MEMBERSHIPS_READ: usize = 1_000;
+/// Most membership rows read for one user: every membership
+/// [`MAX_MEMBERSHIPS_PER_ACTOR`] allows, plus a stray row (left by an
+/// ownership transfer, docs/decisions/0020; ignored below) in each of the
+/// at most [`MAX_GROUPS_PER_OWNER`] groups they own. So every group a user
+/// belongs to is read.
+const MAX_MEMBERSHIPS_READ: usize = MAX_MEMBERSHIPS_PER_ACTOR + MAX_GROUPS_PER_OWNER;
 
 /// One user's groups, with where the user stands in each.
 struct Belonging {
@@ -39,7 +40,7 @@ impl Groups {
     /// The active groups `actor` owns or is an active member of.
     async fn belonging(&self, actor: &Actor) -> Result<Belonging, DbError> {
         let mut groups = BTreeMap::new();
-        for g in self.store.owned_groups(actor, MAX_MEMBERSHIPS_READ).await? {
+        for g in self.store.owned_groups(actor, MAX_GROUPS_PER_OWNER).await? {
             groups.insert(g.id.clone(), (g, Standing::Owner));
         }
         let memberships = self

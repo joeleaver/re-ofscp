@@ -64,10 +64,10 @@ with `POST /api/groups/{id}/leave`) and `204` to anyone else.
 
 An entry's `role` is `owner` for the group's owner (`Group.owner`, not a
 `Membership` row) and the membership's role otherwise. Its `updatedAt` is
-`Membership.updated_at` or `Group.owner_since`, columns that the
-membership branch adds and that are written on a role change or a
-transfer. Where one is absent (old rows, or before that branch lands) the
-entry dates from `joined_at` or the group's `created_at`. The reads are in
+`Membership.updated_at` (written on a role change, decision 0020) or
+`Group.owner_since` (written by an ownership transfer). Where one is absent
+(old rows, or a creator who still owns the group) the entry dates from
+`joined_at` or the group's `created_at`. The reads are in
 `groups/listing.rs`, so they stay with the rest of the group storage.
 
 ### Bounds
@@ -84,8 +84,12 @@ entry dates from `joined_at` or the group's `created_at`. The reads are in
   member is answered first (`Ok(false)`, whatever the count). Then the
   active memberships are counted before the write, and again once the
   new one is active; a join that finds the actor over the limit takes its
-  row back (announced, since it was briefly active). Either way the join is
-  `403 forbidden` (provider policy, like the owned-group limit). Owned
+  row back. Either way the join is `403 forbidden` (provider policy, like
+  the owned-group limit). From the activation on, every exit announces
+  the change (`Groups::settle_join`), errors included: an activation that
+  failed may have committed, and a join whose activation or recount failed
+  is taken back (announced again), so no group list misses a membership
+  that may exist. Owned
   groups are bounded by `MAX_GROUPS_PER_OWNER`.
 - **No partial lists.** `GET` must list every group, so it reads one row
   more than each bound (owned groups, memberships, pointers). A list that
@@ -191,9 +195,9 @@ list silently wrong.
 
 - Clients get one list for all their devices, with live updates. A pointer
   stays unchecked by design: a wrong one misleads only its owner's list.
-- The `updatedAt` of a hosted entry moves on a role change or transfer only
-  once the membership branch's columns are written. Before that it is the
-  join or creation time.
+- The `updatedAt` of a hosted entry moves on a role change or a transfer.
+  Rows written before those columns existed date from the join or the
+  group's creation.
 - If the provider ever runs as several processes, the pointer lock must
   become a shared one, or event order between devices weakens (data stays
   correct).

@@ -118,6 +118,32 @@ async fn a_list_over_the_membership_limit_is_500_not_partial() {
 }
 
 #[tokio::test]
+async fn a_stray_row_in_an_owned_group_does_not_count_against_the_limit() {
+    let env = env_with_remotes(&[]).await;
+    let bob = local(&env, "bob").await;
+    let own = id(&create_group(&env, &bob, group_body("Own", "public")).await);
+    // A row an interrupted ownership transfer leaves for the owner
+    // (docs/decisions/0020): not a membership.
+    let q = Ql::new("Membership.create({ key: ")
+        .str(&format!("{own} {}", bob.id()))
+        .raw(", group_id: ")
+        .str(&own)
+        .raw(", actor: ")
+        .str(&bob.id().to_string())
+        .raw(", role: \"admin\", status: \"active\", joined_at: ")
+        .unix_seconds(SIGNED_AT.unix_timestamp())
+        .raw(" })");
+    env.state.db.execute(&q).await.unwrap();
+    memberships(&env, &bob.id(), MAX_MEMBERSHIPS_PER_ACTOR).await;
+    // The fake groups do not exist, so the owned one is all that is listed.
+    let (s, body) = list_status(&env, &bob).await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    assert_eq!(body["groups"].as_array().unwrap().len(), 1, "{body}");
+    assert_eq!(body["groups"][0]["group"], hosted(&own));
+    assert_eq!(body["groups"][0]["role"], "owner");
+}
+
+#[tokio::test]
 async fn a_list_over_the_owned_group_limit_is_500_not_partial() {
     let env = env_with_remotes(&[]).await;
     let alice = local(&env, "alice").await;

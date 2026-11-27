@@ -184,10 +184,18 @@ impl Groups {
         for e in owned {
             entries.insert(e.group_id.clone(), e);
         }
-        let rows = self
+        // A row left in a group they own (by an ownership transfer,
+        // docs/decisions/0020) is not a membership: read enough rows that
+        // such strays cannot hide real ones, and leave them out of the
+        // bound, as `Groups::add_member` counts.
+        let cap = MAX_MEMBERSHIPS_PER_ACTOR + 1 + entries.len();
+        let rows: Vec<_> = self
             .store
-            .membership_rows(actor, MAX_MEMBERSHIPS_PER_ACTOR + 1)
-            .await?;
+            .membership_rows(actor, cap)
+            .await?
+            .into_iter()
+            .filter(|(id, _, _)| !entries.contains_key(id))
+            .collect();
         if rows.len() > MAX_MEMBERSHIPS_PER_ACTOR {
             return Err(ListingError::TooMany(actor.clone()));
         }

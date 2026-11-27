@@ -56,7 +56,9 @@ impl GroupStore {
     /// the owner's nickname moves the revision too
     /// ([`Self::set_owner_display_name`]), so a nickname set since `group`
     /// was read fails this write, and the retry carries it to the former
-    /// owner's row. `None` when the group changed or is gone.
+    /// owner's row. `owner_since` becomes `now`: the new owner's group-list
+    /// entry dates from the transfer (§5.7, decision 0018). `None` when the
+    /// group changed or is gone.
     pub async fn transfer_owner(
         &self,
         group: &StoredGroup,
@@ -87,6 +89,8 @@ impl GroupStore {
             .unix_seconds(to_joined_at)
             .raw(", revision: ")
             .int(group.revision.saturating_add(1))
+            .raw(", owner_since: ")
+            .unix_seconds(now)
             .raw(", updated_at: ")
             .unix_seconds(now)
             .raw(", owner_display_name: ");

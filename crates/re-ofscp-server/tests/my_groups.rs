@@ -10,6 +10,7 @@ use common::groups::{
     Env, call, create_group, env_with_remotes, group_body, id, join, local, remote,
 };
 use common::harness::SIGNED_AT;
+use common::members::set_role;
 use common::my_groups::{delete, hosted, list, pointer_path, put, uris};
 use common::ws::denying;
 use common::{assert_valid, schema};
@@ -126,6 +127,35 @@ async fn a_put_that_changes_nothing_keeps_updated_at() {
     assert!(bare.get("role").is_none(), "{bare}");
     assert_eq!(bare["updatedAt"], "2026-01-01T12:02:00Z");
     assert_eq!(list(&env, &alice).await, vec![bare]);
+}
+
+#[tokio::test]
+async fn a_hosted_entry_dates_from_its_role_change_or_transfer() {
+    let env = env().await;
+    let alice = local(&env, "alice").await;
+    let bob = local(&env, "bob").await;
+    let gid = id(&create_group(&env, &alice, group_body("Home", "public")).await);
+    let uri = hosted(&gid);
+    join(&env, &gid, &bob, "member").await;
+
+    env.clock.set(SIGNED_AT + time::Duration::seconds(60));
+    let (s, m) = set_role(&env, &alice, &gid, &bob.actor, "admin").await;
+    assert_eq!(s, StatusCode::OK, "{m}");
+    let (_, entry) = put(&env, &bob, &uri, None).await;
+    assert_eq!(entry["role"], "admin");
+    assert_eq!(entry["updatedAt"], "2026-01-01T12:01:00Z");
+
+    // A transfer dates both parties' entries (`Group.owner_since` for the
+    // new owner, the former owner's new row for them).
+    env.clock.set(SIGNED_AT + time::Duration::seconds(120));
+    let (s, m) = set_role(&env, &alice, &gid, &bob.actor, "owner").await;
+    assert_eq!(s, StatusCode::OK, "{m}");
+    let (_, entry) = put(&env, &bob, &uri, None).await;
+    assert_eq!(entry["role"], "owner");
+    assert_eq!(entry["updatedAt"], "2026-01-01T12:02:00Z");
+    let (_, entry) = put(&env, &alice, &uri, None).await;
+    assert_eq!(entry["role"], "admin");
+    assert_eq!(entry["updatedAt"], "2026-01-01T12:02:00Z");
 }
 
 #[tokio::test]
