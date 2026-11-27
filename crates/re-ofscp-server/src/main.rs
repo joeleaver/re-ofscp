@@ -2,9 +2,9 @@ use anyhow::Context;
 use re_ofscp_server::{AppState, Config, router};
 use tracing_subscriber::EnvFilter;
 
-/// How long startup waits for the replay ledger before serving in warm-up
-/// (the restore keeps retrying in the background after that).
-const RESTORE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long startup waits for the replay ledger and the federation policy
+/// before serving (both keep retrying in the background after that).
+const STARTUP_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -35,35 +35,44 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState::builder(config)
         .build()
         .context("building application state")?;
-    // The managed database may not be listening yet: the restore retries
-    // until it loads, and ends the warm-up then. Serving waits for it up to
-    // RESTORE_TIMEOUT, then starts in warm-up while it keeps trying.
-    let mut restore = tokio::spawn(state.clone().restore_replay_until_loaded());
-    let restore = match tokio::time::timeout(RESTORE_TIMEOUT, &mut restore).await {
-        Ok(_) => None,
-        Err(_) => {
-            tracing::warn!(
+    // The managed database may not be listening yet. The replay restore
+    // retries until it loads (ending the warm-up then) and the federation
+    // policy load likewise; serving waits for both, together, up to
+    // STARTUP_WAIT, then starts while they keep trying.
+    let deadline = tokio::time::Instant::now() + STARTUP_WAIT;
+    let (restored_tx, restored_rx) = tokio::sync::oneshot::channel();
+    let replay = tokio::spawn(state.clone().maintain_replay(restored_tx));
+    let wait_replay = async {
+        match tokio::time::timeout_at(deadline, restored_rx).await {
+            // The outcome is logged by the restore itself.
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) => tracing::error!(
+                "replay restore task ended without a result; signed requests get 503 \
+                 for one skew window"
+            ),
+            Err(_) => tracing::warn!(
                 "replay ledger not restored yet; serving in warm-up while the restore retries"
-            );
-            Some(restore)
+            ),
         }
     };
     // Federation stays refused (503, nothing sent) until the policy loads.
-    let load_policy = match tokio::time::timeout(RESTORE_TIMEOUT, state.load_federation()).await {
-        Ok(Ok(())) => {
-            tracing::info!("federation policy loaded");
-            None
-        }
-        Ok(Err(e)) => {
-            tracing::warn!(error = %e, "federation policy unavailable at startup; retrying");
-            Some(tokio::spawn(state.federation.clone().load_until_loaded()))
-        }
-        Err(_) => {
-            tracing::warn!("federation policy load timed out at startup; retrying");
-            Some(tokio::spawn(state.federation.clone().load_until_loaded()))
+    let load_policy = async {
+        match tokio::time::timeout_at(deadline, state.load_federation()).await {
+            Ok(Ok(())) => {
+                tracing::info!("federation policy loaded");
+                None
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "federation policy unavailable at startup; retrying");
+                Some(tokio::spawn(state.federation.clone().load_until_loaded()))
+            }
+            Err(_) => {
+                tracing::warn!("federation policy load timed out at startup; retrying");
+                Some(tokio::spawn(state.federation.clone().load_until_loaded()))
+            }
         }
     };
-    let purge = tokio::spawn(state.clone().purge_ledger_forever());
+    let ((), load_policy) = tokio::join!(wait_replay, load_policy);
     if state.admins.enabled() {
         tracing::info!("admin console enabled");
         if state.config.admin_loopback_http {
@@ -97,10 +106,7 @@ async fn main() -> anyhow::Result<()> {
     })
     .await?;
     ws_recheck.abort();
-    purge.abort();
-    if let Some(task) = restore {
-        task.abort();
-    }
+    replay.abort();
     if let Some(task) = load_policy {
         task.abort();
     }

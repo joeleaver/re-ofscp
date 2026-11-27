@@ -409,6 +409,25 @@ impl AppState {
         }
     }
 
+    /// The replay store's background work for the life of the process:
+    /// [`AppState::restore_replay_until_loaded`], its outcome sent on
+    /// `restored` (startup waits on it before serving), then
+    /// [`AppState::purge_ledger_forever`].
+    ///
+    /// The purge starts only after the restore: the ledger is read in pages
+    /// by offset, and rows deleted meanwhile would shift the pages and skip a
+    /// live nonce. (The ledger's `@unique` key would still refuse that
+    /// nonce's replay, but the in-memory store is meant to hold it too.)
+    pub async fn maintain_replay(
+        self,
+        restored: tokio::sync::oneshot::Sender<Result<usize, LedgerError>>,
+    ) {
+        let outcome = self.clone().restore_replay_until_loaded().await;
+        // Startup may have stopped waiting; the outcome is logged either way.
+        let _ = restored.send(outcome);
+        self.purge_ledger_forever().await;
+    }
+
     /// Read the stored federation policy and put it in force. Call before
     /// serving; until it succeeds every federation decision fails closed
     /// (`503` inbound, nothing sent outbound).

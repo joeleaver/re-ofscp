@@ -129,9 +129,13 @@ The spec says a provider SHOULD persist the store, and we do
 - **Startup:** `AppState::restore_replay` reloads every live nonce, in
   pages, and only then ends the warm-up.
   `AppState::restore_replay_until_loaded` retries it until the ledger can
-  be read (waits of 100 ms doubling to 2 s). Serving waits for it for up to
-  30 s, then starts in warm-up while the retries go on, and the warm-up
-  ends as soon as a load succeeds. Ending it late is safe: until then every
+  be read (waits of 100 ms doubling to 2 s). Serving waits for it, and for
+  the federation policy load beside it, for up to 30 s in all, then starts
+  in warm-up while the retries go on, and the warm-up ends as soon as a
+  load succeeds. The ledger purge (`AppState::maintain_replay`) starts only
+  after the restore: the load reads pages by offset, and rows deleted
+  meanwhile would shift the pages and skip a live nonce. (The `@unique`
+  key would still refuse its replay, but the memory store should hold it.) Ending it late is safe: until then every
   signed request the warm-up let through was recorded in memory, and
   `restore` keeps those entries. A ledger that persists nothing
   (`NotPersistent`) is not retried, and its warm-up runs its course.
