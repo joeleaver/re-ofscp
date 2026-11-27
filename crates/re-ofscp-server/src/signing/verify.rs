@@ -6,6 +6,15 @@
 //! fetch is allowed", docs/decisions/0008): a remote signer whose provider
 //! is denied gets `403` before any key is resolved, cached or not, and its
 //! nonce is never recorded.
+//!
+//! No route of this provider accepts provider signatures (§8 *Authorization*,
+//! §8.1; lost-conn/ofscp#42, merged at spec 8ffa97b; docs/decisions/0021).
+//! The only provider-signed requests the spec defines are §10 notification
+//! deliveries, sent to an endpoint's `target`, and this provider receives
+//! none. A provider-signed request passes or fails steps 1–5, then the
+//! federation policy (`403` for a denied provider), and is otherwise
+//! answered `401`, without a discovery fetch, a signature check or a
+//! recorded nonce. Only actors are ever verified.
 
 use std::sync::Arc;
 
@@ -29,31 +38,24 @@ pub use ofscp_core::signing::headers;
 /// unbounded memory in the replay store.
 pub const MAX_TOKEN_LEN: usize = 256;
 
-/// Who signed a request.
+/// Who a request's signing headers claim signed it (§4.5 step 1). Only an
+/// actor can go on to be verified (lost-conn/ofscp#42).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Signer {
     /// A user, via one of their device keys (§4.4).
     Actor(Actor),
-    /// A provider, via its signing key (§8.1).
+    /// A provider (`X-OFSCP-Provider`, §8.1). Never verified here: answered
+    /// `403` or `401` after steps 1–5 (§8 *Authorization*).
     Provider(Authority),
 }
 
-impl Signer {
-    /// The replay-store namespace for this signer.
-    pub fn kind(&self) -> SignerKind {
-        match self {
-            Self::Actor(_) => SignerKind::Actor,
-            Self::Provider(_) => SignerKind::Provider,
-        }
-    }
-}
-
-/// A successfully verified request. Inserted into request extensions by the
-/// signature middleware.
+/// A successfully verified request: always an actor's, since no route
+/// accepts provider signatures (lost-conn/ofscp#42). Inserted into request
+/// extensions by the signature middleware.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Verified {
-    /// Who signed.
-    pub signer: Signer,
+    /// The user who signed, by `(handle, domain)`.
+    pub actor: Actor,
     /// The key that signed.
     pub key_id: String,
 }
@@ -126,6 +128,12 @@ pub enum VerifyError {
     /// signer can be judged: `503`.
     #[error("federation policy is loading; retry shortly")]
     PolicyUnknown,
+    /// A permitted provider signed (`X-OFSCP-Provider`), but no route of
+    /// this provider accepts provider signatures (§8 *Authorization*, §8.1,
+    /// lost-conn/ofscp#42): `401` `unauthorized`, decided without fetching
+    /// the signer's discovery document or checking the signature.
+    #[error("this route does not accept provider signatures")]
+    ProviderSignature,
     /// Step 6: no active key with that id, or no key for this signer can
     /// ever be checked (its provider is refused by our outbound rules).
     #[error("unknown or revoked key")]
@@ -197,9 +205,6 @@ pub struct RequestParts<'a> {
 #[derive(Debug, Clone)]
 pub struct Precheck {
     signer: Signer,
-    /// Canonical signer identity and home domain, for replay quotas.
-    signer_id: String,
-    signer_domain: String,
     key_id: String,
     timestamp: String,
     nonce: String,
@@ -208,14 +213,35 @@ pub struct Precheck {
     signed_at: i64,
 }
 
-impl Precheck {
+/// An actor's use of a nonce, as the replay store keys it. Actors are the
+/// only signers whose nonces are checked or recorded (lost-conn/ofscp#42).
+struct ActorNonce<'a> {
+    /// Canonical actor identity and home domain, for replay quotas.
+    actor: String,
+    domain: String,
+    key_id: &'a str,
+    nonce: &'a str,
+    signed_at: i64,
+}
+
+impl<'a> ActorNonce<'a> {
+    fn new(actor: &Actor, key_id: &'a str, nonce: &'a str, signed_at: i64) -> Self {
+        Self {
+            actor: actor.to_string(),
+            domain: actor.domain().to_string(),
+            key_id,
+            nonce,
+            signed_at,
+        }
+    }
+
     fn nonce_use(&self) -> NonceUse<'_> {
         NonceUse {
-            kind: self.signer.kind(),
-            signer: &self.signer_id,
-            domain: &self.signer_domain,
-            key_id: &self.key_id,
-            nonce: &self.nonce,
+            kind: SignerKind::Actor,
+            signer: &self.actor,
+            domain: &self.domain,
+            key_id: self.key_id,
+            nonce: self.nonce,
             signed_at: self.signed_at,
         }
     }
@@ -245,25 +271,17 @@ impl Verifier {
         }
     }
 
-    /// The signer's provider, if it is not this one: the authority the
-    /// federation policy judges.
-    fn remote_provider<'a>(&self, signer: &'a Signer) -> Option<&'a Authority> {
-        let provider = match signer {
-            Signer::Actor(a) => a.domain(),
-            Signer::Provider(p) => p,
-        };
-        (*provider != self.authority).then_some(provider)
-    }
-
     /// Step 6 begins with the federation policy, decided from the claimed
-    /// provider before any key is resolved (§4.5 step 6, §4.6 "No fetch is
-    /// allowed", §7.3 `forbidden`, §8.5): a cached key that would verify
+    /// provider (the actor's domain, or `X-OFSCP-Provider`) before any key
+    /// is resolved (§4.5 step 6, §4.6 "No fetch is allowed", §7.3
+    /// `forbidden`, §8 *Authorization*): a cached key that would verify
     /// must not rescue a denied signer. Signed HTTP and the WebSocket
-    /// handshake both start step 6 here.
-    pub(super) fn check_policy(&self, signer: &Signer) -> Result<(), VerifyError> {
-        let Some(provider) = self.remote_provider(signer) else {
+    /// handshake both start step 6 here. This provider's own authority is
+    /// never subject to its policy.
+    pub(super) fn check_policy(&self, provider: &Authority) -> Result<(), VerifyError> {
+        if *provider == self.authority {
             return Ok(());
-        };
+        }
         match self.policy.decide(provider) {
             Decision::Permitted => Ok(()),
             Decision::Denied => Err(VerifyError::Forbidden),
@@ -329,32 +347,35 @@ impl Verifier {
             ));
         }
 
-        let (signer_id, signer_domain) = match &h.signer {
-            Signer::Actor(a) => (a.to_string(), a.domain().to_string()),
-            Signer::Provider(p) => (p.to_string(), p.to_string()),
-        };
-        let pre = Precheck {
+        // Step 4: replay check only. Recording happens after step 7.
+        //
+        // Only an actor's nonce is checked. A provider signature is never
+        // verified, so its nonce is never recorded and the check could find
+        // nothing; nor does the restart warm-up apply to it: its `403` or
+        // `401` is answered during the warm-up too (§4.5 *Restarts*,
+        // lost-conn/ofscp#42).
+        if let Signer::Actor(actor) = &h.signer {
+            let entry = ActorNonce::new(actor, h.key_id, h.nonce, signed_at);
+            self.replay
+                .check(Surface::SignedRequest, &entry.nonce_use(), now)
+                .map_err(replay_error)?;
+        }
+        Ok(Precheck {
             signer: h.signer,
-            signer_id,
-            signer_domain,
             key_id: h.key_id.to_owned(),
             timestamp: h.timestamp.to_owned(),
             nonce: h.nonce.to_owned(),
             digest: h.digest.to_owned(),
             signature: h.signature.to_owned(),
             signed_at,
-        };
-
-        // Step 4: replay check only. Recording happens after step 7.
-        self.replay
-            .check(Surface::SignedRequest, &pre.nonce_use(), now)
-            .map_err(replay_error)?;
-        Ok(pre)
+        })
     }
 
     /// §4.5 steps 5–7, then record the nonce. `req` must be the request
     /// `pre` came from; remote key fetches are charged to `requester`, the
-    /// client that sent it.
+    /// client that sent it. A provider signer stops after step 5 and the
+    /// federation policy: `403` if its provider is denied, otherwise `401`
+    /// (§8 *Authorization*, lost-conn/ofscp#42).
     pub async fn complete(
         &self,
         pre: Precheck,
@@ -367,7 +388,20 @@ impl Verifier {
             return Err(VerifyError::Digest);
         }
 
-        self.check_policy(&pre.signer)?;
+        let actor = match pre.signer {
+            Signer::Actor(actor) => {
+                self.check_policy(actor.domain())?;
+                actor
+            }
+            // The policy check sits where §8.1 step 2 would begin, and §8.1
+            // step 2 is never performed: no route here accepts provider
+            // signatures, so nothing is fetched, verified or recorded
+            // (§8 *Authorization*, lost-conn/ofscp#42).
+            Signer::Provider(provider) => {
+                self.check_policy(&provider)?;
+                return Err(VerifyError::ProviderSignature);
+            }
+        };
 
         // Steps 6 and 7: resolve the key and verify, re-fetching once after
         // a cached miss (see `resolve_and_check`).
@@ -382,23 +416,18 @@ impl Verifier {
         }
         .render()
         .map_err(|_| VerifyError::Headers("a signed component contains a line break"))?;
-        self.resolve_and_check(
-            &pre.signer,
-            &pre.key_id,
-            &pre.signature,
-            &canonical,
-            requester,
-        )
-        .await?;
+        self.resolve_and_check(&actor, &pre.key_id, &pre.signature, &canonical, requester)
+            .await?;
 
         // Re-check and record atomically, on a fresh clock reading (reading
         // the body and resolving keys take time). The store re-checks
         // freshness under its lock on a clock that never runs backwards, so
         // a slow or stale copy cannot record a nonce a sibling already used.
         let now = self.clock.now().unix_timestamp();
+        let entry = ActorNonce::new(&actor, &pre.key_id, &pre.nonce, pre.signed_at);
         let recorded = self
             .replay
-            .record(Surface::SignedRequest, &pre.nonce_use(), now)
+            .record(Surface::SignedRequest, &entry.nonce_use(), now)
             .map_err(replay_error)?;
 
         // Make it durable before accepting. The in-memory entry stays even if
@@ -406,7 +435,7 @@ impl Verifier {
         match self
             .ledger
             .persist(
-                &StoredNonce::from_use(&pre.nonce_use(), recorded.expires),
+                &StoredNonce::from_use(&entry.nonce_use(), recorded.expires),
                 recorded.clock,
             )
             .await
@@ -420,28 +449,28 @@ impl Verifier {
         }
 
         Ok(Verified {
-            signer: pre.signer,
+            actor,
             key_id: pre.key_id,
         })
     }
 
-    /// §4.5 steps 6 and 7: resolve `signer`'s key `key_id` and check
+    /// §4.5 steps 6 and 7: resolve `actor`'s key `key_id` and check
     /// `signature` over `canonical`. If a *cached* answer has no such key
     /// or its key does not verify, ask again with `fresh` so a newly
-    /// registered or rotated key is honoured (§4.6, §8.1,
-    /// lost-conn/ofscp#19). An answer fetched for this lookup is final:
+    /// registered or rotated key is honoured (§4.6, lost-conn/ofscp#19). An
+    /// answer fetched for this lookup is final:
     /// fetching it twice could not change it. Resolvers that fetch remotely
     /// rate-limit fresh lookups (see `KeyResolver`). Returns the answer
     /// whose key verified.
     pub(super) async fn resolve_and_check(
         &self,
-        signer: &Signer,
+        actor: &Actor,
         key_id: &str,
         signature: &str,
         canonical: &str,
         requester: &Requester,
     ) -> Result<Resolved, VerifyError> {
-        let attempt = |fresh| self.try_key(signer, key_id, signature, canonical, fresh, requester);
+        let attempt = |fresh| self.try_key(actor, key_id, signature, canonical, fresh, requester);
         match attempt(false).await {
             Ok(resolved) => Ok(resolved),
             Err(failure) if failure.retry => attempt(true).await.map_err(|f| f.error),
@@ -452,14 +481,14 @@ impl Verifier {
     /// Resolve the key (step 6) and check the signature (step 7), once.
     async fn try_key(
         &self,
-        signer: &Signer,
+        actor: &Actor,
         key_id: &str,
         signature: &str,
         canonical: &str,
         fresh: bool,
         requester: &Requester,
     ) -> Result<Resolved, KeyFailure> {
-        let resolved = match self.keys.resolve(signer, key_id, fresh, requester).await {
+        let resolved = match self.keys.resolve(actor, key_id, fresh, requester).await {
             Ok(resolved) => resolved,
             // The policy changed while the key was being resolved.
             Err(KeyError::Denied(_)) => return Err(KeyFailure::terminal(VerifyError::Forbidden)),

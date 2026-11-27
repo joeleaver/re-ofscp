@@ -1,6 +1,7 @@
-//! Signed requests from remote actors and remote providers, verified through
+//! Signed requests from remote actors, verified through
 //! the production router against keys fetched from a local https "remote
-//! provider" (spec §4.5 step 6, §4.6, §8.1; docs/decisions/0006).
+//! provider" (spec §4.5 step 6, §4.6; docs/decisions/0006). Provider
+//! signatures are never verified: see `tests/provider_signers.rs`.
 
 mod common;
 
@@ -9,9 +10,8 @@ use std::sync::Arc;
 use axum::Router;
 use axum::http::StatusCode;
 use common::harness::{SIGNED_AT, SettableClock, new_key, send, signed_as};
-use common::remote_peer::{DISCOVERY_PATH, RemotePeer, Reply, discovery_doc, keys_doc, keys_path};
+use common::remote_peer::{RemotePeer, Reply, keys_doc, keys_path};
 use re_ofscp_server::outbound::OutboundClient;
-use re_ofscp_server::provider_key::ProviderKey;
 use re_ofscp_server::replay::NoLedger;
 use re_ofscp_server::timefmt::rfc3339;
 use re_ofscp_server::{AppState, Config, router};
@@ -109,33 +109,6 @@ async fn a_remote_actor_is_verified_with_keys_from_its_provider() {
 }
 
 #[tokio::test]
-async fn a_remote_provider_is_verified_with_its_discovery_keys() {
-    let peer = RemotePeer::start().await;
-    let key = new_key();
-    let authority = peer.authority().to_string();
-    peer.set(
-        DISCOVERY_PATH,
-        Reply::json(
-            200,
-            &discovery_doc(&authority, &[("pk_1", key.verifying_key())]),
-        ),
-    );
-    let app = app(&peer);
-    let req = signed_as(
-        &key,
-        ("x-ofscp-provider", &authority),
-        "pk_1",
-        "GET",
-        "/api/health",
-        "",
-        TIMESTAMP,
-    );
-    let (status, _, text, _) = send(&app, req).await;
-    assert_eq!(status, StatusCode::OK, "{text}");
-    assert_eq!(peer.hits(DISCOVERY_PATH), 1);
-}
-
-#[tokio::test]
 async fn an_unreachable_provider_is_503_with_retry_after() {
     let peer = RemotePeer::start().await;
     peer.set(&keys_path("alice"), Reply::new(502, ""));
@@ -176,52 +149,4 @@ async fn a_provider_on_a_refused_address_is_401() {
     assert_eq!(json["errorCode"], "unauthorized");
     assert_eq!(retry, None);
     assert_eq!(peer.total_hits(), 0);
-}
-
-#[tokio::test]
-async fn a_provider_signature_naming_this_provider_uses_its_own_key_without_a_fetch() {
-    // Signatures claiming to be from this provider are checked against the
-    // key it publishes (§8.1), held in memory: it never fetches its own
-    // discovery document (providera.com is not even reachable here).
-    let peer = RemotePeer::start().await;
-    let app = app(&peer);
-    let seed: [u8; 32] = base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        common::PROVIDER_SIGNING_KEY,
-    )
-    .unwrap()
-    .try_into()
-    .unwrap();
-    let own = ProviderKey::from_seed(&seed);
-    let ours = signed_as(
-        own.signing_key(),
-        ("x-ofscp-provider", "providera.com"),
-        own.key_id(),
-        "GET",
-        "/api/health",
-        "",
-        TIMESTAMP,
-    );
-    let (status, _, text, _) = send(&app, ours).await;
-    assert_eq!(status, StatusCode::OK, "{text}");
-
-    // Another key under our key id, and our key under an unknown id: 401.
-    for (key, key_id) in [
-        (new_key(), own.key_id()),
-        (own.signing_key().clone(), "psk_1"),
-    ] {
-        let req = signed_as(
-            &key,
-            ("x-ofscp-provider", "providera.com"),
-            key_id,
-            "GET",
-            "/api/health",
-            "",
-            TIMESTAMP,
-        );
-        let (status, json, _, retry) = send(&app, req).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "{key_id}");
-        assert_eq!(json["errorCode"], "unauthorized");
-        assert_eq!(retry, None);
-    }
 }

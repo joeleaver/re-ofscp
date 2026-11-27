@@ -122,23 +122,16 @@ pub struct Accounts {
 
 impl Accounts {
     /// Account services over `db` for `domain`, registering by
-    /// `registration`, resolving this provider's own signatures with
-    /// `provider_keys` (key id, public key) and remote signers with `remote`.
+    /// `registration` and resolving remote actors' keys with `remote`.
     pub fn new(
         domain: Authority,
-        provider_keys: Vec<(String, ed25519_dalek::VerifyingKey)>,
         registration: RegistrationMode,
         db: Arc<Db>,
         remote: Arc<dyn KeyResolver>,
     ) -> Self {
         let invites = InviteStore::new(db.clone());
         let store = AccountStore::new(db);
-        let keys = Arc::new(ProviderKeys::new(
-            domain.clone(),
-            provider_keys,
-            store.clone(),
-            remote,
-        ));
+        let keys = Arc::new(ProviderKeys::new(domain.clone(), store.clone(), remote));
         Self {
             domain,
             registration,

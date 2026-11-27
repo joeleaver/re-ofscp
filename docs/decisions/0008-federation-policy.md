@@ -100,6 +100,9 @@ How a policy is expressed is this provider's design.
   without its signature ever being checked, and its nonce is never
   recorded. It applies to actor and provider signers alike. The signer's
   provider is the actor's domain, or the `X-OFSCP-Provider` authority.
+  Since 0021 (lost-conn/ofscp#42) a permitted provider signer then gets
+  `401`, as no route accepts provider signatures, and provider signers
+  skip the replay check, so they never see the warm-up `503`.
 - **Remote key resolver.** It decides before consulting its cache, so a
   denied provider is neither fetched nor answered from cache. That gives
   `KeyError::Denied`, which the verifier turns into `403`.

@@ -112,11 +112,17 @@ async fn one_signer_over_its_share_gets_429_not_everyone_503() {
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(json["errorCode"], "too_many_requests");
     assert_eq!(retry.as_deref(), Some("301"));
-    // A provider signature is a different signer and still gets through.
+    // A provider signature is never charged to any share: it is answered
+    // `401` before the replay store is consulted (lost-conn/ofscp#42).
     let mut p = Req::vector();
     p.identity = ("x-ofscp-provider", "providera.com".into());
     p.nonce = "provider-nonce-0123456789".into();
-    assert_eq!(send(&h.app, p.build()).await.0, StatusCode::OK);
+    let (status, json, _, _) = send(&h.app, p.build()).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{json}");
+    assert_eq!(
+        json["detail"],
+        "this route does not accept provider signatures"
+    );
 }
 
 #[tokio::test]
@@ -161,15 +167,28 @@ async fn replay_refused_through_the_last_acceptable_second() {
 }
 
 #[tokio::test]
-async fn provider_signed_request_uses_its_own_replay_namespace() {
+async fn a_provider_signed_request_is_401_and_records_no_nonce() {
+    // No route accepts provider signatures (§8 *Authorization*,
+    // lost-conn/ofscp#42): even one that would verify (our own provider
+    // key, the vector key here) is answered `401`, unverified.
     let h = harness();
-    assert_eq!(send(&h.app, Req::vector().build()).await.0, StatusCode::OK);
-    // Same key id and nonce, but signed as a provider: a different namespace.
+    let now = SIGNED_AT.unix_timestamp();
     let mut r = Req::vector();
     r.identity = ("x-ofscp-provider", "providera.com".into());
-    let (status, _, text, _) = send(&h.app, r.build()).await;
-    assert_eq!(status, StatusCode::OK, "{text}");
-    assert_eq!(text, "provider providera.com dk_abc123xyz");
+    for _ in 0..2 {
+        // Twice: the first recorded nothing, so the second is no replay.
+        let (status, json, _, _) = send(&h.app, r.build()).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{json}");
+        assert_eq!(json["errorCode"], "unauthorized");
+        assert_eq!(
+            json["detail"],
+            "this route does not accept provider signatures"
+        );
+        assert!(h.replay.is_empty(now));
+    }
+    // The actor's request with the same key id and nonce is unaffected.
+    assert_eq!(send(&h.app, Req::vector().build()).await.0, StatusCode::OK);
+    assert_eq!(h.replay.len(now), 1);
 }
 
 fn verifier_at(clock: Arc<SettableClock>) -> (Verifier, Arc<ReplayStore>) {

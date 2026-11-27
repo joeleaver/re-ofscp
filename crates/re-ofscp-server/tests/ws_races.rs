@@ -11,8 +11,8 @@ use common::ws::{Client, Provider, denying, fast_config};
 use ed25519_dalek::VerifyingKey;
 use re_ofscp_server::accounts::{Revocation, RevocationListener as _};
 use re_ofscp_server::federation::Snapshot;
-use re_ofscp_server::signing::{KeyFuture, KeyResolver, Requester, Resolved, Signer};
-use re_ofscp_types::Authority;
+use re_ofscp_server::signing::{KeyFuture, KeyResolver, Requester, Resolved};
+use re_ofscp_types::{Actor, Authority};
 use tokio::sync::Notify;
 
 /// Publishes `key` for every signer, but pauses the first lookup until
@@ -42,7 +42,7 @@ impl Paused {
 impl KeyResolver for Paused {
     fn resolve<'a>(
         &'a self,
-        _signer: &'a Signer,
+        _actor: &'a Actor,
         _key_id: &'a str,
         _fresh: bool,
         _requester: &'a Requester,

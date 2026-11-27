@@ -122,7 +122,7 @@ async fn create(
     Path((g, c)): Path<(String, String)>,
     Json(body): Json<Value>,
 ) -> Result<Response, Problem> {
-    let actor = auth.actor()?;
+    let actor = auth.actor();
     channel_ids(&g, &c)?;
     Ok(
         match state.messages.create(actor, &g, &c, body, None).await? {
@@ -162,7 +162,7 @@ async fn edit(
     Path((g, c, m)): Path<(String, String, String)>,
     Json(body): Json<Value>,
 ) -> Result<Json<Message>, Problem> {
-    let actor = auth.actor()?;
+    let actor = auth.actor();
     channel_ids(&g, &c)?;
     let edited = state.messages.edit(actor, &g, &c, &m, body, None).await?;
     Ok(Json(edited.to_wire()))
@@ -174,7 +174,7 @@ async fn delete(
     auth: Authenticated,
     Path((g, c, m)): Path<(String, String, String)>,
 ) -> Result<StatusCode, Problem> {
-    let actor = auth.actor()?;
+    let actor = auth.actor();
     channel_ids(&g, &c)?;
     state.messages.delete(actor, &g, &c, &m, None).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -230,7 +230,7 @@ async fn add_reaction(
     Path((g, c, m, key)): Path<(String, String, String, String)>,
     body: Bytes,
 ) -> Result<Response, Problem> {
-    let actor = auth.actor()?;
+    let actor = auth.actor();
     channel_ids(&g, &c)?;
     let put = reaction_put(&body)?;
     Ok(
@@ -252,7 +252,7 @@ async fn remove_reaction(
     auth: Authenticated,
     Path((g, c, m, key)): Path<(String, String, String, String)>,
 ) -> Result<StatusCode, Problem> {
-    let actor = auth.actor()?;
+    let actor = auth.actor();
     channel_ids(&g, &c)?;
     state
         .messages

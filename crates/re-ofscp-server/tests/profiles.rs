@@ -146,10 +146,15 @@ async fn local_endpoints_need_a_local_signature() {
             Some(json!({"availability": "away"})),
         ),
     ];
-    for caller in [&remote.bob, &remote.provider] {
+    // Remote bob is a user, but not local: 403. A provider signature is
+    // never accepted at all: 401 (lost-conn/ofscp#42).
+    for (caller, expected) in [
+        (&remote.bob, StatusCode::FORBIDDEN),
+        (&remote.provider, StatusCode::UNAUTHORIZED),
+    ] {
         for (method, path, body) in &calls {
             let (status, p) = call(&env, caller, method, path, body.as_ref()).await;
-            problem(status, &p, StatusCode::FORBIDDEN);
+            problem(status, &p, expected);
         }
     }
     // Local bob's profile is untouched.
@@ -243,14 +248,24 @@ async fn the_bio_follows_profile_visibility_by_full_actor() {
     };
     let hi = Some("hi".to_owned());
 
-    // Default (public): everyone, providers included.
-    for c in [&alice, &bob, &remote.bob, &remote.provider] {
+    // Default (public): every user.
+    for c in [&alice, &bob, &remote.bob] {
         assert_eq!(bio(&env, c).await, hi);
     }
-    // authenticated: users, not providers.
+    // A provider signature is never read as an anonymous viewer, even of
+    // public data: 401 (§4.5 *Anonymous viewers*, lost-conn/ofscp#42).
+    let (status, p) = call(
+        &env,
+        &remote.provider,
+        "GET",
+        "/api/users/alice/profile",
+        None,
+    )
+    .await;
+    problem(status, &p, StatusCode::UNAUTHORIZED);
+    // authenticated: users.
     set(json!({"profileVisibility": "authenticated"})).await;
     assert_eq!(bio(&env, &remote.bob).await, hi);
-    assert_eq!(bio(&env, &remote.provider).await, None);
     // nobody, with remote bob allowed: local bob is not remote bob.
     set(json!({"profileVisibility": "nobody", "allowList": ["bob@providerb.com"]})).await;
     assert_eq!(bio(&env, &remote.bob).await, hi);

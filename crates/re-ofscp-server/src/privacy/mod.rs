@@ -20,10 +20,10 @@
 
 pub mod seams;
 
+use re_ofscp_types::Actor;
 use re_ofscp_types::profile::Visibility;
-use re_ofscp_types::{Actor, Authority};
 
-use crate::signing::{Signer, Verified};
+use crate::signing::Verified;
 
 pub use seams::{
     Contacts, GroupMemberships, Liveness, NoConnections, NoContacts, NoGroupsHosted, RelError,
@@ -35,20 +35,19 @@ pub use seams::{
 pub enum Viewer {
     /// An unsigned request: satisfies only `public`.
     Anonymous,
-    /// A provider signature (§8.1). Authenticated, but not a user, so it
-    /// satisfies only `public`.
-    Provider(Authority),
     /// A user, local or remote, by `(handle, domain)`.
     Actor(Actor),
 }
 
 impl Viewer {
-    /// The viewer behind a verified request, or [`Viewer::Anonymous`].
+    /// The viewer behind a verified request, or [`Viewer::Anonymous`] for
+    /// one that carried no signing headers. A provider signature is never a
+    /// viewer: the signature middleware answers it `403` or `401` (§4.5
+    /// *Anonymous viewers*, §8 *Authorization*, lost-conn/ofscp#42).
     pub fn from_verified(verified: Option<&Verified>) -> Self {
-        match verified.map(|v| &v.signer) {
+        match verified {
             None => Self::Anonymous,
-            Some(Signer::Provider(p)) => Self::Provider(p.clone()),
-            Some(Signer::Actor(a)) => Self::Actor(a.clone()),
+            Some(v) => Self::Actor(v.actor.clone()),
         }
     }
 
@@ -56,7 +55,7 @@ impl Viewer {
     pub fn actor(&self) -> Option<&Actor> {
         match self {
             Self::Actor(a) => Some(a),
-            Self::Anonymous | Self::Provider(_) => None,
+            Self::Anonymous => None,
         }
     }
 }
@@ -79,7 +78,7 @@ impl Policy<'_> {
     /// In order: the subject always sees their own data (even under
     /// `nobody`); then the deny list refuses and the allow list admits; then
     /// the tier decides. Lists match users only, so they never apply to
-    /// anonymous or provider viewers. A relationship lookup that fails is an
+    /// anonymous viewers. A relationship lookup that fails is an
     /// error, never an admission (fail closed).
     pub async fn admits(
         &self,

@@ -18,11 +18,10 @@ use common::remote_peer::{RemotePeer, Reply, keys_doc, keys_path};
 use re_ofscp_server::federation::{FederationPolicy, Rule, Snapshot};
 use re_ofscp_server::outbound::{OutboundClient, OutboundError};
 use re_ofscp_server::replay::NoLedger;
-use re_ofscp_server::signing::Signer;
 use re_ofscp_server::timefmt::rfc3339;
 use re_ofscp_server::{AppState, Config, router};
+use re_ofscp_types::Actor;
 use re_ofscp_types::federation::{FederationMode, RuleList, RuleScope};
-use re_ofscp_types::{Actor, Authority};
 
 const TIMESTAMP: &str = "2026-01-01T12:00:00Z";
 const BOB: &str = "bob@chat.evil.example";
@@ -53,20 +52,14 @@ fn deny(value: &str) -> Snapshot {
     )
 }
 
-/// The signature harness, with bob at `chat.evil.example` and the
-/// provider `evil.example` known beside alice (local), under `policy`.
+/// The signature harness, with bob at `chat.evil.example` known beside
+/// alice (local), under `policy`.
 fn app(policy: Arc<FederationPolicy>) -> Router {
-    let keys = alice_keys()
-        .with(
-            Signer::Actor(Actor::parse_canonical(BOB).unwrap()),
-            "dk_abc123xyz",
-            key().verifying_key(),
-        )
-        .with(
-            Signer::Provider(Authority::parse_canonical("evil.example").unwrap()),
-            "dk_abc123xyz",
-            key().verifying_key(),
-        );
+    let keys = alice_keys().with(
+        Actor::parse_canonical(BOB).unwrap(),
+        "dk_abc123xyz",
+        key().verifying_key(),
+    );
     harness_policy(Arc::new(keys), SIGNED_AT, limits(1000), None, policy).app
 }
 

@@ -36,7 +36,7 @@ use super::Caller;
 use super::ops::GroupError;
 use crate::AppState;
 use crate::problem::Problem;
-use crate::signing::{Authenticated, Signer, Verified};
+use crate::signing::{Authenticated, Verified};
 
 /// Longest local id (§2.2); longer path segments cannot name anything.
 const MAX_LOCAL_ID: usize = 128;
@@ -59,13 +59,16 @@ impl From<GroupError> for Problem {
 impl<S: Send + Sync> FromRequestParts<S> for Caller {
     type Rejection = std::convert::Infallible;
 
+    /// The verified actor, or an anonymous viewer when the request carried
+    /// no signing headers at all. A provider-signed request never gets
+    /// here: it is a signed request, never an anonymous viewer, and the
+    /// signature middleware already answered it `403` or `401` (§4.5
+    /// *Anonymous viewers*, §8 *Authorization*, lost-conn/ofscp#42).
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        Ok(
-            match parts.extensions.get::<Verified>().map(|v| &v.signer) {
-                Some(Signer::Actor(a)) => Caller::Actor(a.clone()),
-                Some(Signer::Provider(_)) | None => Caller::Anonymous,
-            },
-        )
+        Ok(match parts.extensions.get::<Verified>() {
+            Some(v) => Caller::Actor(v.actor.clone()),
+            None => Caller::Anonymous,
+        })
     }
 }
 
@@ -129,7 +132,7 @@ pub async fn update_group(
     Path(g): Path<String>,
     Json(patch): Json<GroupUpdateRequest>,
 ) -> Result<Json<Group>, Problem> {
-    let actor = auth.actor()?;
+    let actor = auth.actor();
     group_id(&g)?;
     let now = state.verifier.now();
     Ok(Json(
@@ -143,7 +146,7 @@ pub async fn delete_group(
     auth: Authenticated,
     Path(g): Path<String>,
 ) -> Result<StatusCode, Problem> {
-    let actor = auth.actor()?;
+    let actor = auth.actor();
     group_id(&g)?;
     state.groups.delete_group(actor, &g).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -167,7 +170,7 @@ pub async fn create_channel(
     Path(g): Path<String>,
     Json(req): Json<ChannelCreateRequest>,
 ) -> Result<Response, Problem> {
-    let actor = auth.actor()?;
+    let actor = auth.actor();
     group_id(&g)?;
     let now = state.verifier.now();
     let channel = state.groups.create_channel(actor, &g, req, now).await?;
@@ -191,7 +194,7 @@ pub async fn update_channel(
     Path((g, c)): Path<(String, String)>,
     Json(patch): Json<ChannelUpdateRequest>,
 ) -> Result<Json<Channel>, Problem> {
-    let actor = auth.actor()?;
+    let actor = auth.actor();
     channel_ids(&g, &c)?;
     let now = state.verifier.now();
     Ok(Json(
@@ -208,7 +211,7 @@ pub async fn delete_channel(
     auth: Authenticated,
     Path((g, c)): Path<(String, String)>,
 ) -> Result<StatusCode, Problem> {
-    let actor = auth.actor()?;
+    let actor = auth.actor();
     channel_ids(&g, &c)?;
     state.groups.delete_channel(actor, &g, &c).await?;
     Ok(StatusCode::NO_CONTENT)

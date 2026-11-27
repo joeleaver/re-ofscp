@@ -11,7 +11,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use common::harness::*;
 use ofscp_core::signing::{self as core, DeviceKey};
-use re_ofscp_server::signing::{Signer, StaticKeys};
+use re_ofscp_server::signing::StaticKeys;
 
 const KEY_ID: &str = "dk_core_client";
 const BODY: &str = r#"{"content":{"text":"hi","mime":"text/plain"}}"#;
@@ -23,7 +23,7 @@ fn device_key() -> DeviceKey {
 }
 
 fn harness_for(key: &DeviceKey) -> Harness {
-    let keys = StaticKeys::default().with(Signer::Actor(alice()), KEY_ID, key.verifying_key());
+    let keys = StaticKeys::default().with(alice(), KEY_ID, key.verifying_key());
     harness_with(Arc::new(keys), SIGNED_AT, limits(1000))
 }
 

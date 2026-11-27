@@ -11,7 +11,7 @@ use common::accounts::{
 };
 use common::admin::*;
 use common::harness::{new_key, send as send_signed, signed};
-use re_ofscp_server::signing::{Signer, StaticKeys};
+use re_ofscp_server::signing::StaticKeys;
 use re_ofscp_types::Actor;
 use re_ofscp_types::federation::FederationMode;
 use serde_json::{Value, json};
@@ -301,8 +301,7 @@ async fn the_policy_survives_a_restart() {
 async fn a_denied_remote_signer_gets_403_and_a_local_one_never_does() {
     let key = new_key();
     let bob = Actor::parse_canonical("bob@chat.evil.example").unwrap();
-    let remote =
-        StaticKeys::default().with(Signer::Actor(bob.clone()), "dk_bob", key.verifying_key());
+    let remote = StaticKeys::default().with(bob.clone(), "dk_bob", key.verifying_key());
     let env = env_with(EnvOptions {
         remote: Some(remote),
         ..EnvOptions::default()

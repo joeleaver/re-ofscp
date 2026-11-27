@@ -77,7 +77,7 @@ impl Groups {
         let of_subject = self.belonging(subject).await?;
         let caller = match viewer {
             Viewer::Actor(a) => Caller::Actor(a.clone()),
-            Viewer::Anonymous | Viewer::Provider(_) => Caller::Anonymous,
+            Viewer::Anonymous => Caller::Anonymous,
         };
         let of_viewer = match &caller {
             Caller::Actor(a) if a == subject => None,

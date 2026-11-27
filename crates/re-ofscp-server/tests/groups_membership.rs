@@ -17,8 +17,6 @@ use common::members::{group_with_policy, join_http, leave, members, roster};
 use common::{assert_valid, schema};
 use re_ofscp_server::db::Ql;
 use re_ofscp_server::groups::PENDING_TTL;
-use re_ofscp_server::signing::{Signer, StaticKeys};
-use re_ofscp_types::Authority;
 use serde_json::{Value, json};
 use tower::ServiceExt as _;
 
@@ -181,17 +179,8 @@ async fn leaving_ends_a_membership_but_the_owner_must_transfer_first() {
 #[tokio::test]
 async fn mutations_need_a_user_signature() {
     let provider_key = new_key();
-    let authority = Authority::parse_canonical("providerb.example").unwrap();
-    let keys = StaticKeys::default().with(
-        Signer::Provider(authority),
-        "pk_1",
-        provider_key.verifying_key(),
-    );
-    let env = env_with(EnvOptions {
-        remote: Some(keys),
-        ..Default::default()
-    })
-    .await;
+    // No resolver knows its key: it is never resolved (lost-conn/ofscp#42).
+    let env = env_with(EnvOptions::default()).await;
     let alice = local(&env, "alice").await;
     let g = group(&env, &alice, "public", "open").await;
     let paths = [
@@ -214,7 +203,11 @@ async fn mutations_need_a_user_signature() {
             NOW,
         );
         let (s, _, _, _) = send(&env.app, req).await;
-        assert_eq!(s, StatusCode::FORBIDDEN, "provider-signed {method} {path}");
+        assert_eq!(
+            s,
+            StatusCode::UNAUTHORIZED,
+            "provider-signed {method} {path}"
+        );
     }
 }
 

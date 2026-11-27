@@ -54,16 +54,17 @@ impl ProviderKey {
         &self.signing
     }
 
-    /// Every key this provider publishes, as (key id, public key), for
-    /// verifying its own provider signatures. One today; a rotation window
-    /// would add the previous key (docs/decisions/0007).
+    /// Every key this provider publishes, as (key id, public key). One
+    /// today; a rotation window would add the previous key
+    /// (docs/decisions/0007). Nothing here verifies provider signatures:
+    /// no route accepts them (lost-conn/ofscp#42, docs/decisions/0021).
     pub fn published(&self) -> Vec<(String, ed25519_dalek::VerifyingKey)> {
         vec![(self.key_id.clone(), self.signing.verifying_key())]
     }
 
     /// The published keys as discovery lists them (`provider.publicKeys`),
     /// from the same list as [`ProviderKey::published`], so what peers see
-    /// and what this provider accepts cannot drift apart.
+    /// and what this provider signs with cannot drift apart.
     pub fn public_entries(&self) -> Vec<ProviderPublicKey> {
         self.published()
             .into_iter()

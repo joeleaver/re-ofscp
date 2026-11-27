@@ -124,7 +124,7 @@ async fn join(
     Path(g): Path<String>,
     bytes: Bytes,
 ) -> Result<Response, Problem> {
-    let actor = auth.actor()?;
+    let actor = auth.actor();
     group_id(&g)?;
     join_as(&state, actor, &g, &bytes).await
 }
@@ -137,7 +137,7 @@ async fn join_channel(
     Path((g, _channel)): Path<(String, String)>,
     bytes: Bytes,
 ) -> Result<Response, Problem> {
-    let actor = auth.actor()?;
+    let actor = auth.actor();
     group_id(&g)?;
     join_as(&state, actor, &g, &bytes).await
 }
@@ -168,7 +168,7 @@ async fn leave(
     auth: Authenticated,
     Path(g): Path<String>,
 ) -> Result<StatusCode, Problem> {
-    let actor = auth.actor()?;
+    let actor = auth.actor();
     group_id(&g)?;
     state.groups.leave(actor, &g).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -181,7 +181,7 @@ async fn list_members(
     Path(g): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<Paged<Member>>, Problem> {
-    let actor = auth.actor()?;
+    let actor = auth.actor();
     group_id(&g)?;
     let query = PageQuery::from_params(&params);
     Ok(Json(state.groups.list_members(actor, &g, &query).await?))
@@ -200,7 +200,7 @@ async fn change_role(
     Path((g, user_ref)): Path<(String, String)>,
     bytes: Bytes,
 ) -> Result<Json<Member>, Problem> {
-    let actor = auth.actor()?;
+    let actor = auth.actor();
     group_id(&g)?;
     let req = body::<RoleBody>(&bytes);
     let who = target(&state, &user_ref)?;
@@ -217,7 +217,7 @@ async fn kick(
     auth: Authenticated,
     Path((g, user_ref)): Path<(String, String)>,
 ) -> Result<StatusCode, Problem> {
-    let actor = auth.actor()?;
+    let actor = auth.actor();
     group_id(&g)?;
     let who = target(&state, &user_ref)?;
     state.groups.kick(actor, &g, &who).await?;
@@ -245,7 +245,7 @@ async fn set_display_name(
     Path((g, user_ref)): Path<(String, String)>,
     bytes: Bytes,
 ) -> Result<Json<Member>, Problem> {
-    let actor = auth.actor()?;
+    let actor = auth.actor();
     group_id(&g)?;
     let raw = body::<DisplayNameBody>(&bytes).and_then(|req| {
         req.display_name_override
@@ -265,7 +265,7 @@ async fn list_requests(
     Path(g): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<Paged<JoinRequest>>, Problem> {
-    let actor = auth.actor()?;
+    let actor = auth.actor();
     group_id(&g)?;
     let query = PageQuery::from_params(&params);
     Ok(Json(state.groups.list_requests(actor, &g, &query).await?))
@@ -278,7 +278,7 @@ async fn approve(
     auth: Authenticated,
     Path((g, r)): Path<(String, String)>,
 ) -> Result<Json<Member>, Problem> {
-    let actor = auth.actor()?;
+    let actor = auth.actor();
     group_id(&g)?;
     local_id(&r, "no such join request")?;
     Ok(Json(state.groups.approve_request(actor, &g, &r).await?))
@@ -290,7 +290,7 @@ async fn deny(
     auth: Authenticated,
     Path((g, r)): Path<(String, String)>,
 ) -> Result<StatusCode, Problem> {
-    let actor = auth.actor()?;
+    let actor = auth.actor();
     group_id(&g)?;
     local_id(&r, "no such join request")?;
     state.groups.deny_request(actor, &g, &r).await?;

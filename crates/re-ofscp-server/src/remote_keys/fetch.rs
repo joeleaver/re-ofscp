@@ -1,5 +1,6 @@
-//! Fetching a signer's keys and classifying the outcome (spec §4.6, §8.1,
-//! lost-conn/ofscp#19 and #20).
+//! Fetching a remote actor's keys and classifying the outcome (spec §4.6,
+//! lost-conn/ofscp#19 and #20). A provider's discovery keys are never
+//! fetched: no route accepts provider signatures (lost-conn/ofscp#42).
 
 use std::sync::Arc;
 
@@ -8,51 +9,41 @@ use re_ofscp_types::{Actor, Authority};
 
 use super::document::{self, KeySet};
 use crate::outbound::{OutboundClient, OutboundError, Reservation};
-use crate::signing::Signer;
 
-/// Where a signer's keys are published. Identity is the full actor or
-/// authority, never a bare handle (security requirement 1).
+/// Where an actor's keys are published:
+/// `https://{domain}/.well-known/ofscp/users/{handle}/keys` (§4.6).
+/// Identity is the full actor, never a bare handle (security requirement 1).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Source {
-    /// `https://{domain}/.well-known/ofscp/users/{handle}/keys` (§4.6).
-    User(Actor),
-    /// `https://{authority}/.well-known/ofscp-provider`, `provider.publicKeys`
-    /// (§8.1).
-    Provider(Authority),
-}
+pub struct Source(Actor);
 
 impl Source {
-    /// Where `signer`'s keys come from.
-    pub fn of(signer: &Signer) -> Self {
-        match signer {
-            Signer::Actor(a) => Self::User(a.clone()),
-            Signer::Provider(p) => Self::Provider(p.clone()),
-        }
+    /// Where `actor`'s keys come from.
+    pub fn of(actor: &Actor) -> Self {
+        Self(actor.clone())
+    }
+
+    /// The actor whose keys these are.
+    pub fn actor(&self) -> &Actor {
+        &self.0
     }
 
     /// The host fetched.
     pub fn host(&self) -> &Authority {
-        match self {
-            Self::User(a) => a.domain(),
-            Self::Provider(p) => p,
-        }
+        self.0.domain()
     }
 
     /// The path fetched. A canonical handle is `[a-z0-9_-]`, so it needs no
     /// escaping.
     pub fn path(&self) -> String {
-        match self {
-            Self::User(a) => format!("/.well-known/ofscp/users/{}/keys", a.handle()),
-            Self::Provider(_) => "/.well-known/ofscp-provider".to_owned(),
-        }
+        format!("/.well-known/ofscp/users/{}/keys", self.0.handle())
     }
 }
 
 /// What one fetch found.
 #[derive(Debug, Clone)]
 pub enum Fetched {
-    /// A completed fetch: the signer's keys (empty for an empty list or a
-    /// user-keys `404`), cacheable until `expires` (unix seconds; `None`:
+    /// A completed fetch: the actor's keys (empty for an empty list or a
+    /// `404`), cacheable until `expires` (unix seconds; `None`:
     /// not cacheable).
     Keys {
         /// Usable keys by id.
@@ -89,8 +80,8 @@ pub async fn fetch(
         Err(e) => return Fetched::Failed(e.to_string()),
     };
     let now = now();
-    match (source, res.status) {
-        (Source::User(actor), StatusCode::OK) => match document::user_keys(&res.body, actor) {
+    match res.status {
+        StatusCode::OK => match document::user_keys(&res.body, source.actor()) {
             Ok((keys, cache_until)) => Fetched::Keys {
                 keys: Arc::new(keys),
                 expires: document::user_keys_expiry(cache_until, now),
@@ -99,21 +90,11 @@ pub async fn fetch(
         },
         // §4.6: a user-keys 404 means no key matches (401), like an empty
         // list. It has no `cache_until`, so its caching headers decide.
-        (Source::User(_), StatusCode::NOT_FOUND) => Fetched::Keys {
+        StatusCode::NOT_FOUND => Fetched::Keys {
             keys: Arc::new(KeySet::new()),
             expires: document::http_expiry(&res.headers, now),
         },
-        (Source::Provider(authority), StatusCode::OK) => {
-            match document::discovery(&res.body, authority) {
-                Ok(keys) => Fetched::Keys {
-                    keys: Arc::new(keys),
-                    expires: document::http_expiry(&res.headers, now),
-                },
-                Err(e) => Fetched::Failed(e.to_string()),
-            }
-        }
-        // §8.1: for discovery any non-200 answer is a fetch failure; for
-        // user keys every status but 200 and 404 is (§4.6).
-        (_, status) => Fetched::Failed(format!("{host} answered {status}")),
+        // §4.6: every other status is a fetch failure.
+        status => Fetched::Failed(format!("{host} answered {status}")),
     }
 }

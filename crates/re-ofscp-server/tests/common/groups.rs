@@ -6,7 +6,7 @@ use axum::http::{Request, StatusCode};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use ed25519_dalek::SigningKey;
-use re_ofscp_server::signing::{Signer, StaticKeys};
+use re_ofscp_server::signing::StaticKeys;
 use re_ofscp_types::Actor;
 use serde_json::{Value, json};
 
@@ -46,7 +46,7 @@ pub fn remote(handle: &str, domain: &str) -> Party {
 pub async fn env_with_remotes(remotes: &[&Party]) -> Env {
     let mut keys = StaticKeys::default();
     for p in remotes {
-        keys = keys.with(Signer::Actor(p.id()), &p.key_id, p.key.verifying_key());
+        keys = keys.with(p.id(), &p.key_id, p.key.verifying_key());
     }
     env_with(EnvOptions {
         remote: Some(keys),

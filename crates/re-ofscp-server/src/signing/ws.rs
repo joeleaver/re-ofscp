@@ -19,7 +19,7 @@ use time::format_description::well_known::Rfc3339;
 
 use super::canonical;
 use super::keys::{Lifetime, Reconfirmed, Requester};
-use super::verify::{MAX_TOKEN_LEN, Signer, Verifier, VerifyError, replay_error};
+use super::verify::{MAX_TOKEN_LEN, Verifier, VerifyError, replay_error};
 use crate::replay::{NonceUse, SignerKind, Surface};
 
 /// The fields of an `authenticate` command (`ws/authenticate.json`).
@@ -141,11 +141,10 @@ impl Verifier {
         pre: WsPrecheck,
         requester: &Requester,
     ) -> Result<WsVerified, VerifyError> {
-        let signer = Signer::Actor(pre.actor.clone());
-        self.check_policy(&signer)?;
+        self.check_policy(pre.actor.domain())?;
         let resolved = self
             .resolve_and_check(
-                &signer,
+                &pre.actor,
                 &pre.key_id,
                 &pre.signature,
                 &pre.canonical,
@@ -172,9 +171,14 @@ impl Verifier {
         held: Lifetime,
         requester: &Requester,
     ) -> Reconfirmed {
-        let signer = Signer::Actor(verified.actor.clone());
         self.keys
-            .reconfirm(&signer, &verified.key_id, &verified.key, held, requester)
+            .reconfirm(
+                &verified.actor,
+                &verified.key_id,
+                &verified.key,
+                held,
+                requester,
+            )
             .await
     }
 }

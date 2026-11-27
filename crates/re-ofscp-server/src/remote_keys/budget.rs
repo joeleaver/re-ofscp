@@ -5,10 +5,8 @@
 //!
 //! * **the target**, by registrable domain (port and subdomains ignored, so
 //!   `x@victim.example:1..65535` or `x@{n}.victim.example` behind wildcard
-//!   DNS all share one bucket). Each target has four buckets: user keys and
-//!   provider discovery apart, so requests naming random handles cannot
-//!   stop us from verifying the provider itself; and each of those split
-//!   into **known**, for expiry-driven fetches of known sources (the last
+//!   DNS all share one bucket). Each target has two buckets: **known**,
+//!   for expiry-driven fetches of known sources (the last
 //!   completed fetch found keys), and **first-time**, for everything else,
 //!   including every re-fetch on a key miss. Requests naming random
 //!   handles or subdomains, or real users with bogus key ids, are all
@@ -98,10 +96,8 @@ fn spent_why(spent: &[Kind]) -> &'static str {
 /// The resolver's token buckets.
 #[derive(Debug)]
 pub struct Budgets {
-    user_known: RateLimiter,
-    user_first_time: RateLimiter,
-    provider_known: RateLimiter,
-    provider_first_time: RateLimiter,
+    known: RateLimiter,
+    first_time: RateLimiter,
     clients: RateLimiter,
     networks: RateLimiter,
 }
@@ -110,10 +106,8 @@ impl Default for Budgets {
     fn default() -> Self {
         let target = || RateLimiter::new(DOMAIN_BURST, DOMAIN_PER_MINUTE, MAX_ENTRIES);
         Self {
-            user_known: target(),
-            user_first_time: target(),
-            provider_known: target(),
-            provider_first_time: target(),
+            known: target(),
+            first_time: target(),
             clients: RateLimiter::new(CLIENT_BURST, CLIENT_PER_MINUTE, MAX_ENTRIES),
             networks: RateLimiter::new(NETWORK_BURST, NETWORK_PER_MINUTE, MAX_ENTRIES),
         }
@@ -134,7 +128,7 @@ impl Budgets {
         now: i64,
     ) -> Result<(), OverBudget> {
         let target = target_group(source);
-        let buckets = self.buckets(source, standing, &target, requester);
+        let buckets = self.buckets(standing, &target, requester);
         let mut spent = Vec::new();
         let mut retry_after = 0;
         for (kind, limiter, key) in buckets.iter().flatten() {
@@ -158,18 +152,17 @@ impl Budgets {
         Ok(())
     }
 
-    /// The buckets a fetch of `source` (of `standing`, in target group
+    /// The buckets a fetch (of `standing`, in target group
     /// `target`) for `requester` is charged to, with their keys, in
     /// [`Kind`] order.
     fn buckets<'a>(
         &'a self,
-        source: &Source,
         standing: Standing,
         target: &'a str,
         requester: &'a Requester,
     ) -> [Option<(Kind, &'a RateLimiter, &'a str)>; 3] {
         [
-            Some((Kind::Target, self.targets(source, standing), target)),
+            Some((Kind::Target, self.targets(standing), target)),
             Some((Kind::Client, &self.clients, requester.as_str())),
             requester
                 .network()
@@ -177,12 +170,10 @@ impl Budgets {
         ]
     }
 
-    fn targets(&self, source: &Source, standing: Standing) -> &RateLimiter {
-        match (source, standing) {
-            (Source::User(_), Standing::Known) => &self.user_known,
-            (Source::User(_), Standing::FirstTime) => &self.user_first_time,
-            (Source::Provider(_), Standing::Known) => &self.provider_known,
-            (Source::Provider(_), Standing::FirstTime) => &self.provider_first_time,
+    fn targets(&self, standing: Standing) -> &RateLimiter {
+        match standing {
+            Standing::Known => &self.known,
+            Standing::FirstTime => &self.first_time,
         }
     }
 
@@ -197,7 +188,7 @@ impl Budgets {
         now: i64,
     ) -> bool {
         let target = target_group(source);
-        self.buckets(source, standing, &target, requester)
+        self.buckets(standing, &target, requester)
             .iter()
             .flatten()
             .all(|(_, limiter, key)| limiter.peek(key, now).is_ok())
@@ -212,7 +203,7 @@ pub fn target_group(source: &Source) -> String {
 
 #[cfg(test)]
 mod tests {
-    use re_ofscp_types::{Actor, Authority};
+    use re_ofscp_types::Actor;
 
     use super::Standing::{FirstTime, Known};
     use super::*;
@@ -220,11 +211,7 @@ mod tests {
     const T: i64 = 1_800_000_000;
 
     fn user(id: &str) -> Source {
-        Source::User(Actor::parse_canonical(id).unwrap())
-    }
-
-    fn provider(authority: &str) -> Source {
-        Source::Provider(Authority::parse_canonical(authority).unwrap())
+        Source::of(&Actor::parse_canonical(id).unwrap())
     }
 
     #[test]
@@ -236,8 +223,7 @@ mod tests {
             user("yyy@victim.example:65535"),
             user("xxx@a.victim.example"),
             user("xxx@123.b.victim.example:8443"),
-            provider("victim.example:8443"),
-            provider("www.victim.example"),
+            user("yyy@www.victim.example"),
         ] {
             assert_eq!(target_group(&other), group, "{other:?}");
         }
@@ -354,7 +340,7 @@ mod tests {
     }
 
     #[test]
-    fn user_keys_discovery_known_and_first_time_have_separate_buckets() {
+    fn known_and_first_time_fetches_have_separate_buckets() {
         let b = Budgets::default();
         for i in 0..DOMAIN_BURST {
             let client = Requester::new(format!("client{i}"));
@@ -370,9 +356,6 @@ mod tests {
         let next = user("vvv@victim.example");
         assert!(b.charge(&next, FirstTime, &client, T).is_err());
         assert!(b.charge(&next, Known, &client, T).is_ok());
-        let victim = provider("victim.example");
-        assert!(b.charge(&victim, FirstTime, &client, T).is_ok());
-        assert!(b.charge(&victim, Known, &client, T).is_ok());
     }
 
     #[test]
