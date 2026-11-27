@@ -3,8 +3,11 @@
 //! channel's local id, which holds no space, nor does a canonical actor,
 //! so the key is unambiguous.
 //!
-//! A marker only moves forward: an update is a compare-and-set on the
-//! stored position (`seq`), which rhypedb #59 makes atomic (decision 0012).
+//! A marker keeps its message's creation ordinal (`n`) and how many of the
+//! owner's messages are at or before it (`own`), the two numbers an exact
+//! unread count needs (`unread.rs`). It only moves forward: an update is a
+//! compare-and-set on the stored `n`, which rhypedb #59 makes atomic
+//! (decision 0012), and writes `n` and `own` together.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -14,6 +17,7 @@ use serde::Deserialize;
 
 use crate::db::lookup::lookup;
 use crate::db::{Db, DbError, Ql};
+use crate::messages::ordinals::MarkPoint;
 
 /// A stored marker.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,15 +26,19 @@ pub struct StoredMarker {
     pub scope_id: String,
     /// The newest message read.
     pub message_id: String,
-    /// That message's creation position in the scope's timeline.
-    pub seq: i64,
+    /// That message's creation ordinal among the scope's messages.
+    pub n: i64,
+    /// How many of the owner's messages in the scope have an ordinal of at
+    /// most `n`.
+    pub own: i64,
 }
 
 #[derive(Deserialize)]
 struct MarkerRow {
     scope_id: String,
     message_id: String,
-    seq: i64,
+    n: i64,
+    own: i64,
 }
 
 impl MarkerRow {
@@ -38,7 +46,8 @@ impl MarkerRow {
         StoredMarker {
             scope_id: self.scope_id,
             message_id: self.message_id,
-            seq: self.seq,
+            n: self.n,
+            own: self.own,
         }
     }
 }
@@ -104,28 +113,30 @@ impl MarkerStore {
             .map(|r| r.data.decode()))
     }
 
-    /// Move `owner`'s marker in `scope` to `message_id` at position `seq`,
-    /// only forward, at `now` (unix seconds).
+    /// Move `owner`'s marker in `scope` to `at`, only forward, at `now`
+    /// (unix seconds).
     pub async fn advance(
         &self,
         owner: &Actor,
         scope: &str,
-        message_id: &str,
-        seq: i64,
+        at: &MarkPoint,
         now: i64,
     ) -> Result<Advanced, DbError> {
+        let message_id = at.message_id.as_str();
         for _ in 0..ADVANCE_ATTEMPTS {
             match self.get(owner, scope).await? {
-                Some(m) if m.seq >= seq => return Ok(Advanced::Behind),
+                Some(m) if m.n >= at.n => return Ok(Advanced::Behind),
                 Some(_) => {
                     let q = Ql::new("ReadMarker.filter(.key == ")
                         .str(&key(owner, scope))
-                        .raw(" && .seq < ")
-                        .int(seq)
+                        .raw(" && .n < ")
+                        .int(at.n)
                         .raw(").update({ message_id: ")
                         .str(message_id)
-                        .raw(", seq: ")
-                        .int(seq)
+                        .raw(", n: ")
+                        .int(at.n)
+                        .raw(", own: ")
+                        .int(at.own)
                         .raw(", updated_at: ")
                         .unix_seconds(now)
                         .raw(" })");
@@ -139,7 +150,7 @@ impl MarkerStore {
                         Err(DbError::Contended(_)) => {}
                         Err(e) => return Err(e),
                     }
-                    // Another writer moved it at or past `seq`, or removed
+                    // Another writer moved it at or past `n`, or removed
                     // it: read again.
                 }
                 None => {
@@ -151,8 +162,10 @@ impl MarkerStore {
                         .str(scope)
                         .raw(", message_id: ")
                         .str(message_id)
-                        .raw(", seq: ")
-                        .int(seq)
+                        .raw(", n: ")
+                        .int(at.n)
+                        .raw(", own: ")
+                        .int(at.own)
                         .raw(", updated_at: ")
                         .unix_seconds(now)
                         .raw(" })");

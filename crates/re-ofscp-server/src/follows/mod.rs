@@ -30,12 +30,13 @@ use crate::timefmt;
 use request::ChannelRef;
 use store::{Created, FollowStore, StoredFollow};
 
-/// Most follows one user may hold (provider policy). Following a new
-/// channel beyond it is refused with `409`.
+/// Most follows one user may hold (provider policy): the number of their
+/// follow slots (`store.rs`). Following a new channel beyond it is refused
+/// with `409`.
 pub const MAX_FOLLOWS_PER_ACTOR: usize = 1_000;
-/// How often a follow re-reads when another request created or removed
-/// the same follow under it, before answering `409`.
-const CREATE_ATTEMPTS: usize = 3;
+/// How often a follow reads again when another request created the same
+/// follow or took the slot it picked, before answering `409`.
+const CREATE_ATTEMPTS: usize = 8;
 
 /// Why a follow operation failed.
 #[derive(Debug, thiserror::Error)]
@@ -156,19 +157,12 @@ impl Follows {
             if let Some(existing) = self.store.get(actor, &stored).await? {
                 return Ok((to_wire(&existing, local.as_ref())?, false));
             }
-            self.make_room(actor).await?;
-            match self.store.create(actor, &stored, now).await? {
-                Created::Written(row) => {
-                    // Two creates may each have seen room for one more.
-                    let count = self.store.list(actor, MAX_FOLLOWS_PER_ACTOR + 1).await?;
-                    if count.len() > MAX_FOLLOWS_PER_ACTOR {
-                        self.store.delete(actor, &stored).await?;
-                        return Err(FollowError::Limit);
-                    }
-                    return Ok((to_wire(&row, local.as_ref())?, true));
-                }
-                // Another request created it: read it back.
-                Created::Exists => {}
+            let slot = self.free_slot(actor).await?;
+            match self.store.create(actor, &stored, slot, now).await? {
+                Created::Written(row) => return Ok((to_wire(&row, local.as_ref())?, true)),
+                // Another request created this follow, or took the slot:
+                // read again.
+                Created::Taken => {}
             }
         }
         Err(FollowError::Contended)
@@ -181,15 +175,33 @@ impl Follows {
         Ok(self.store.delete(actor, &channel.stored()).await?)
     }
 
-    /// Ensure `actor` has room for one more follow. At the limit, first
-    /// prune their local follows of channels that are gone or that they
-    /// can no longer read: the list does not show those, so they could not
-    /// remove them themselves (§7.6 allows pruning a stale pointer).
-    async fn make_room(&self, actor: &Actor) -> Result<(), FollowError> {
-        let rows = self.store.list(actor, MAX_FOLLOWS_PER_ACTOR).await?;
-        if rows.len() < MAX_FOLLOWS_PER_ACTOR {
-            return Ok(());
+    /// A slot `actor` holds no follow in, picked at random among the free
+    /// ones so that concurrent creates seldom pick the same one. With every
+    /// slot taken, first prune their local follows of channels that are
+    /// gone or that they can no longer read: the list does not show those,
+    /// so they could not remove them themselves (§7.6 allows pruning a
+    /// stale pointer). With none to prune, the limit is reached (`409`).
+    async fn free_slot(&self, actor: &Actor) -> Result<usize, FollowError> {
+        let mut rows = self.store.list(actor, MAX_FOLLOWS_PER_ACTOR + 1).await?;
+        if store::free_slots(&rows, MAX_FOLLOWS_PER_ACTOR).is_empty() {
+            self.prune_stale(actor, &rows).await?;
+            rows = self.store.list(actor, MAX_FOLLOWS_PER_ACTOR + 1).await?;
         }
+        let free = store::free_slots(&rows, MAX_FOLLOWS_PER_ACTOR);
+        if free.is_empty() {
+            // Another request took the slots pruning freed.
+            return Err(FollowError::Limit);
+        }
+        let mut pick = [0u8; 8];
+        getrandom::fill(&mut pick).map_err(|e| DbError::Query(format!("random source: {e}")))?;
+        // Below `free.len()`, so the cast cannot truncate.
+        let at = (u64::from_le_bytes(pick) % free.len() as u64) as usize;
+        free.get(at).copied().ok_or(FollowError::Limit)
+    }
+
+    /// Remove `actor`'s local follows (among `rows`) of channels that are
+    /// gone or that they can no longer read; `409` if there are none.
+    async fn prune_stale(&self, actor: &Actor, rows: &[StoredFollow]) -> Result<(), FollowError> {
         let local: Vec<String> = rows
             .iter()
             .filter(|f| is_local(&f.channel))

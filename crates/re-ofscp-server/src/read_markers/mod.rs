@@ -1,10 +1,12 @@
 //! Read markers and unread counts (spec §7.7; docs/decisions/0021): for
 //! each local user, the newest message they have read in each channel
-//! they can read in the groups they belong to.
+//! they can read in the groups they belong to, and the exact number of
+//! messages after it that they did not write (lost-conn/ofscp#41).
 //!
 //! - [`request`]: reading the `PATCH` body (`400`s).
 //! - [`store`]: the `ReadMarker` rows.
-//! - [`unread`]: counting what is newer than a marker.
+//! - [`unread`]: the unread count from a marker and the channel's counts
+//!   (`messages::ordinals`).
 //! - [`routes`]: `GET`/`PATCH /api/me/read-markers`.
 //!
 //! A scope the user cannot read now is an unknown scope (§7.7, security
@@ -21,53 +23,23 @@ pub mod unread;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use futures_util::stream::{self, StreamExt, TryStreamExt};
 use ofscp_core::LocalId;
 use ofscp_core::wire::ReadMarker;
+use ofscp_core::ws::ReadUpdated;
 use re_ofscp_types::Actor;
-use serde::Serialize;
 
 use crate::db::DbError;
 use crate::groups::Groups;
 use crate::groups::listing::ListingError;
 use crate::groups::model::StoredChannel;
 use crate::messages::Messages;
-use crate::messages::log;
+use crate::messages::ordinals::Totals;
 use crate::ws::Hub;
 use request::MarkerUpdate;
 use store::{Advanced, MarkerStore, StoredMarker};
 
 /// The `read.updated` event type (§7.7).
 pub const READ_UPDATED: &str = "read.updated";
-/// Unread counts computed at once for one listing.
-const COUNT_CONCURRENCY: usize = 8;
-
-/// One scope's entry in a response or a `read.updated` event: a
-/// `ReadMarker` (`read-markers-response.json`), plus the extension field
-/// `unreadCountCapped` (§2.3) when `unreadCount` is a lower bound.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Scope {
-    /// The marker.
-    #[serde(flatten)]
-    pub marker: ReadMarker,
-    /// Whether there may be more unread messages than `unreadCount`.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub unread_count_capped: bool,
-}
-
-/// `GET`/`PATCH /api/me/read-markers` responses.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ScopesResponse {
-    /// One entry per scope.
-    pub scopes: Vec<Scope>,
-}
-
-/// `read.updated` data.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct ReadUpdated<'a> {
-    markers: &'a [Scope],
-}
 
 /// Why a read-marker operation failed.
 #[derive(Debug, thiserror::Error)]
@@ -96,7 +68,7 @@ impl std::fmt::Debug for ReadMarkers {
 
 impl ReadMarkers {
     /// Markers kept in `store`, over `groups`' channels and `messages`'
-    /// timelines, announcing changes through `hub`.
+    /// counts, announcing changes through `hub`.
     pub fn new(
         store: MarkerStore,
         groups: Arc<Groups>,
@@ -112,25 +84,12 @@ impl ReadMarkers {
     }
 
     /// `GET /api/me/read-markers`: an entry for every channel `actor` can
-    /// read now in the groups they belong to.
-    pub async fn scopes(&self, actor: &Actor) -> Result<Vec<Scope>, MarkerError> {
+    /// read now in the groups they belong to. Bounded whatever the
+    /// channels hold: batched lookups of the markers, logs and tallies.
+    pub async fn scopes(&self, actor: &Actor) -> Result<Vec<ReadMarker>, MarkerError> {
         let channels = self.groups.readable_member_channels(actor).await?;
         let ids: Vec<String> = channels.iter().map(|c| c.id.clone()).collect();
-        let markers = self.store.for_scopes(actor, &ids).await?;
-        let lasts = log::last_positions(self.messages.store().db(), &ids).await?;
-        // Collected first: a lazily mapped iterator here makes the handler's
-        // future fail axum's `Send` bound (a higher-ranked lifetime).
-        let entries: Vec<_> = channels
-            .iter()
-            .map(|c| {
-                let last = lasts.get(&c.id).copied().unwrap_or(0);
-                self.entry(actor, c, markers.get(&c.id), last)
-            })
-            .collect();
-        stream::iter(entries)
-            .buffered(COUNT_CONCURRENCY)
-            .try_collect()
-            .await
+        self.entries(actor, &channels, &ids).await
     }
 
     /// `PATCH /api/me/read-markers` at `now` (unix seconds): move each
@@ -142,10 +101,11 @@ impl ReadMarkers {
         actor: &Actor,
         updates: &[MarkerUpdate],
         now: i64,
-    ) -> Result<Vec<Scope>, MarkerError> {
+    ) -> Result<Vec<ReadMarker>, MarkerError> {
+        let reader = actor.to_string();
         // The usable channel of each scope named, looked up once.
         let mut usable: BTreeMap<&str, Option<StoredChannel>> = BTreeMap::new();
-        let mut moved: Vec<String> = Vec::new();
+        let mut moved: Vec<StoredChannel> = Vec::new();
         for u in updates {
             if !usable.contains_key(u.scope_id.as_str()) {
                 let channel = match LocalId::new(&u.scope_id) {
@@ -161,33 +121,25 @@ impl ReadMarkers {
             let Some(Some(channel)) = usable.get(u.scope_id.as_str()) else {
                 continue;
             };
-            let Some(message) = self
+            let Some(at) = self
                 .messages
-                .store()
-                .message(&channel.id, u.last_read_message_id.as_str())
+                .mark_point(&channel.id, u.last_read_message_id.as_str(), &reader)
                 .await?
             else {
                 continue;
             };
-            let advanced = self
-                .store
-                .advance(actor, &channel.id, message.id.as_str(), message.seq, now)
-                .await?;
-            if matches!(advanced, Advanced::Moved(_)) && !moved.contains(&channel.id) {
-                moved.push(channel.id.clone());
+            let advanced = self.store.advance(actor, &channel.id, &at, now).await?;
+            if matches!(advanced, Advanced::Moved(_)) && !moved.iter().any(|c| c.id == channel.id) {
+                moved.push(channel.clone());
             }
         }
-        let mut scopes = Vec::with_capacity(moved.len());
-        for id in &moved {
-            let Some(Some(channel)) = usable.get(id.as_str()) else {
-                continue;
-            };
-            let marker = self.store.get(actor, id).await?;
-            let last = log::read(self.messages.store().db(), id).await?.last();
-            scopes.push(self.entry(actor, channel, marker.as_ref(), last).await?);
-        }
+        let ids: Vec<String> = moved.iter().map(|c| c.id.clone()).collect();
+        let scopes = self.entries(actor, &moved, &ids).await?;
         if !scopes.is_empty() {
-            match serde_json::to_value(ReadUpdated { markers: &scopes }) {
+            let event = ReadUpdated {
+                markers: scopes.clone(),
+            };
+            match serde_json::to_value(event) {
                 Ok(data) => self.hub.send_to_actor(actor, READ_UPDATED, data),
                 Err(e) => tracing::error!(error = %e, "serializing read.updated failed"),
             }
@@ -195,30 +147,44 @@ impl ReadMarkers {
         Ok(scopes)
     }
 
-    /// The entry for `channel`, whose timeline has handed out positions up
-    /// to `last`, given `actor`'s marker there.
-    async fn entry(
+    /// The entries for `channels` (whose ids are `ids`), in that order, with
+    /// `actor`'s markers and exact unread counts.
+    async fn entries(
         &self,
         actor: &Actor,
-        channel: &StoredChannel,
-        marker: Option<&StoredMarker>,
-        last: i64,
-    ) -> Result<Scope, MarkerError> {
-        let bad = |what: &str| DbError::Decode(format!("read marker {}: bad {what}", channel.id));
-        let after = marker.map_or(0, |m| m.seq);
-        let unread = unread::count(self.messages.store(), &channel.id, after, last, actor).await?;
-        let last_read_message_id = match marker {
-            Some(m) => Some(LocalId::new(&m.message_id).map_err(|_| bad("message id"))?),
-            None => None,
-        };
-        Ok(Scope {
-            marker: ReadMarker {
-                scope_id: LocalId::new(&channel.id).map_err(|_| bad("scope id"))?,
-                last_read_message_id,
-                unread_count: unread.count,
-                group_id: Some(LocalId::new(&channel.group_id).map_err(|_| bad("group id"))?),
-            },
-            unread_count_capped: unread.capped,
-        })
+        channels: &[StoredChannel],
+        ids: &[String],
+    ) -> Result<Vec<ReadMarker>, MarkerError> {
+        if channels.is_empty() {
+            return Ok(Vec::new());
+        }
+        let markers = self.store.for_scopes(actor, ids).await?;
+        let totals = self.messages.totals(ids, &actor.to_string()).await?;
+        channels
+            .iter()
+            .map(|c| {
+                let t = totals.get(&c.id).copied().unwrap_or_default();
+                entry(c, markers.get(&c.id), t)
+            })
+            .collect()
     }
+}
+
+/// The entry for `channel`, given the reader's marker and totals there.
+fn entry(
+    channel: &StoredChannel,
+    marker: Option<&StoredMarker>,
+    totals: Totals,
+) -> Result<ReadMarker, MarkerError> {
+    let bad = |what: &str| DbError::Decode(format!("read marker {}: bad {what}", channel.id));
+    let last_read_message_id = match marker {
+        Some(m) => Some(LocalId::new(&m.message_id).map_err(|_| bad("message id"))?),
+        None => None,
+    };
+    Ok(ReadMarker {
+        scope_id: LocalId::new(&channel.id).map_err(|_| bad("scope id"))?,
+        last_read_message_id,
+        unread_count: unread::count(&channel.id, totals, marker)?,
+        group_id: Some(LocalId::new(&channel.group_id).map_err(|_| bad("group id"))?),
+    })
 }

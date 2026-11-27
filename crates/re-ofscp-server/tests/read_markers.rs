@@ -1,20 +1,21 @@
 //! Read markers and unread counts (spec §7.7; docs/decisions/0021;
 //! security requirements 1 and 5), on a real rhypedb-server: `GET`/`PATCH
-//! /api/me/read-markers` and the `read.updated` event.
+//! /api/me/read-markers` and the `read.updated` event. Exact counts are in
+//! tests/read_marker_counts.rs.
 
 mod common;
 
 use std::time::Duration;
 
 use axum::http::StatusCode;
-use common::groups::{Env, Party, call, create_channel, env_with_remotes, id, join, local, remote};
+use common::groups::{Env, Party, call, create_channel, env_with_remotes, id, remote};
 use common::harness::SIGNED_AT;
 use common::members::kick;
-use common::messages::{Chan, post, public_channel, text};
+use common::messages::{Chan, public_channel};
+use common::read_markers::{mark, posts, scopes, setup};
 use common::ws::{Client, serve};
 use common::{assert_valid, schema};
 use re_ofscp_server::read_markers::store::MarkerStore;
-use re_ofscp_server::read_markers::unread::UNREAD_COUNT_MAX;
 use serde_json::{Value, json};
 
 const QUIET: Duration = Duration::from_millis(300);
@@ -22,47 +23,6 @@ const QUIET: Duration = Duration::from_millis(300);
 fn assert_problem(status: StatusCode, body: &Value, want: StatusCode, code: &str) {
     assert_eq!(status, want, "{body}");
     assert_eq!(body["errorCode"], code, "{body}");
-}
-
-/// `GET /api/me/read-markers` as `by`, checked against the schema.
-async fn scopes(env: &Env, by: &Party) -> Vec<Value> {
-    let (s, body) = call(env, Some(by), "GET", "/api/me/read-markers", None).await;
-    assert_eq!(s, StatusCode::OK, "{body}");
-    assert_valid(&schema("read-markers-response.json"), &body);
-    body["scopes"].as_array().unwrap().clone()
-}
-
-/// `PATCH /api/me/read-markers` as `by` with `(scopeId, messageId)` pairs;
-/// panics unless `200`. Returns the scopes that moved.
-async fn mark(env: &Env, by: &Party, markers: &[(&str, &str)]) -> Vec<Value> {
-    let markers: Vec<Value> = markers
-        .iter()
-        .map(|(s, m)| json!({"scopeId": s, "lastReadMessageId": m}))
-        .collect();
-    let body = json!({ "markers": markers });
-    let (s, body) = call(env, Some(by), "PATCH", "/api/me/read-markers", Some(body)).await;
-    assert_eq!(s, StatusCode::OK, "{body}");
-    assert_valid(&schema("read-markers-response.json"), &body);
-    body["scopes"].as_array().unwrap().clone()
-}
-
-/// Alice's public group with one public channel, bob a member.
-async fn setup() -> (Env, Party, Party, Chan) {
-    let env = env_with_remotes(&[]).await;
-    let alice = local(&env, "alice").await;
-    let bob = local(&env, "bob").await;
-    let chan = public_channel(&env, &alice).await;
-    join(&env, &chan.g, &bob, "member").await;
-    (env, alice, bob, chan)
-}
-
-/// Post `n` messages in `chan` as `by`; their ids, in order.
-async fn posts(env: &Env, by: &Party, chan: &Chan, n: usize) -> Vec<String> {
-    let mut ids = Vec::with_capacity(n);
-    for i in 0..n {
-        ids.push(id(&post(env, by, chan, text(&format!("m{i}"))).await));
-    }
-    ids
 }
 
 #[tokio::test]
@@ -201,20 +161,6 @@ async fn markers_for_unusable_scopes_are_ignored() {
     let store = MarkerStore::new(env.state.db.clone());
     let ids = [hidden.c.clone(), elsewhere.c.clone(), chan.c.clone()];
     assert!(store.for_scopes(&bob.id(), &ids).await.unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn long_unread_runs_are_reported_as_capped() {
-    let (env, alice, bob, chan) = setup().await;
-    let n = usize::try_from(UNREAD_COUNT_MAX).unwrap() + 1;
-    let m = posts(&env, &alice, &chan, n).await;
-    let got = scopes(&env, &bob).await;
-    assert_eq!(got[0]["unreadCount"], UNREAD_COUNT_MAX);
-    assert_eq!(got[0]["unreadCountCapped"], true);
-    // Exactly the maximum is exact.
-    let moved = mark(&env, &bob, &[(&chan.c, &m[0])]).await;
-    assert_eq!(moved[0]["unreadCount"], UNREAD_COUNT_MAX);
-    assert!(moved[0].get("unreadCountCapped").is_none(), "{}", moved[0]);
 }
 
 #[tokio::test]

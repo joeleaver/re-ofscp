@@ -9,7 +9,7 @@ use ofscp_core::{Actor, LocalId};
 use serde::Deserialize;
 
 use super::model::{MessageDoc, StoredMessage};
-use crate::db::doc::{json, new_id};
+use crate::db::doc::json;
 use crate::db::lookup::lookup;
 use crate::db::{Db, DbError, Ql};
 use crate::timefmt;
@@ -25,6 +25,13 @@ pub mod event_kind {
 /// A timeline position's key: `"{scope}:{n}"`.
 pub(super) fn position(scope: &str, n: i64) -> String {
     format!("{scope}:{n}")
+}
+
+/// The `@unique` key of `author`'s `author_n`th message in `channel_id`
+/// (`Message.apos`): `"{channel} {author} {author_n}"`. Neither a channel
+/// id nor a canonical actor holds a space.
+pub(super) fn author_position(channel_id: &str, author: &str, author_n: i64) -> String {
+    format!("{channel_id} {author} {author_n}")
 }
 
 /// The `n` of a position key of `scope`.
@@ -51,6 +58,9 @@ struct MessageRow {
     edited_at: i64,
     revision: i64,
     deleted_at: i64,
+    // Absent on messages from before ordinals (`ordinals.rs`).
+    #[serde(default)]
+    n: Option<i64>,
 }
 
 impl MessageRow {
@@ -81,6 +91,7 @@ impl MessageRow {
             channel_id: LocalId::new(&self.channel_id).map_err(|_| bad("channel_id"))?,
             group_id: LocalId::new(&self.group_id).map_err(|_| bad("group_id"))?,
             seq: self.seq,
+            n: self.n,
             reply_seq: self.reply_seq,
             reaction_seq: self.reaction_seq,
             created_at: timefmt::parse_timestamp(&self.created_at)
@@ -123,12 +134,18 @@ pub struct StoredEvent {
 /// A message about to be written.
 #[derive(Debug, Clone)]
 pub struct NewMessage<'a> {
+    /// Its id, chosen before its ordinals were taken (`ops.rs`).
+    pub id: &'a str,
     /// Its channel.
     pub channel_id: &'a str,
     /// The channel's group.
     pub group_id: &'a str,
     /// Its timeline position.
     pub seq: i64,
+    /// Its creation ordinal among the channel's messages.
+    pub n: i64,
+    /// Its ordinal among its author's messages in the channel.
+    pub author_n: i64,
     /// Its idempotency key, if the create carried one.
     pub client_message_id: Option<&'a str>,
     /// The canonical author.
@@ -165,7 +182,7 @@ impl MessageStore {
     /// Write a new message. `Conflict` when its idempotency key is taken
     /// (a duplicate create), or, astronomically rarely, its id.
     pub async fn insert(&self, m: &NewMessage<'_>) -> Result<StoredMessage, DbError> {
-        let id = new_id("msg_")?;
+        let id = m.id;
         let key = match m.client_message_id {
             Some(c) => client_key(m.channel_id, m.author, c),
             None => format!("m {id}"),
@@ -175,7 +192,7 @@ impl MessageStore {
             None => (String::new(), format!("m {id}")),
         };
         let q = Ql::new("Message.create({ message_id: ")
-            .str(&id)
+            .str(id)
             .raw(", channel_id: ")
             .str(m.channel_id)
             .raw(", group_id: ")
@@ -200,7 +217,17 @@ impl MessageStore {
             .unix_seconds(m.now)
             .raw(", edit_until: ")
             .int(m.edit_until.unwrap_or(0))
-            .raw(", edited_at: 0, revision: 0, deleted_at: 0 })");
+            .raw(", edited_at: 0, revision: 0, deleted_at: 0, n: ")
+            .int(m.n)
+            .raw(", author_n: ")
+            .int(m.author_n)
+            .raw(", apos: ")
+            .str(&author_position(
+                m.channel_id,
+                &m.author.to_string(),
+                m.author_n,
+            ))
+            .raw(" })");
         self.db.write_one::<MessageRow>(&q).await?.data.decode()
     }
 
@@ -250,24 +277,6 @@ impl MessageStore {
         rows.into_iter()
             .map(|r| r.decode().map(|m| (m.seq, m)))
             .collect()
-    }
-
-    /// The creation position and author of each message created at
-    /// `positions` of `channel_id`'s timeline, without decoding bodies
-    /// (unread counts, §7.7). Positions holding no message are left out.
-    pub async fn authors_at(
-        &self,
-        channel_id: &str,
-        positions: &[i64],
-    ) -> Result<Vec<(i64, String)>, DbError> {
-        #[derive(Deserialize)]
-        struct AuthorRow {
-            seq: i64,
-            author: String,
-        }
-        let keys: Vec<String> = positions.iter().map(|p| position(channel_id, *p)).collect();
-        let rows: Vec<AuthorRow> = lookup(&self.db, "Message.filter(", ".pos == ", &keys).await?;
-        Ok(rows.into_iter().map(|r| (r.seq, r.author)).collect())
     }
 
     /// The replies at positions `ns` under `parent`.
@@ -464,12 +473,13 @@ impl MessageStore {
             .collect())
     }
 
-    /// Remove every message, event and reaction of the deleted channel
-    /// `channel_id`. Idempotent.
+    /// Remove every message, event, reaction and author tally of the
+    /// deleted channel `channel_id`. Idempotent.
     pub async fn purge_channel(&self, channel_id: &str) -> Result<(), DbError> {
         for head in [
             "Reaction.filter(.channel_id == ",
             "TimelineEvent.filter(.channel_id == ",
+            "MessageTally.filter(.channel_id == ",
             "Message.filter(.channel_id == ",
         ] {
             let q = Ql::new(head).str(channel_id).raw(").delete()");

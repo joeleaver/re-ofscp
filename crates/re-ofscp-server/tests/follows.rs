@@ -5,15 +5,13 @@
 mod common;
 
 use axum::http::StatusCode;
+use common::follows::{follow, list, remote_follows, unfollow};
 use common::groups::{Env, Party, call, env_with_remotes, join, local, remote};
-use common::harness::SIGNED_AT;
 use common::members::kick;
 use common::messages::{Chan, group_and_channel, public_channel};
 use common::my_groups::segment;
 use common::ws::denying;
 use common::{assert_valid, schema};
-use futures_util::stream::{self, StreamExt};
-use re_ofscp_server::db::Ql;
 use re_ofscp_server::follows::MAX_FOLLOWS_PER_ACTOR;
 use re_ofscp_server::follows::store::FollowStore;
 use re_ofscp_types::Authority;
@@ -25,24 +23,6 @@ const REMOTE_GROUP: &str = "https://b.example/api/groups/grp_2";
 fn assert_problem(status: StatusCode, body: &Value, want: StatusCode, code: &str) {
     assert_eq!(status, want, "{body}");
     assert_eq!(body["errorCode"], code, "{body}");
-}
-
-async fn follow(env: &Env, by: &Party, channel: &str) -> (StatusCode, Value) {
-    let body = json!({ "channel": channel });
-    call(env, Some(by), "POST", "/api/me/follows", Some(body)).await
-}
-
-async fn unfollow(env: &Env, by: &Party, channel: &str) -> StatusCode {
-    let path = format!("/api/me/follows/{}", segment(channel));
-    call(env, Some(by), "DELETE", &path, None).await.0
-}
-
-/// `GET /api/me/follows` as `by`, checked against the schema; the follows.
-async fn list(env: &Env, by: &Party) -> Vec<Value> {
-    let (s, body) = call(env, Some(by), "GET", "/api/me/follows", None).await;
-    assert_eq!(s, StatusCode::OK, "{body}");
-    assert_valid(&schema("follows-response.json"), &body);
-    body["follows"].as_array().unwrap().clone()
 }
 
 fn channels(follows: &[Value]) -> Vec<&str> {
@@ -257,31 +237,6 @@ async fn the_federation_policy_gates_new_remote_follows_only() {
         channels(&list(&env, &alice).await),
         [chan.c.as_str(), other]
     );
-}
-
-/// Write `n` remote follows of `who` straight to the database: the count,
-/// not the channels, is what is limited.
-async fn remote_follows(env: &Env, who: &Party, n: usize) {
-    let owner = who.actor.clone();
-    let now = SIGNED_AT.unix_timestamp();
-    stream::iter(0..n)
-        .for_each_concurrent(16, |i| {
-            let owner = owner.clone();
-            async move {
-                let channel = format!("https://c.example/api/groups/g/channels/chn_{i}");
-                let q = Ql::new("Follow.create({ key: ")
-                    .str(&format!("{owner} {channel}"))
-                    .raw(", owner: ")
-                    .str(&owner)
-                    .raw(", channel: ")
-                    .str(&channel)
-                    .raw(", created_at: ")
-                    .unix_seconds(now)
-                    .raw(" })");
-                env.state.db.execute(&q).await.unwrap();
-            }
-        })
-        .await;
 }
 
 #[tokio::test]

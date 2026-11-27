@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use futures_util::stream::{self, StreamExt, TryStreamExt};
 use re_ofscp_types::Actor;
 
 use super::listing::ListingError;
@@ -28,6 +29,8 @@ pub struct Readable {
 /// Most channel rows read per group: every active channel fits, with room
 /// for rows a concurrent create or delete leaves behind.
 const CHANNELS_READ: usize = 2 * super::MAX_CHANNELS_PER_GROUP;
+/// Groups checked at once by [`Groups::readable_member_channels`].
+const GROUP_CONCURRENCY: usize = 4;
 
 impl Groups {
     /// Active channel `channel_id`, if it exists and `actor` can read it
@@ -88,36 +91,51 @@ impl Groups {
     /// Every channel `actor` can read now in the groups hosted here that
     /// they own or are an active member of, by group then channel age.
     /// Fails rather than leave a group out (see
-    /// [`Groups::hosted_entries`]).
+    /// [`Groups::hosted_entries`]). The groups are checked a few at a time
+    /// ([`GROUP_CONCURRENCY`]), keeping their order.
     pub async fn readable_member_channels(
         &self,
         actor: &Actor,
     ) -> Result<Vec<StoredChannel>, ListingError> {
         let caller = Caller::Actor(actor.clone());
-        let mut out = Vec::new();
-        for entry in self.hosted_entries(actor).await? {
-            let Some(group) = self.store.group(&entry.group_id).await? else {
-                continue;
-            };
-            let standing = self.standing(&caller, &group).await?;
-            // The membership was read a moment ago; re-check it against the
-            // standing read now, so a removal in between leaves the group out.
-            if !standing.is_member() {
-                continue;
-            }
-            let policy = group.policy();
-            if !access::can_read_group(&standing, &policy) {
-                continue;
-            }
-            out.extend(
-                self.store
-                    .channels(&group.id, CHANNELS_READ)
-                    .await?
-                    .into_iter()
-                    .filter(|c| access::can_read_channel(&standing, &policy, &c.policy())),
-            );
+        let entries = self.hosted_entries(actor).await?;
+        // Collected first: a lazily mapped iterator here makes the callers'
+        // futures fail axum's `Send` bound (a higher-ranked lifetime).
+        let checks: Vec<_> = entries
+            .iter()
+            .map(|e| self.readable_in_group(&caller, &e.group_id))
+            .collect();
+        let per_group: Vec<Vec<StoredChannel>> = stream::iter(checks)
+            .buffered(GROUP_CONCURRENCY)
+            .try_collect()
+            .await?;
+        Ok(per_group.into_iter().flatten().collect())
+    }
+
+    /// The channels of active group `group_id` that `caller` can read now,
+    /// as a member: none if the group is gone or they are no member now.
+    async fn readable_in_group(
+        &self,
+        caller: &Caller,
+        group_id: &str,
+    ) -> Result<Vec<StoredChannel>, DbError> {
+        let Some(group) = self.store.group(group_id).await? else {
+            return Ok(Vec::new());
+        };
+        let standing = self.standing(caller, &group).await?;
+        let policy = group.policy();
+        // The membership was read a moment ago; re-check it against the
+        // standing read now, so a removal in between leaves the group out.
+        if !standing.is_member() || !access::can_read_group(&standing, &policy) {
+            return Ok(Vec::new());
         }
-        Ok(out)
+        Ok(self
+            .store
+            .channels(&group.id, CHANNELS_READ)
+            .await?
+            .into_iter()
+            .filter(|c| access::can_read_channel(&standing, &policy, &c.policy()))
+            .collect())
     }
 
     /// Sort `ids` into the channels `actor` can read now and the ids that

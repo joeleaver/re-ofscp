@@ -353,9 +353,12 @@ async fn a_deleted_channels_messages_404_at_once_and_the_sweeper_purges_them_twi
     // by the second.
     let late = store
         .insert(&NewMessage {
+            id: "msg_late",
             channel_id: &chan.c,
             group_id: &chan.g,
             seq: 99,
+            n: 99,
+            author_n: 99,
             client_message_id: None,
             author: &alice,
             kind: &MessageType::Message,

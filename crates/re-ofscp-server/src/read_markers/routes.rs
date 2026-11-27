@@ -13,7 +13,9 @@ use axum::Json;
 use axum::body::Bytes;
 use axum::extract::State;
 
-use super::{MarkerError, ScopesResponse, request};
+use ofscp_core::wire::ReadMarkersResponse;
+
+use super::{MarkerError, request};
 use crate::AppState;
 use crate::problem::Problem;
 use crate::signing::Authenticated;
@@ -33,10 +35,10 @@ impl From<MarkerError> for Problem {
 pub async fn list(
     State(state): State<AppState>,
     auth: Authenticated,
-) -> Result<Json<ScopesResponse>, Problem> {
+) -> Result<Json<ReadMarkersResponse>, Problem> {
     let actor = auth.local_actor(&state.config.domain)?;
     let scopes = state.read_markers.scopes(actor).await?;
-    Ok(Json(ScopesResponse { scopes }))
+    Ok(Json(ReadMarkersResponse { scopes }))
 }
 
 /// `PATCH /api/me/read-markers`.
@@ -44,11 +46,11 @@ pub async fn update(
     State(state): State<AppState>,
     auth: Authenticated,
     body: Bytes,
-) -> Result<Json<ScopesResponse>, Problem> {
+) -> Result<Json<ReadMarkersResponse>, Problem> {
     let actor = auth.local_actor(&state.config.domain)?;
     let updates =
         request::update_body(&body).map_err(|e| Problem::bad_request().with_detail(e.0))?;
     let now = state.verifier.now();
     let scopes = state.read_markers.update(actor, &updates, now).await?;
-    Ok(Json(ScopesResponse { scopes }))
+    Ok(Json(ReadMarkersResponse { scopes }))
 }
