@@ -1,7 +1,7 @@
 //! Which channels a user can read right now (effective read access, §11.3;
 //! security requirement 5), for the surfaces that start from the user
-//! rather than from one channel: follows (§7.6), read markers (§7.7) and,
-//! later, notifications (§10.1).
+//! rather than from one channel: follows (§7.6), read markers (§7.7) and
+//! notifications (§10.1).
 //!
 //! Every answer is computed from the stored group, channel and membership
 //! as they are at the call, never cached, so a change in tier, `view` or
@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use futures_util::stream::{self, StreamExt, TryStreamExt};
 use re_ofscp_types::Actor;
 
+use super::access::Standing;
 use super::listing::ListingError;
 use super::model::StoredChannel;
 use super::{Caller, Groups, access};
@@ -78,6 +79,54 @@ impl Groups {
             .channel(&group_id, channel_id)
             .await?
             .filter(|c| access::can_read_channel(&standing, &policy, &c.policy())))
+    }
+
+    /// Which of `actors` can read active channel `channel_id` now: the
+    /// checks of [`Self::readable_channel`], with the group and channel read
+    /// once and every actor's membership in one batched lookup (none at all
+    /// when anyone may read the channel). Nobody, when the channel is
+    /// missing or its group is being deleted.
+    pub async fn readers_among(
+        &self,
+        channel_id: &str,
+        actors: &[Actor],
+    ) -> Result<BTreeSet<Actor>, DbError> {
+        if actors.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let Some(group_id) = self.store.channel_group(channel_id).await? else {
+            return Ok(BTreeSet::new());
+        };
+        let Some(group) = self.store.group(&group_id).await? else {
+            return Ok(BTreeSet::new());
+        };
+        let Some(channel) = self.store.channel(&group_id, channel_id).await? else {
+            return Ok(BTreeSet::new());
+        };
+        let (policy, cpolicy) = (group.policy(), channel.policy());
+        if access::can_read_channel(&Standing::Outsider, &policy, &cpolicy) {
+            return Ok(actors.iter().cloned().collect());
+        }
+        let members: Vec<Actor> = actors
+            .iter()
+            .filter(|a| **a != group.owner)
+            .cloned()
+            .collect();
+        let roles = self.store.roles_of(&group.id, &members).await?;
+        Ok(actors
+            .iter()
+            .filter(|a| {
+                let standing = if **a == group.owner {
+                    Standing::Owner
+                } else {
+                    roles
+                        .get(*a)
+                        .map_or(Standing::Outsider, |r| Standing::Member(r.clone()))
+                };
+                access::can_read_channel(&standing, &policy, &cpolicy)
+            })
+            .cloned()
+            .collect())
     }
 
     /// Whether active channel `channel_id` exists at all, readable or not.

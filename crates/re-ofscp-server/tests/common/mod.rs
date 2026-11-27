@@ -11,6 +11,7 @@ pub mod key_setup;
 pub mod members;
 pub mod messages;
 pub mod my_groups;
+pub mod notifications;
 pub mod profiles;
 pub mod races;
 pub mod read_markers;

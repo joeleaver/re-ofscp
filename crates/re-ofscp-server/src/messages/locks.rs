@@ -1,6 +1,10 @@
 //! One async lock per channel, so that this process takes a channel's
 //! positions, commits and fans out its events one writer at a time: live
 //! events then leave in timeline order (§7.1 *Delivery, ordering*).
+//!
+//! The map is keyed by any string: the notification feed (decision 0023)
+//! uses one keyed by user, for turns at a user's feed positions and
+//! settings.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};

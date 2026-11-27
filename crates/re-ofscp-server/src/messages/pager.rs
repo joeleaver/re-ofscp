@@ -113,14 +113,20 @@ impl PageRequest {
 /// §7.2 `limit`: fractional values round down, larger ones clamp to
 /// [`MAX_LIMIT`], anything else unusable means [`DEFAULT_LIMIT`].
 fn parse_limit(raw: Option<&str>) -> usize {
+    parse_limit_within(raw, DEFAULT_LIMIT, MAX_LIMIT)
+}
+
+/// A `limit` read as §7.2 reads it, for an endpoint with its own default
+/// and maximum (the notification feed's are 30 and 100, §10.1).
+pub fn parse_limit_within(raw: Option<&str>, default: usize, max: usize) -> usize {
     let Some(v) = raw.and_then(|s| s.trim().parse::<f64>().ok()) else {
-        return DEFAULT_LIMIT;
+        return default;
     };
     if !v.is_finite() || v < 1.0 {
-        return DEFAULT_LIMIT;
+        return default;
     }
     // Clamp before converting, so a huge value cannot overflow.
-    v.min(MAX_LIMIT as f64).floor() as usize
+    v.min(max as f64).floor() as usize
 }
 
 /// One page: the items in the direction of travel, each with its
