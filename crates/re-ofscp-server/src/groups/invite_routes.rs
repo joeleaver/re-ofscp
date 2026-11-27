@@ -10,7 +10,8 @@
 //!
 //! Every route but `/guest` needs a user signature: unsigned is `401`, a
 //! provider signature `403`. A token is never logged: it is a path
-//! segment here, and request tracing records the route template only.
+//! segment here, and every logged path passes through
+//! `crate::logpath::loggable`, which replaces it with a placeholder.
 
 use std::collections::HashMap;
 
@@ -20,7 +21,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-use re_ofscp_types::wire::{Invite, InviteCreateRequest, InviteRedeemResponse, Paged};
+use re_ofscp_types::wire::{Invite, InviteRedeemResponse, Paged};
 
 use super::routes::{group_id, local_id};
 use crate::AppState;
@@ -49,8 +50,8 @@ pub fn routes() -> Router<AppState> {
 }
 
 /// `POST /api/groups/{groupId}/invites` (§5.6): `201` with the `Invite`,
-/// carrying its token (`invite-create-response.json`). Every field of the body, and the body itself, is
-/// optional.
+/// carrying its token (`invite-create-response.json`). The body is handed
+/// on unparsed: it is judged only after the `manage` check.
 async fn create_invite(
     State(state): State<AppState>,
     auth: Authenticated,
@@ -59,13 +60,7 @@ async fn create_invite(
 ) -> Result<Response, Problem> {
     let actor = auth.actor()?;
     group_id(&g)?;
-    let req: InviteCreateRequest = if bytes.iter().all(u8::is_ascii_whitespace) {
-        InviteCreateRequest::default()
-    } else {
-        serde_json::from_slice(&bytes)
-            .map_err(|e| Problem::bad_request().with_detail(format!("invalid request body: {e}")))?
-    };
-    let invite = state.groups.create_invite(actor, &g, &req).await?;
+    let invite = state.groups.create_invite(actor, &g, &bytes).await?;
     Ok((StatusCode::CREATED, Json(invite)).into_response())
 }
 

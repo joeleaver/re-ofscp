@@ -50,6 +50,17 @@ pub fn token_hash(token: &str) -> Option<String> {
     )
 }
 
+/// The body of `POST /api/groups/{groupId}/invites`: every field is
+/// optional, and so is the body itself (empty or whitespace is `{}`).
+/// Parsed only once the caller is known to hold `manage`, so an
+/// unauthorised caller learns nothing from how a body is judged.
+pub fn parse_create(body: &[u8]) -> Result<InviteCreateRequest, Invalid> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(InviteCreateRequest::default());
+    }
+    serde_json::from_slice(body).map_err(|e| Invalid(format!("invalid request body: {e}")))
+}
+
 /// The terms of a create request that need no group to check: guests are
 /// refused (this provider has no guest accounts, §4.8), `maxUses` is
 /// within `1..=`[`MAX_INVITE_USES`], and `expiresAt` lies after `now` and
@@ -163,6 +174,18 @@ mod tests {
         assert_eq!(token_hash(&a), token_hash(&a));
         assert_eq!(token_hash("ai_account_invite"), None);
         assert_eq!(token_hash(&format!("gi_{}", "x".repeat(200))), None);
+    }
+
+    #[test]
+    fn an_empty_create_body_is_an_empty_request() {
+        assert_eq!(parse_create(b"").unwrap(), InviteCreateRequest::default());
+        assert_eq!(
+            parse_create(b" \n").unwrap(),
+            InviteCreateRequest::default()
+        );
+        assert_eq!(parse_create(b"{\"maxUses\": 2}").unwrap().max_uses, Some(2));
+        assert!(parse_create(b"{\"maxUses\": \"two\"}").is_err());
+        assert!(parse_create(b"not json").is_err());
     }
 
     #[test]

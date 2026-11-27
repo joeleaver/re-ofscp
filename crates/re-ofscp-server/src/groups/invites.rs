@@ -7,12 +7,8 @@
 //! security requirement 6). Redemption joins through [`Groups::add_member`],
 //! so every limit, access change and announcement of a join applies.
 
-use std::collections::HashMap;
-
 use re_ofscp_types::Actor;
-use re_ofscp_types::wire::{
-    Invite, InviteCreateRequest, InviteCreateResponse, InviteRedeemResponse, Paged,
-};
+use re_ofscp_types::wire::{Invite, InviteCreateResponse, InviteRedeemResponse, Paged};
 
 use super::access::{self, Standing, actions, roles};
 use super::invite_model;
@@ -64,19 +60,22 @@ impl Groups {
         Ok((group, standing))
     }
 
-    /// `POST /api/groups/{groupId}/invites`: `manage`, then the terms. The
-    /// role must exist and not be `owner` (`400`), and the subset rule
-    /// binds it (§5.7: `403` unless `perms(role) ⊆ perms(caller)`). A
-    /// `channelId` must name an active channel of the group (`400`).
+    /// `POST /api/groups/{groupId}/invites`: `manage`, then the body
+    /// (`body`, unparsed until then, so an unauthorised caller learns
+    /// nothing from it) and its terms. The role must exist and not be
+    /// `owner` (`400`), and the subset rule binds it (§5.7: `403` unless
+    /// `perms(role) ⊆ perms(caller)`). A `channelId` must name an active
+    /// channel of the group (`400`).
     pub async fn create_invite(
         &self,
         actor: &Actor,
         group_id: &str,
-        req: &InviteCreateRequest,
+        body: &[u8],
     ) -> Result<InviteCreateResponse, GroupError> {
         let (group, standing) = self.managing(actor, group_id).await?;
+        let req = invite_model::parse_create(body)?;
         let now = self.now();
-        let terms = invite_model::terms(req, now)?;
+        let terms = invite_model::terms(&req, now)?;
         let policy = group.policy();
         if terms.role == roles::OWNER {
             return Err(Invalid(NOT_A_ROLE.to_owned()).into());
@@ -127,7 +126,8 @@ impl Groups {
 
     /// `GET /api/groups/{groupId}/invites`: `manage`. The unexpired
     /// invites, without their tokens, paged per §7.2 by `(createdAt, id)`,
-    /// newest first by default.
+    /// newest first by default. One bounded read: at most
+    /// [`MAX_INVITES_PER_GROUP`] rows.
     pub async fn list_invites(
         &self,
         actor: &Actor,
@@ -137,24 +137,17 @@ impl Groups {
         let (group, _) = self.managing(actor, group_id).await?;
         let now = self.now();
         let invites = self.store.invites(&group.id, MAX_INVITES_PER_GROUP).await?;
-        let cap = MAX_INVITES_PER_GROUP * invite_model::MAX_INVITE_USES as usize;
-        let mut slots: HashMap<String, Vec<u32>> = HashMap::new();
-        for (invite, n) in self.store.group_slots(&group.id, cap).await? {
-            slots.entry(invite).or_default().push(n);
-        }
         let items = invites
             .iter()
             .filter(|i| !i.expired(now))
             .map(|i| {
-                let uses = match i.max_uses {
-                    Some(max) => used_slots(slots.get(&i.id), max),
-                    None => i.counter,
-                };
                 let key = SortKey {
                     at: i.created_at,
                     id: i.id.clone(),
                 };
-                Ok((key, i.to_wire(uses)?))
+                // `uses` is the display counter (decision 0019): reading
+                // the slot rows instead would cost up to 50,000 rows.
+                Ok((key, i.to_wire(i.counter)?))
             })
             .collect::<Result<Vec<_>, GroupError>>()?;
         Ok(paging::page(
@@ -239,7 +232,9 @@ impl Groups {
             }
             (outcome, None) => outcome?,
         };
-        if joined && invite.max_uses.is_none() {
+        // The display count, for limited invites too (their slots, not
+        // this count, enforce `maxUses`).
+        if joined {
             match self.store.bump_uses(&invite.id).await {
                 Ok(true) => {}
                 Ok(false) => {
@@ -341,26 +336,5 @@ impl Groups {
             self.store.delete_invite(id).await?;
         }
         Ok(ids.len())
-    }
-}
-
-/// How many of a limited invite's `max` slots are taken.
-fn used_slots(taken: Option<&Vec<u32>>, max: u32) -> u32 {
-    let mut taken: Vec<u32> = taken
-        .map(|t| t.iter().copied().filter(|n| *n < max).collect())
-        .unwrap_or_default();
-    taken.sort_unstable();
-    taken.dedup();
-    u32::try_from(taken.len()).unwrap_or(max)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn only_slots_within_the_limit_count() {
-        assert_eq!(used_slots(None, 3), 0);
-        assert_eq!(used_slots(Some(&vec![0, 2, 2, 7]), 3), 2);
     }
 }

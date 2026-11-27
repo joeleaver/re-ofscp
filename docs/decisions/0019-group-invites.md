@@ -27,8 +27,9 @@ one, and how uses are counted. rhypedb has no multi-object transactions.
 
 ### Creating an invite (`POST /api/groups/{g}/invites`)
 
-The caller must hold `manage`; that is checked before the body (0014).
-Then:
+The caller must hold `manage`; that is checked before the body is even
+parsed (0014), so a caller without it gets `403` whatever they send and
+learns nothing from how a body would be judged. Then:
 
 1. **Role.**
    - It defaults to `member`.
@@ -129,8 +130,11 @@ lost-conn/ofscp#35). The checks run in this order:
    When the last slot went to a concurrent redemption, the answer is
    `409`.
 6. The caller joins with the invite's role through `Groups::add_member`.
-   So the member and membership limits, the pending-row protocol and the
-   `AccessChange::Member` announcement all apply exactly as for any join.
+   So the member and membership limits, the pending-row protocol, the
+   take-back of a join over the limit, the `AccessChange::Member`
+   announcement and `groups.updated` (0018) all apply exactly as for any
+   join. A pending join request of the caller's is resolved by the join
+   (deleted, as approval does), not left for a reviewer.
    This works for `private` groups and `invite`/`request` policies, which
    is what an invite is for.
 
@@ -153,8 +157,11 @@ are kept from both joining. Following 0012, a limited invite's uses are
 - A redemption reads the slots taken, then creates the first free one.
   On a `Conflict` (another redemption won that slot) it tries the next.
   When every slot is taken, it answers `409`.
+- A create that lost a write conflict (`Contended`) wrote nothing, so the
+  same slot is tried again, as for any one-object write. Moving on would
+  have answered `409` with a slot still free. A conflict that outlasts
+  the retries is a server error, never a `409`.
 - Slots are only created and deleted, never updated.
-- A limited invite's `uses` is the number of its slots.
 
 A redemption that took a slot but did not join gives the slot back by
 deleting it. That covers:
@@ -172,12 +179,17 @@ always be accounted for.
 Leaving a group does not return the use. `maxUses` counts redemptions,
 not current members.
 
-An **unlimited** invite has no limit to defend, so it takes no slot. Its
-`uses` is a counter, bumped after each join by an update guarded on the
-old value. Since rhypedb #59 that update is compare-and-set per object,
-so concurrent bumps all count. A bump loses only to another bump that
-landed, and it retries up to 64 times. The counter is display only, and a
-bump that gives up is logged and costs nothing else.
+An **unlimited** invite has no limit to defend, so it takes no slot.
+
+**`uses` is a display counter on the invite row, for every invite.** It
+is bumped after each join by an update guarded on the old value. Since
+rhypedb #59 that update is compare-and-set per object, so concurrent bumps
+all count. A bump loses only to another bump that landed, and it retries
+up to 64 times. A bump that gives up, or fails, is logged and costs
+nothing else: `uses` may then read one low, while the slots still enforce
+`maxUses` exactly. The list reads this counter, so it is one bounded read
+of at most 50 rows. Counting slot rows instead would read up to 50,000
+(50 invites of 1,000 uses).
 
 ### Guests (`POST /api/invites/{token}/guest`)
 
@@ -202,6 +214,7 @@ invite here can carry `grantsGuest: true`.
 
 - A manager cannot recover a lost link. They make a new invite and revoke
   the old one.
-- Listing reads all of a group's invites and slots. The bounds (50
-  invites of at most 1,000 uses each) keep that bounded.
+- Listing reads at most 50 invite rows and no slots. Its `uses` is a
+  display count that a failed bump can leave low; the limit itself never
+  depends on it.
 - A crash mid-redemption can burn a use of a limited invite.

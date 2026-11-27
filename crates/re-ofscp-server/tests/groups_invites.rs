@@ -134,6 +134,54 @@ async fn managers_create_list_and_revoke_invites() {
 }
 
 #[tokio::test]
+async fn only_a_manager_has_the_body_judged() {
+    let env = env_with_remotes(&[]).await;
+    let alice = local(&env, "alice").await;
+    let plain = local(&env, "pat").await;
+    let outsider = local(&env, "olga").await;
+    let g = group(&env, &alice, "group", "open").await;
+    join(&env, &g, &plain, "member").await;
+    // A body that is invalid, and terms that would be refused: an
+    // unauthorised caller is told only that they may not (`403`), never
+    // what is wrong with the body (`400`).
+    for body in [
+        json!({"maxUses": "two"}),
+        json!({"role": "owner"}),
+        json!([1]),
+    ] {
+        for who in [&plain, &outsider] {
+            let (s, p) = create_invite_http(&env, Some(who), &g, body.clone()).await;
+            assert_eq!(s, StatusCode::FORBIDDEN, "{body} as {}: {p}", who.actor);
+        }
+        let (s, _) = create_invite_http(&env, Some(&alice), &g, body.clone()).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{body} as the owner");
+    }
+    let (s, _) = create_invite_http(&env, Some(&alice), "grp_missing", json!([1])).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn redeeming_resolves_the_callers_join_request() {
+    let env = env_with_remotes(&[]).await;
+    let alice = local(&env, "alice").await;
+    let bob = local(&env, "bob").await;
+    let g = group(&env, &alice, "group", "request").await;
+    let (s, r) = join_http(&env, &bob, &g, None).await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{r}");
+    assert_eq!(rows_of_group(&env, "JoinRequest", &g).await, 1);
+    let inv = create_invite(&env, &alice, &g, json!({})).await;
+    let (s, r) = redeem(&env, Some(&bob), &token(&inv)).await;
+    assert_eq!(s, StatusCode::OK, "{r}");
+    assert!(has(&roster(&env, &alice, &g).await, &bob, "member"));
+    // The request is resolved by the join, not left for a reviewer.
+    assert_eq!(rows_of_group(&env, "JoinRequest", &g).await, 0);
+    let path = format!("/api/groups/{g}/requests");
+    let (s, list) = call(&env, Some(&alice), "GET", &path, None).await;
+    assert_eq!(s, StatusCode::OK, "{list}");
+    assert_eq!(list["items"], json!([]), "{list}");
+}
+
+#[tokio::test]
 async fn invite_terms_are_validated() {
     let env = env_with_remotes(&[]).await;
     let alice = local(&env, "alice").await;

@@ -7,9 +7,10 @@
 //! max_uses`. Creating a slot is the one serialized step (decision 0012),
 //! so concurrent redemptions never use more slots than exist. A slot is
 //! only ever created and deleted (given back), never updated. An unlimited
-//! invite has no slots; its `uses` counter is a guarded increment, which
-//! is compare-and-set per object since rhypedb #59, and counts only for
-//! display.
+//! invite has no slots. Every invite's `uses` counter is a guarded
+//! increment after each join, compare-and-set per object since rhypedb
+//! #59, and counts only for display: the list reads it rather than the
+//! slot rows.
 
 use re_ofscp_types::Actor;
 use serde::Deserialize;
@@ -79,8 +80,9 @@ pub struct StoredInvite {
     pub role: String,
     /// How many redemptions it allows; `None` is unlimited.
     pub max_uses: Option<u32>,
-    /// An unlimited invite's redemptions so far (a limited one counts its
-    /// slots instead, [`GroupStore::slots_taken`]).
+    /// Joins by this invite so far, for display (`uses`). A limited
+    /// invite's limit is enforced by its slots ([`GroupStore::slots_taken`]),
+    /// never by this count.
     pub counter: u32,
     /// Unix seconds from which it no longer works; `None` is never.
     pub expires_at: Option<i64>,
@@ -113,7 +115,6 @@ pub struct InviteTerms {
 #[derive(Deserialize)]
 struct SlotRow {
     slot: String,
-    invite_id: String,
 }
 
 /// The `@unique` key of slot `n` of `invite_id`.
@@ -297,33 +298,12 @@ impl GroupStore {
             .collect())
     }
 
-    /// The slots taken of every limited invite of `group_id`, by invite id
-    /// (for the list), counting at most `cap` rows.
-    pub async fn group_slots(
-        &self,
-        group_id: &str,
-        cap: usize,
-    ) -> Result<Vec<(String, u32)>, DbError> {
-        let q = Ql::new("GroupInviteUse.filter(.group_id == ")
-            .str(group_id)
-            .raw(").limit(")
-            .uint(cap as u64)
-            .raw(")");
-        Ok(self
-            .db
-            .fetch::<SlotRow>(&q)
-            .await?
-            .into_iter()
-            .filter_map(|r| {
-                let n = slot_number(&r.data, &r.data.invite_id)?;
-                Some((r.data.invite_id, n))
-            })
-            .collect())
-    }
-
     /// Take a free slot of limited invite `invite` for `actor`: the slot
     /// number taken, or `None` when every slot is taken. Of concurrent
-    /// takers of one slot, exactly one creates it; the others move on.
+    /// takers of one slot, exactly one creates it; the others move on. A
+    /// create that lost a write conflict wrote nothing, so the same slot is
+    /// tried again (`write_one_object`) rather than counted as taken: a
+    /// free slot is never mistaken for an exhausted invite.
     pub async fn take_slot(
         &self,
         invite: &StoredInvite,
@@ -344,12 +324,12 @@ impl GroupStore {
                 .raw(", used_at: ")
                 .unix_seconds(now)
                 .raw(" })");
-            match self.db.execute(&q).await {
-                Ok(()) => return Ok(Some(n)),
-                // Taken by a concurrent redemption: try the next. A
-                // contended create wrote nothing; a slot it lost stays
-                // taken by the winner, so moving on is right either way.
-                Err(DbError::Conflict(_) | DbError::Contended(_)) => {}
+            match self.db.write_one_object(&q).await {
+                Ok(_) => return Ok(Some(n)),
+                // Taken by a concurrent redemption: try the next.
+                Err(DbError::Conflict(_)) => {}
+                // Still contended after the retries: the slot's fate is
+                // unknown to us, so this is an error, never a `409`.
                 Err(e) => return Err(e),
             }
         }
@@ -420,7 +400,6 @@ mod tests {
     fn slot_numbers_belong_to_their_invite() {
         let row = |slot: &str| SlotRow {
             slot: slot.to_owned(),
-            invite_id: "inv_a".to_owned(),
         };
         assert_eq!(slot_key("inv_a", 3), "inv_a 3");
         assert_eq!(slot_number(&row("inv_a 3"), "inv_a"), Some(3));

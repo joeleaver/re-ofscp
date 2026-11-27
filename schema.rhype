@@ -296,8 +296,8 @@ type JoinRequest {
 // An invite to a group (spec §5.6; docs/decisions/0019). Only the token's
 // SHA-256 is stored: the token is a bearer secret, shown once by the create.
 // Revoking deletes the row; so does expiry (the sweeper) and the group's
-// purge. `uses` counts an unlimited invite's redemptions (display only); a
-// limited one counts its `GroupInviteUse` slots instead.
+// purge. `uses` counts joins by the invite, for display only (the list
+// reads it); a limited invite's `GroupInviteUse` slots enforce `max_uses`.
 type GroupInvite {
     invite_id: String @unique
     token_hash: String @unique

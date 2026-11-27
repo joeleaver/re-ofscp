@@ -61,13 +61,15 @@ pub async fn uses(env: &Env, by: &Party, group: &str, id: &str) -> u64 {
         .unwrap()
 }
 
-/// How many rows of `kind` (`GroupInvite`, `GroupInviteUse`) belong to
-/// `group`.
+/// How many rows of `kind` (`GroupInvite`, `GroupInviteUse`,
+/// `Membership`, `JoinRequest`) belong to `group`.
 pub async fn rows_of_group(env: &Env, kind: &'static str, group: &str) -> usize {
     let q = match kind {
         "GroupInvite" => Ql::new("GroupInvite.filter(.group_id == "),
         "GroupInviteUse" => Ql::new("GroupInviteUse.filter(.group_id == "),
-        other => panic!("not an invite type: {other}"),
+        "Membership" => Ql::new("Membership.filter(.group_id == "),
+        "JoinRequest" => Ql::new("JoinRequest.filter(.group_id == "),
+        other => panic!("not a type these tests count: {other}"),
     };
     let q = q.str(group).raw(")");
     env.state
