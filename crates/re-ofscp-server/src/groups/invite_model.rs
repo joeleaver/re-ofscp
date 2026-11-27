@@ -1,16 +1,15 @@
 //! Group invite tokens, terms and wire shapes (spec §5.6,
 //! docs/decisions/0019).
 //!
-//! A token is `gi_` + 256 random bits (base64url): a bearer secret that
-//! is returned once, by the create, and otherwise never stored, logged or
-//! listed. Only its SHA-256 is kept.
+//! A token is `gi_` + 256 random bits (base64url) from the OS CSPRNG: a
+//! bearer secret that is returned once, by the create, and otherwise never
+//! stored, logged or listed (§5.6, lost-conn/ofscp#40). Only its SHA-256
+//! is kept.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use ofscp_core::LocalId;
-use re_ofscp_types::Actor;
-use re_ofscp_types::wire::{Invite, InviteCreateRequest, Role, Timestamp};
-use serde::Serialize;
+use re_ofscp_types::wire::{Invite, InviteCreateRequest, InviteCreateResponse};
 use sha2::{Digest, Sha256};
 
 use super::invite_store::{InviteTerms, StoredInvite};
@@ -97,50 +96,25 @@ pub fn terms(req: &InviteCreateRequest, now: i64) -> Result<InviteTerms, Invalid
     })
 }
 
-/// An invite as `GET /api/groups/{groupId}/invites` lists it: the §5.6
-/// `Invite` without its `token`, which is not stored and so cannot be
-/// listed (docs/decisions/0019).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ListedInvite {
-    /// The invite's local id.
-    pub id: LocalId,
-    /// The group it is for.
-    pub group_id: LocalId,
-    /// The channel to land in.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub channel_id: Option<LocalId>,
-    /// The role it gives.
-    pub role: Role,
-    /// How many times it may be used; absent is unlimited.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_uses: Option<u32>,
-    /// How many times it has been used.
-    pub uses: u32,
-    /// When it stops working.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expires_at: Option<Timestamp>,
-    /// Who made it.
-    pub created_by: Actor,
-    /// When.
-    pub created_at: Timestamp,
-}
-
 fn local_id(invite: &StoredInvite, s: &str) -> Result<LocalId, DbError> {
     LocalId::new(s).map_err(|_| DbError::Decode(format!("invite {}: bad id", invite.id)))
 }
 
 impl StoredInvite {
-    /// The listed form, with `uses` as counted.
-    pub fn to_listed(&self, uses: u32) -> Result<ListedInvite, DbError> {
-        Ok(ListedInvite {
+    /// The §5.6 `Invite` as the list serves it, with `uses` as counted and
+    /// without its `token`: only the token's digest is stored, so it cannot
+    /// be served again (lost-conn/ofscp#40, docs/decisions/0019).
+    pub fn to_wire(&self, uses: u32) -> Result<Invite, DbError> {
+        Ok(Invite {
             id: local_id(self, &self.id)?,
             group_id: local_id(self, &self.group_id)?,
             channel_id: match &self.channel_id {
                 Some(c) => Some(local_id(self, c)?),
                 None => None,
             },
-            role: self.role.clone(),
+            token: None,
+            role: Some(self.role.clone()),
+            grants_guest: None,
             max_uses: self.max_uses,
             uses,
             expires_at: self.expires_at.map(timefmt::timestamp),
@@ -149,21 +123,22 @@ impl StoredInvite {
         })
     }
 
-    /// The §5.6 `Invite` the create answers, carrying `token`.
-    pub fn to_created(&self, token: String) -> Result<Invite, DbError> {
-        let l = self.to_listed(0)?;
-        Ok(Invite {
-            id: l.id,
-            group_id: l.group_id,
-            channel_id: l.channel_id,
+    /// The answer to the create (§5.6 `201`, `invite-create-response.json`):
+    /// the new invite with its `token`, the one time it is served.
+    pub fn to_created(&self, token: String) -> Result<InviteCreateResponse, DbError> {
+        let i = self.to_wire(0)?;
+        Ok(InviteCreateResponse {
+            id: i.id,
+            group_id: i.group_id,
+            channel_id: i.channel_id,
             token,
-            role: Some(l.role),
-            grants_guest: None,
-            max_uses: l.max_uses,
-            uses: 0,
-            expires_at: l.expires_at,
-            created_by: l.created_by,
-            created_at: l.created_at,
+            role: i.role,
+            grants_guest: i.grants_guest,
+            max_uses: i.max_uses,
+            uses: i.uses,
+            expires_at: i.expires_at,
+            created_by: i.created_by,
+            created_at: i.created_at,
         })
     }
 }

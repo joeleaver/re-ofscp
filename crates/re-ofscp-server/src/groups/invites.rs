@@ -10,10 +10,12 @@
 use std::collections::HashMap;
 
 use re_ofscp_types::Actor;
-use re_ofscp_types::wire::{Invite, InviteCreateRequest, InviteRedeemResponse, Paged};
+use re_ofscp_types::wire::{
+    Invite, InviteCreateRequest, InviteCreateResponse, InviteRedeemResponse, Paged,
+};
 
 use super::access::{self, Standing, actions, roles};
-use super::invite_model::{self, ListedInvite};
+use super::invite_model;
 use super::invite_store::StoredInvite;
 use super::model::StoredGroup;
 use super::ops::{GroupError, NO_GROUP, NOT_MANAGER};
@@ -71,7 +73,7 @@ impl Groups {
         actor: &Actor,
         group_id: &str,
         req: &InviteCreateRequest,
-    ) -> Result<Invite, GroupError> {
+    ) -> Result<InviteCreateResponse, GroupError> {
         let (group, standing) = self.managing(actor, group_id).await?;
         let now = self.now();
         let terms = invite_model::terms(req, now)?;
@@ -131,7 +133,7 @@ impl Groups {
         actor: &Actor,
         group_id: &str,
         query: &PageQuery,
-    ) -> Result<Paged<ListedInvite>, GroupError> {
+    ) -> Result<Paged<Invite>, GroupError> {
         let (group, _) = self.managing(actor, group_id).await?;
         let now = self.now();
         let invites = self.store.invites(&group.id, MAX_INVITES_PER_GROUP).await?;
@@ -152,7 +154,7 @@ impl Groups {
                     at: i.created_at,
                     id: i.id.clone(),
                 };
-                Ok((key, i.to_listed(uses)?))
+                Ok((key, i.to_wire(uses)?))
             })
             .collect::<Result<Vec<_>, GroupError>>()?;
         Ok(paging::page(
@@ -212,7 +214,7 @@ impl Groups {
             return Err(GroupError::Conflict(EXHAUSTED));
         }
         if let Some(m) = self.member_of(&group, actor).await? {
-            return self.redeemed(&invite, m.role, false);
+            return self.redeemed(&invite, m.role, false).await;
         }
         self.still_grants(&invite, &group).await?;
         let slot = match invite.max_uses {
@@ -256,7 +258,7 @@ impl Groups {
             .ok_or(GroupError::Conflict(
                 "the membership changed meanwhile; retry",
             ))?;
-        self.redeemed(&invite, member.role, joined)
+        self.redeemed(&invite, member.role, joined).await
     }
 
     /// Join `invite`'s group with its role, once its slot (if any) is
@@ -304,19 +306,22 @@ impl Groups {
         }
     }
 
-    fn redeemed(
+    /// The redemption's answer (§5.6): the group, the caller's `role`, and
+    /// the invite's channel while it still exists. An invite whose channel
+    /// has since been deleted still joins the group, and the answer omits
+    /// `channelId` (lost-conn/ofscp#40).
+    async fn redeemed(
         &self,
         invite: &StoredInvite,
         role: String,
         joined: bool,
     ) -> Result<Redeemed, GroupError> {
         let bad = |_| DbError::Decode(format!("invite {}: bad id", invite.id));
-        // The invite's channel, as §5.6 answers it (lost-conn/ofscp#35),
-        // even if the channel has since been deleted: the caller joined the
-        // group regardless.
         let channel_id = match &invite.channel_id {
-            Some(c) => Some(LocalId::new(c).map_err(bad)?),
-            None => None,
+            Some(c) if self.store.channel(&invite.group_id, c).await?.is_some() => {
+                Some(LocalId::new(c).map_err(bad)?)
+            }
+            _ => None,
         };
         Ok(Redeemed {
             response: InviteRedeemResponse {

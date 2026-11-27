@@ -20,9 +20,8 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-use re_ofscp_types::wire::{InviteCreateRequest, InviteRedeemResponse, Paged};
+use re_ofscp_types::wire::{Invite, InviteCreateRequest, InviteRedeemResponse, Paged};
 
-use super::invite_model::ListedInvite;
 use super::routes::{group_id, local_id};
 use crate::AppState;
 use crate::problem::Problem;
@@ -50,7 +49,7 @@ pub fn routes() -> Router<AppState> {
 }
 
 /// `POST /api/groups/{groupId}/invites` (§5.6): `201` with the `Invite`,
-/// carrying its token. Every field of the body, and the body itself, is
+/// carrying its token (`invite-create-response.json`). Every field of the body, and the body itself, is
 /// optional.
 async fn create_invite(
     State(state): State<AppState>,
@@ -70,13 +69,14 @@ async fn create_invite(
     Ok((StatusCode::CREATED, Json(invite)).into_response())
 }
 
-/// `GET /api/groups/{groupId}/invites` (§5.6, paged per §7.2).
+/// `GET /api/groups/{groupId}/invites` (§5.6, paged per §7.2): the
+/// invites without their tokens (lost-conn/ofscp#40).
 async fn list_invites(
     State(state): State<AppState>,
     auth: Authenticated,
     Path(g): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<Paged<ListedInvite>>, Problem> {
+) -> Result<Json<Paged<Invite>>, Problem> {
     let actor = auth.actor()?;
     group_id(&g)?;
     let query = super::paging::PageQuery::from_params(&params);

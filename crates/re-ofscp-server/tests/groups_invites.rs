@@ -55,11 +55,13 @@ async fn managers_create_list_and_revoke_invites() {
     join(&env, &g, &admin, "admin").await;
     join(&env, &g, &plain, "member").await;
     let invite_schema = schema("invite.json");
+    let created_schema = schema("invite-create-response.json");
 
-    // All fields are optional: the default is a `member` invite.
+    // All fields are optional: the default is a `member` invite. The
+    // create's answer carries the token (lost-conn/ofscp#40).
     let (s, inv) = create_invite_http(&env, Some(&admin), &g, json!({})).await;
     assert_eq!(s, StatusCode::CREATED, "{inv}");
-    assert_valid(&invite_schema, &inv);
+    assert_valid(&created_schema, &inv);
     let t = token(&inv);
     assert!(t.starts_with("gi_") && t.len() >= 40, "{t}");
     assert_eq!(
@@ -79,7 +81,7 @@ async fn managers_create_list_and_revoke_invites() {
         json!({"maxUses": 3, "expiresAt": "2026-01-02T12:00:00Z", "role": "admin"}),
     )
     .await;
-    assert_valid(&invite_schema, &limited);
+    assert_valid(&created_schema, &limited);
     assert_ne!(token(&limited), t, "every invite has its own token");
 
     // Only managers.
@@ -92,8 +94,9 @@ async fn managers_create_list_and_revoke_invites() {
     let (s, _) = create_invite_http(&env, Some(&alice), "grp_missing", json!({})).await;
     assert_eq!(s, StatusCode::NOT_FOUND);
 
-    // The list never carries tokens (they are not stored); otherwise each
-    // item is a valid `Invite`. Newest first; paged per §7.2.
+    // The list never carries tokens (only their digests are stored), which
+    // §5.6 allows (lost-conn/ofscp#40): each item is a valid `Invite` as it
+    // is. Newest first; paged per §7.2.
     let (s, list) = list_invites(&env, Some(&admin), &g, "").await;
     assert_eq!(s, StatusCode::OK, "{list}");
     let items = list["items"].as_array().unwrap();
@@ -101,9 +104,7 @@ async fn managers_create_list_and_revoke_invites() {
     assert!(!list.to_string().contains(&t), "a token leaked: {list}");
     for item in items {
         assert!(item.get("token").is_none(), "{item}");
-        let mut with_token = item.clone();
-        with_token["token"] = json!("gi_placeholder");
-        assert_valid(&invite_schema, &with_token);
+        assert_valid(&invite_schema, item);
     }
     let (_, first) = list_invites(&env, Some(&admin), &g, "?limit=1").await;
     assert_eq!(first["items"].as_array().unwrap().len(), 1);
@@ -169,7 +170,7 @@ async fn invite_terms_are_validated() {
         json!({"role": "editor", "channelId": c, "grantsGuest": false, "maxUses": 1000}),
     )
     .await;
-    assert_valid(&schema("invite.json"), &inv);
+    assert_valid(&schema("invite-create-response.json"), &inv);
     assert_eq!(
         (&inv["role"], &inv["channelId"]),
         (&json!("editor"), &json!(c))
@@ -433,15 +434,17 @@ async fn the_redeem_answer_names_the_invites_channel() {
         call(&env, Some(&alice), "DELETE", &path, None).await.0,
         StatusCode::NO_CONTENT
     );
-    // A deleted channel does not void the invite; the answer still names
-    // the invite's channel (§5.6, lost-conn/ofscp#35).
+    // A deleted channel does not void the invite: the caller still joins
+    // the group, and the answer omits `channelId` (§5.6,
+    // lost-conn/ofscp#40).
     let (s, r) = redeem(&env, Some(&carol), &token(&inv)).await;
     assert_eq!(s, StatusCode::OK);
-    assert_eq!(r, json!({"groupId": g, "channelId": c, "role": "member"}));
+    assert_eq!(r, json!({"groupId": g, "role": "member"}));
+    assert!(has(&roster(&env, &alice, &g).await, &carol, "member"));
     // So does the already-a-member answer.
     let (s, r) = redeem(&env, Some(&alice), &token(&inv)).await;
     assert_eq!(s, StatusCode::OK);
-    assert_eq!(r, json!({"groupId": g, "channelId": c, "role": "owner"}));
+    assert_eq!(r, json!({"groupId": g, "role": "owner"}));
 }
 
 #[tokio::test]

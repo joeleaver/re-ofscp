@@ -1,13 +1,14 @@
 # 0019: Group invites
 
 - **Status:** accepted. The validation defaults and the redeem order are
-  in the spec since lost-conn/ofscp#35 (merged, fb0c064). The list's
-  missing `token` (below) still needs a spec answer.
+  in the spec since lost-conn/ofscp#35 (merged, fb0c064); token secrecy,
+  the list without tokens and the deleted-channel answer since
+  lost-conn/ofscp#40 (merged, e94447d).
 - **Date:** 2026-11-27
 - **Spec:** §5.6 (invites and join links, as clarified by
-  lost-conn/ofscp#35), §5.7 (the subset rule), §4.8
+  lost-conn/ofscp#35 and lost-conn/ofscp#40), §5.7 (the subset rule), §4.8
   (guests), §7.2 (paging), §11 (private tiers); schemas `invite.json`,
-  `invite-create-request.json`
+  `invite-create-request.json`, `invite-create-response.json`
 - **Security requirements:** 1 (identity is `(handle, domain)`),
   6 (private groups are invite-only)
 - **Builds on:** 0012 (serialize with `@unique`), 0014 (groups),
@@ -49,14 +50,18 @@ Then:
    it, and a write found over the limit takes itself back (`403`), as
    for members (0017).
 
-The response is `201` with the `Invite`, including `token`.
+The response is `201` with the `Invite`, including `token`
+(`invite-create-response.json`; ofscp-core's `InviteCreateResponse`,
+whose `token` is required).
 
 ### Tokens
 
-A token is `gi_` followed by 256 random bits (base64url). It is a bearer
+A token is `gi_` followed by 256 random bits (base64url) from the OS
+CSPRNG (`getrandom`), well past the 128 bits §5.6 requires. It is a bearer
 secret, so the provider:
 
-- stores only its SHA-256 (`GroupInvite.token_hash`, `@unique`);
+- stores only its SHA-256 (`GroupInvite.token_hash`, `@unique`), as §5.6
+  recommends: a presented token is digested and looked up;
 - never logs it. `Invite`'s `Debug` redacts it. The request span and the
   signed-request rejection log pass paths through `logpath::loggable`,
   which turns `/api/invites/{token}/…` into a placeholder;
@@ -71,17 +76,17 @@ is `404` without a lookup.
 - Expired invites are left out.
 - The list is paged per §7.2 by `(createdAt, id)`, newest first by default,
   in the same `{items, page}` shape as the member and request lists.
-- **Items carry no `token`.** It is not stored, so it cannot be listed.
-  Each item is otherwise a valid `Invite`. This is the same choice the
-  admin API made for account invites (0004), where the token is shown
-  once. The trade-off is that `invite.json` requires `token`, so a list
-  item is not, strictly, an `Invite`. A manager who needs the link again
-  makes a new invite and revokes the old one.
+- **Items carry no `token`.** It is not stored, so it cannot be listed,
+  and §5.6 lets a provider omit it from every `Invite` but the create's
+  (lost-conn/ofscp#40). Each item is a valid `Invite` (`invite.json`).
+  This is the same choice the admin API made for account invites (0004),
+  where the token is shown once. A manager who needs the link again makes
+  a new invite and revokes the old one.
+  - In ofscp-core, `Invite.token` is therefore `Option<String>`, skipped
+    when absent. This is a breaking change for its users (Postrinch).
   - The alternative was sealing tokens with a server-held key so the list
     could return them. That needs a new required secret, and it widens
     what a stolen key exposes.
-  - **Open:** to be raised with the oracle. The spec could say that list
-    items MAY omit `token`, or define a list item type.
 
 ### Revoking (`DELETE /api/groups/{g}/invites/{i}`)
 
@@ -132,10 +137,10 @@ lost-conn/ofscp#35). The checks run in this order:
 The response is `200 {groupId, channelId?, role}`:
 
 - `role` is the caller's role as read back after the join.
-- `channelId` is the invite's channel when it has one (lost-conn/ofscp#35),
-  in the already-a-member answer too. A deleted channel does not void the
-  invite. The caller still joins the group, and the answer still names
-  the channel.
+- `channelId` is the invite's channel when it has one and that channel
+  still exists (lost-conn/ofscp#35, #40), in the already-a-member answer
+  too. A deleted channel does not void the invite: the caller still joins
+  the group, and the answer omits `channelId`.
 
 ### Counting uses without transactions
 
