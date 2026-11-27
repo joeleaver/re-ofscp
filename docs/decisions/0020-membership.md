@@ -212,16 +212,15 @@ Recovery and races:
 
 ### `member.updated` and the commit→hold window
 
-`Hub::publish_checked` closes 0010's window:
-
-1. It holds every subscription of the group's channel topics.
-2. It queues the event behind the hold.
-3. It releases each subscription only after a re-check finds it readable.
-
+Decision 0010's window is closed the way decision 0017 closed it for
+messages: `Hub::member_updated` delivers through `Hub::publish_to_readers`,
+once per channel of the group (`GroupStore::channel_ids`). That reads the
+group, the channel and the subscribers' memberships afresh after the
+change's commit and delivers only to those who can read the channel now.
 An event published just after a revoking commit therefore never reaches
 the revoked subscriber, whether or not the group follower has applied the
-change yet. `Hub::member_updated` publishes `{groupId, member}` this way
-and also sends it to the member's own connections. Every membership
+change yet. It publishes `{groupId, member}` this way and also sends it
+to the member's own connections. Every membership
 change still announces `AccessChange::Member`, so leaving, kicks and
 demotions end subscriptions with `access_revoked`.
 

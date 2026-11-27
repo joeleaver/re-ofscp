@@ -16,9 +16,10 @@ use common::groups::{
     Env, Party, call, create_channel, create_group, env_with_remotes, id, join, local, remote,
 };
 use common::harness::SIGNED_AT;
-use common::members::{group_with_policy, kick, leave, nickname, set_role};
+use common::members::{group_with_policy, kick, leave, members, nickname, set_role};
 use common::ws::{Client, serve};
 use common::{assert_valid, schema};
+use re_ofscp_types::wire::Member;
 use serde_json::{Value, json};
 
 const QUIET: Duration = Duration::from_millis(300);
@@ -187,35 +188,47 @@ async fn an_event_published_before_the_follower_applies_a_revocation_is_not_leak
     let env = env_with_remotes(&[]).await;
     let alice = local(&env, "alice").await;
     let mia = local(&env, "mia").await;
+    let bob = local(&env, "bob").await;
     let (g, ch) = group_with(&env, &alice, None).await;
     join(&env, &g, &mia, "member").await;
+    join(&env, &g, &bob, "member").await;
     let mut c = connect(&env, &mia).await;
     let mut o = connect(&env, &alice).await;
     subscribed(&mut c, &ch).await;
     subscribed(&mut o, &ch).await;
+    let (s, page) = members(&env, Some(&alice), &g, "?limit=100").await;
+    assert_eq!(s, StatusCode::OK, "{page}");
+    let bob_member: Member = page["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["user"] == json!(bob.actor))
+        .map(|m| serde_json::from_value(m.clone()).unwrap())
+        .unwrap();
 
     // Commit the removal through the store alone: no announcement, so the
-    // follower never holds mia's subscription (as if it were paused).
+    // follower never holds mia's subscription (as if it were paused). Her
+    // subscription is still registered when bob's `member.updated` goes out.
     env.state
         .groups
         .store
         .remove_member(&g, &mia.id())
         .await
         .unwrap();
-    env.state.ws.publish_checked(
-        std::slice::from_ref(&ch),
-        "member.updated",
-        json!({"secret": true}),
-    );
-    let e = c.event().await;
+    env.state
+        .ws
+        .member_updated(&env.state.groups, &g, &bob_member)
+        .await;
+    let e = next_of(&mut o, "member.updated").await;
     assert_eq!(
-        e["type"], "unsubscribed",
-        "nothing before the revocation: {e}"
+        e["data"]["member"]["user"],
+        json!(bob.actor),
+        "a reader gets it"
     );
-    assert_eq!(e["data"]["reason"], "access_revoked");
-    assert!(c.silent_for(QUIET).await, "the held event is dropped");
-    let e = o.event().await;
-    assert_eq!(e["data"], json!({"secret": true}), "a reader still gets it");
+    assert!(
+        c.silent_for(QUIET).await,
+        "nothing reaches the revoked subscriber"
+    );
 }
 
 #[tokio::test]
