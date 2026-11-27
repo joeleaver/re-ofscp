@@ -13,7 +13,7 @@
   oracle confirmed every default except Q5 (typing also needs a post
   grant, with Joe deciding), and settled Q2 (the `Reaction` branch of
   `TimelineItem` will be narrowed away) and Q3 (replay sends current
-  state). The clarifications are lost-conn/ofscp#37. Spec `reference.provider`: lost-conn/ofscp#34
+  state). The clarifications are lost-conn/ofscp#37 (merged). Spec `reference.provider`: lost-conn/ofscp#34
   (300f6fa).
 
 ## Context
@@ -96,9 +96,11 @@ and are not replayed.
 - A delete keeps the row as a tombstone: `deleted: true`, the body
   cleared, the id kept. The schema requires `content`, so a tombstone
   carries `{mime: "text/plain", text: ""}`, as Forumall does.
-- On a tombstone: `GET` returns it with `200`; an edit is `404`; adding a
-  reaction is `404`; removing one is `204`; a second delete is `204` and
-  fans out nothing.
+- On a tombstone: `GET` returns it with `200` (the single-message `GET`
+  is this provider's own endpoint); an edit is `404`; adding a reaction
+  is `404`; removing one proceeds as on a live message (a held reaction
+  is removed and fanned out, otherwise `204`); a second delete is `204`
+  and fans out nothing (lost-conn/ofscp#37).
 - Visibility comes first (§7.1): someone who cannot read the channel gets
   `404` for every one of these, even its author.
 
@@ -197,4 +199,3 @@ use every route exactly as local ones do, by their full `handle@domain`
 - Media uploads (§5.8), replacing `NoUploads`.
 - Notifications and mentions (§10.1). Mentions are validated and stored
   but notify no one yet.
-- Re-check against lost-conn/ofscp#37's final text once it merges.

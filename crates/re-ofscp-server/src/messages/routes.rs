@@ -56,8 +56,10 @@ impl From<MessageError> for Problem {
                 tracing::error!(error = %e, "message operation: database unavailable");
                 Problem::service_unavailable(1)
             }
-            // Writers kept winning the channel's counter: nothing was
-            // written, and a retry will get its turn.
+            // Other writers kept winning a compare-and-set. Usually nothing
+            // was written; if an edit or delete had applied before its
+            // event could be recorded, a retry is still safe (a repeated
+            // edit changes nothing, a repeated delete is already done).
             MessageError::Db(DbError::Contended(e)) => {
                 tracing::warn!(error = %e, "message operation: contended");
                 Problem::service_unavailable(1)
@@ -262,6 +264,21 @@ async fn remove_reaction(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retryable_database_errors_are_503_and_others_500() {
+        for e in [
+            DbError::Unavailable("down".into()),
+            DbError::Contended("busy".into()),
+        ] {
+            let p = Problem::from(MessageError::Db(e));
+            assert_eq!(p.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
+        let p = Problem::from(MessageError::Db(DbError::Decode("bad".into())));
+        assert_eq!(p.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let p = Problem::from(MessageError::Conflict("edited"));
+        assert_eq!(p.status(), StatusCode::CONFLICT);
+    }
 
     #[test]
     fn a_reaction_body_may_be_absent_empty_or_valid_but_not_invalid() {

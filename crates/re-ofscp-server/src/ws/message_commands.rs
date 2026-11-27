@@ -77,8 +77,9 @@ fn ws_error(e: MessageError) -> WsError {
             tracing::error!(error = %e, "message command: database unavailable");
             WsError::service_unavailable("the provider is unavailable; retry", 1)
         }
-        // Writers kept winning the channel's counter: nothing was written,
-        // and a retry will get its turn.
+        // Other writers kept winning a compare-and-set. A retry is safe
+        // even if an edit or delete applied before its event was recorded
+        // (a repeated edit changes nothing, a repeated delete is done).
         MessageError::Db(DbError::Contended(e)) => {
             tracing::warn!(error = %e, "message command: contended");
             WsError::service_unavailable("the channel is busy; retry", 1)
