@@ -9,7 +9,8 @@
 //! channel whose ids outlast its turn goes to the back of the list, so
 //! channels take turns round-robin and a flood in one delays another by at
 //! most one turn per channel ahead of it. A channel is in at most one turn at
-//! a time, so its ids are handled in order.
+//! a time, so its ids are handled in the order they were queued (the order
+//! their direct entries finished, not always their order in the channel).
 //!
 //! The queue is bounded: at most [`Limits::per_channel`] ids wait per
 //! channel and at most [`Limits::total`] in all (with at most

@@ -129,12 +129,17 @@ work they leave behind is queued under explicit bounds:
   the channel at the front of the ready list and up to 64 of its ids. If
   more of that channel's ids wait, the channel goes to the back of the
   list. A channel is in at most one turn at a time, so its messages are
-  handled in order. A flood in one channel therefore delays another
+  handled in the order they were queued. That is the order their direct
+  entries finished, which for messages created at the same moment need
+  not be their order in the channel. A flood in one channel therefore delays another
   channel's entries by at most one turn per channel ahead of it, never by
   the length of the flood.
 - **Bounds.** At most 256 ids wait per channel and 8192 in all; turns in
-  progress hold at most 4 × 64 more. Memory is bounded by those numbers,
-  whatever is posted.
+  progress hold at most 4 × 64 more. The queue's memory is bounded by
+  those numbers, whatever is posted. A create waiting for room (below)
+  still holds its own request's message until it queues; how many wait is
+  bounded only by how many requests are in flight, which this provider
+  does not cap.
 - **When a bound is reached, nothing is dropped.** The create that would
   queue past it waits for room instead (it is woken when a turn takes ids
   out), and logs once that it waited. That is back-pressure on whoever
