@@ -10,8 +10,9 @@ authentication handshake, then commands from the client and events from the
 provider. This record covers the transport: the handshake, the envelope
 and dispatch, errors and close codes, liveness and limits, subscriptions
 and their continuous access checks, revocation, and shutdown. It does not
-cover messaging, typing, presence or DMs. Those commands are still
-answered `bad_request` (below) until their modules land.
+cover messaging, typing, presence or DMs. Channel messaging and typing
+are decision 0017; presence and DM commands are still answered
+`bad_request` (below) until their modules land.
 
 The code is in `crates/re-ofscp-server/src/ws/`, with the signature half of
 the handshake in `signing/ws.rs` and remote-key re-confirmation in
@@ -263,8 +264,9 @@ Disabling an account closes all of its connections with `4003`.
   - then the held live events.
 
   A message may arrive twice across a resume, so clients dedupe by message
-  id. The default `NoTimeline` truncates every resume, so clients backfill
-  through REST history.
+  id. The provider's `Timeline` is the message log's (decision 0017); the
+  default `NoTimeline`, kept for tests, truncates every resume, so clients
+  backfill through REST history.
 
 - **The window between a commit and its hold (a requirement on
   publishing).** A change takes effect in the database before any
@@ -273,9 +275,13 @@ Disabling an account closes all of its connections with `4003`.
   the follower also reads the group's channel ids from the database;
   only then does `Hub::access_changed` hold the matching subscriptions.
   An event published to a topic in that window reaches a subscriber whose
-  access the change has already revoked. Nothing publishes yet
-  (`Hub::publish` has no production caller), so this is latent. The PR
-  that first publishes (the message log) must close it, by one of:
+  access the change has already revoked. **Closed by decision 0017** with
+  the first option below: channel events go through `ws::live::HubFanout`,
+  which checks access at publish, and
+  `a_revoked_reader_gets_nothing_before_its_subscription_is_held`
+  (`tests/messages_live.rs`) is the required test. Any future publisher
+  must do the same rather than call `Hub::publish` directly. The options
+  were:
   - checking access at publish: the publisher re-runs the
     `TopicAuthorizer` (or the effective-read-access rule) per subscriber
     of the topic, or holds the topic's subscriptions and lets the re-check
@@ -314,9 +320,9 @@ before the HTTP server finishes its graceful shutdown.
   (`AccessChange::Actor`), not only those in the group. That is correct,
   only wider than needed; narrow it if an actor's subscription count
   makes it matter.
-- A `Timeline` over the message log, once messaging lands.
-- Messaging, typing, presence (with `presence.update` on connect and
-  disconnect) and DM commands, each replacing a
-  `bad_request` "unsupported command".
+- Done: a `Timeline` over the message log, and the messaging and typing
+  commands (decision 0017).
+- Presence (with `presence.update` on connect and disconnect) and DM
+  commands, each replacing a `bad_request` "unsupported command".
 - Cite the oracle's spec PR (close codes, envelope `ts`, `not_found` on
   subscribe) here and in code comments once it is open.

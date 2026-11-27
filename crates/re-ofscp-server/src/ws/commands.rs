@@ -1,4 +1,5 @@
-//! The subscription commands of an authenticated connection (spec §7.1
+//! The command worker of an authenticated connection, and its
+//! subscription commands (spec §7.1
 //! "Channel subscriptions", "Resuming after a disconnect"), run in order on
 //! the connection's command worker.
 //!
@@ -22,11 +23,14 @@ use super::wire::{Subscribe, Subscribed, Unsubscribe, Unsubscribed};
 use re_ofscp_types::Actor;
 use serde_json::json;
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 
 use super::Hub;
+use super::message_commands::MESSAGE_COMMANDS;
 use super::protocol::{self, ACCESS_REVOKED, Command, ErrorEvent as _, MAX_ID_LEN, WsError};
 use super::registry::{ConnId, ConnShared, Ended, OverCap};
 use super::seams::TopicAccess;
+use super::typing::Typing;
 
 /// An authenticated connection, as its commands see it.
 pub struct Session {
@@ -40,14 +44,43 @@ pub struct Session {
     pub shared: Arc<ConnShared>,
 }
 
-/// Run `commands` in order until the connection ends.
+/// Run `commands` in order until the connection ends, expiring typing
+/// indicators ([`super::typing`]) as their deadlines pass.
 pub async fn run(session: Session, mut commands: mpsc::Receiver<Command>) {
-    while let Some(cmd) = commands.recv().await {
+    let mut typing = session
+        .hub
+        .messages()
+        .map(|m| Typing::new(m.clone(), session.actor.clone()));
+    loop {
+        let deadline = typing.as_ref().and_then(Typing::next_deadline);
+        let cmd = tokio::select! {
+            cmd = commands.recv() => match cmd {
+                Some(cmd) => cmd,
+                None => break,
+            },
+            () = until(deadline) => {
+                if let Some(t) = typing.as_mut() {
+                    t.expire(Instant::now()).await;
+                }
+                continue;
+            }
+        };
         match cmd.kind.as_str() {
             "subscribe" => session.subscribe(&cmd).await,
             "unsubscribe" => session.unsubscribe(&cmd),
+            kind if MESSAGE_COMMANDS.contains(&kind) => {
+                session.message_command(&cmd, typing.as_mut()).await;
+            }
             _ => {}
         }
+    }
+}
+
+/// Resolves at `deadline`, or never.
+async fn until(deadline: Option<Instant>) {
+    match deadline {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
     }
 }
 
@@ -87,11 +120,11 @@ enum Verdict {
 }
 
 impl Session {
-    fn send(&self, text: String) {
+    pub(super) fn send(&self, text: String) {
         self.shared.deliver(text.into());
     }
 
-    fn error(&self, correlation: &str, e: &WsError) {
+    pub(super) fn error(&self, correlation: &str, e: &WsError) {
         self.send(e.to_event(Some(correlation), self.hub.now()));
     }
 

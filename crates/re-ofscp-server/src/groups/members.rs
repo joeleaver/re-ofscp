@@ -45,6 +45,30 @@ impl GroupStore {
             .map(|r| r.data.role))
     }
 
+    /// The roles of those of `actors` who are active (non-owner) members
+    /// of `group_id`, in as few queries as fit (live fan-out checks every
+    /// subscriber of a channel at once).
+    pub async fn roles_of(
+        &self,
+        group_id: &str,
+        actors: &[Actor],
+    ) -> Result<std::collections::HashMap<Actor, String>, DbError> {
+        #[derive(Deserialize)]
+        struct KeyedRole {
+            actor: String,
+            role: String,
+            status: String,
+        }
+        let keys: Vec<String> = actors.iter().map(|a| member_key(group_id, a)).collect();
+        let rows: Vec<KeyedRole> =
+            crate::db::lookup::lookup(&self.db, "Membership.filter(", ".key == ", &keys).await?;
+        Ok(rows
+            .into_iter()
+            .filter(|r| r.status == status::ACTIVE)
+            .filter_map(|r| Some((Actor::parse_canonical(&r.actor).ok()?, r.role)))
+            .collect())
+    }
+
     /// `actor`'s active memberships as `(group_id, role)`, at most `cap`
     /// (their groups may be active or being deleted).
     pub async fn memberships_of(

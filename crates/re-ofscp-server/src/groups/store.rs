@@ -11,13 +11,12 @@
 
 use std::sync::Arc;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use re_ofscp_types::Actor;
 use re_ofscp_types::groups::{ChannelType, JoinPolicy, Tier};
 use serde::Deserialize;
 
 use super::model::{ChannelFields, GroupFields, StoredChannel, StoredGroup};
+use crate::db::doc::{json, new_id};
 use crate::db::{Db, DbError, Ql};
 
 /// `status` values (`Group`, `Channel`, `Membership`).
@@ -96,17 +95,6 @@ struct GroupIdRow {
 #[derive(Deserialize)]
 struct ChannelIdRow {
     channel_id: String,
-}
-
-/// A fresh local id: `prefix` + 128 random bits, base64url (§2.2).
-fn new_id(prefix: &'static str) -> Result<String, DbError> {
-    let mut bytes = [0u8; 16];
-    getrandom::fill(&mut bytes).map_err(|e| DbError::Query(format!("random source: {e}")))?;
-    Ok(format!("{prefix}{}", B64URL.encode(bytes)))
-}
-
-fn json<T: serde::Serialize>(value: &T) -> Result<String, DbError> {
-    serde_json::to_string(value).map_err(|e| DbError::Query(format!("encoding a document: {e}")))
 }
 
 fn decode_updated<R, T>(
@@ -316,10 +304,13 @@ impl GroupStore {
             .is_empty())
     }
 
-    /// Remove a group being deleted: its channels and memberships (pending
-    /// or active), then the group row. Each step is idempotent, so an interrupted purge is
-    /// simply run again.
+    /// Remove a group being deleted: close its channels' message logs
+    /// (the messages sweeper purges them, decision 0017), then remove its
+    /// channels and memberships (pending or active), then the group row.
+    /// Each step is idempotent, so an interrupted purge is simply run
+    /// again.
     pub async fn purge_group(&self, group_id: &str) -> Result<(), DbError> {
+        crate::messages::log::close_group(&self.db, group_id).await?;
         let channels = Ql::new("Channel.filter(.group_id == ")
             .str(group_id)
             .raw(").delete()");
@@ -550,8 +541,11 @@ impl GroupStore {
     }
 
     /// Delete channel `channel_id` of `group_id`, pending or active (a
-    /// no-op if it is gone).
+    /// no-op if it is gone). Its message log is closed first, so no write
+    /// lands after the channel is gone, and the messages sweeper purges
+    /// its messages (decision 0017).
     pub async fn delete_channel(&self, group_id: &str, channel_id: &str) -> Result<(), DbError> {
+        crate::messages::log::close_channel(&self.db, group_id, channel_id).await?;
         let q = Ql::new("Channel.filter(.channel_id == ")
             .str(channel_id)
             .raw(" && .group_id == ")

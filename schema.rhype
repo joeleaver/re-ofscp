@@ -324,3 +324,104 @@ type Presence {
     last_seen: DateTime
     updated_at: DateTime
 }
+
+// ---- Channel messages (spec §5.3, §7.1, §7.2; docs/decisions/0017) ----
+//
+// Every channel has one timeline: a sequence of positions 1, 2, 3, ...
+// handed out by `ChannelLog`. Each create, edit and delete takes the next
+// position. A create's position is its `Message.pos`; an edit's or a
+// delete's is a `TimelineEvent.pos`. Positions are written as
+// "{channel_id}:{seq}" in `@unique` fields, so a page of history or a
+// resume replay is a set of exact lookups (no ordered scan is needed), and
+// a REST cursor and a live event's cursor are the same kind of value.
+// A position whose write failed is simply a gap.
+
+// The next free position of a channel's timeline. Created with the
+// channel's first message; advanced by a compare-and-set on `last_seq`
+// that also requires `state == "open"`.
+//
+// Deleting a channel or its group closes its log (`state: "closed"`,
+// created closed if the channel had none), so no position can be taken
+// after it. The messages sweeper then removes the channel's rows, stamps
+// `purged_at` (unix seconds), and after a grace period removes them once
+// more, catching a write that took its position before the close, and
+// deletes the log (docs/decisions/0017).
+type ChannelLog {
+    channel_id: String @unique
+    group_id: String @indexed
+    last_seq: i64
+    // "open" or "closed".
+    state: String @indexed
+    // 0 until the sweeper's first purge of a closed log.
+    purged_at: i64
+}
+
+// A message in a channel (§5.3). `doc` holds the body as JSON
+// (messages::model::MessageDoc): content, attachments, tags, mentions,
+// article fields, metadata, clientMessageId. A delete tombstones the row:
+// `deleted_at` is set and `doc` is emptied (§7.1).
+type Message {
+    message_id: String @unique
+    channel_id: String @indexed
+    group_id: String @indexed
+    // Creation position: "{channel_id}:{seq}".
+    pos: String @unique
+    seq: i64
+    // Idempotency key (§7.1): "c {channel_id} {author} {clientMessageId}",
+    // or "m {message_id}" when the create had no clientMessageId, so the
+    // insert itself refuses a duplicate.
+    client_key: String @unique
+    // The canonical author (§2.2), local or remote.
+    author: String
+    // "message", "memo" or "article".
+    kind: String
+    // The reply's parent message id, or "" for a top-level message.
+    parent_id: String
+    // The reply's position among its parent's replies: "{parent_id}:{n}",
+    // or "m {message_id}" for a top-level message (kept unique).
+    reply_pos: String @unique
+    // How many reply positions and reaction positions this message has
+    // handed out (compare-and-set counters, as ChannelLog.last_seq).
+    reply_seq: i64
+    reaction_seq: i64
+    doc: String
+    created_at: DateTime
+    // Unix seconds; 0 when the message has no edit window (articles) or
+    // has not been edited or deleted.
+    edit_until: i64
+    edited_at: i64
+    deleted_at: i64
+}
+
+// An edit or a delete, at its own timeline position, for resume replay
+// (§7.1 "Resuming after a disconnect"). It names the message; replay sends
+// the message as it now stands.
+type TimelineEvent {
+    pos: String @unique
+    channel_id: String @indexed
+    group_id: String @indexed
+    seq: i64
+    // "updated" or "deleted".
+    kind: String
+    message_id: String
+    at: DateTime
+}
+
+// A reaction (§5.3, §7.1): at most one per (message, author, key).
+type Reaction {
+    // "{message_id} {author} {key}".
+    key: String @unique
+    // The reaction's position among the message's reactions:
+    // "{message_id}:{n}".
+    rpos: String @unique
+    reaction_id: String @unique
+    message_id: String @indexed
+    channel_id: String @indexed
+    group_id: String @indexed
+    author: String
+    rkey: String
+    // "" when absent.
+    unicode: String
+    image: String
+    created_at: DateTime
+}

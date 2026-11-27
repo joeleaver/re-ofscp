@@ -6,6 +6,7 @@ pub mod admin;
 pub mod groups;
 pub mod harness;
 pub mod key_setup;
+pub mod messages;
 pub mod profiles;
 pub mod races;
 pub mod remote_peer;
@@ -56,7 +57,7 @@ pub fn vector_key(v: &serde_json::Value) -> ed25519_dalek::SigningKey {
 }
 
 /// Where the spec's schemas say they live (their `$id` base).
-const SCHEMA_ID_BASE: &str = "https://example.invalid/ofscp/schemas/v0.1/";
+pub const SCHEMA_ID_BASE: &str = "https://example.invalid/ofscp/schemas/v0.1/";
 
 /// Resolves the spec's relative `$ref`s to files in the sibling checkout.
 struct SpecRetriever;
@@ -81,11 +82,17 @@ pub fn schema(name: &str) -> jsonschema::Validator {
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("cannot read {} ({e})", path.display()));
     let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    schema_value(value)
+}
+
+/// A validator for a schema given inline; its relative `$ref`s resolve
+/// against its `$id` to files in the spec checkout.
+pub fn schema_value(value: serde_json::Value) -> jsonschema::Validator {
     jsonschema::options()
         .should_validate_formats(true)
         .with_retriever(SpecRetriever)
         .build(&value)
-        .unwrap_or_else(|e| panic!("schema {name} does not compile: {e}"))
+        .unwrap_or_else(|e| panic!("schema {} does not compile: {e}", value["$id"]))
 }
 
 /// Panic with every validation error if `instance` does not match.

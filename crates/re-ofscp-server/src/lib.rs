@@ -12,6 +12,7 @@ pub mod db;
 pub mod discovery;
 pub mod federation;
 pub mod groups;
+pub mod messages;
 pub mod outbound;
 pub mod privacy;
 pub mod problem;
@@ -42,6 +43,8 @@ use db::{Db, DbConfig, DbError};
 use federation::FederationPolicy;
 use federation::store::PolicyStore;
 use groups::Groups;
+use messages::uploads::{NoUploads, Uploads};
+use messages::{MessageTimeline, Messages};
 use outbound::{OutboundClient, OutboundConfig};
 use privacy::{Contacts, GroupMemberships, Liveness, Relationships};
 use profiles::Profiles;
@@ -49,7 +52,8 @@ use remote_keys::RemoteKeys;
 use replay::ReplayStore;
 use replay::ledger::{LedgerError, NonceLedger, RhypeLedger};
 use signing::{Clock, KeyResolver, SystemClock, Verifier};
-use ws::{GroupTopics, Hub, NoTimeline, Seams, WsConfig};
+use ws::live::HubFanout;
+use ws::{GroupTopics, Hub, Seams, WsConfig};
 
 /// Maximum clock skew accepted on signed requests, in seconds (§4.5 step 3, §8).
 pub const MAX_SKEW_SECS: i64 = 300;
@@ -81,6 +85,8 @@ pub struct AppState {
     pub admins: Arc<Admins>,
     /// Groups, channels and membership (§5.2, §5.5).
     pub groups: Arc<Groups>,
+    /// Channel messages.
+    pub messages: Arc<Messages>,
     /// Verifies every signed request, REST and federation alike, against the
     /// one provider-wide replay store.
     pub verifier: Arc<Verifier>,
@@ -129,6 +135,7 @@ pub struct AppStateBuilder {
     liveness: Option<Arc<dyn Liveness>>,
     ws_config: WsConfig,
     ws_seams: Option<Seams>,
+    uploads: Option<Arc<dyn Uploads>>,
 }
 
 impl AppStateBuilder {
@@ -202,12 +209,20 @@ impl AppStateBuilder {
         self
     }
 
-    /// Plug channel access and timelines into the WebSocket layer instead
-    /// of the provider's own (channel access from its groups, no
-    /// timeline) (tests).
+    /// Plug channel access, timelines and messages into the WebSocket
+    /// layer instead of the provider's own (channel access from its
+    /// groups, the message log) (tests).
     #[must_use]
     pub fn ws_seams(mut self, seams: Seams) -> Self {
         self.ws_seams = Some(seams);
+        self
+    }
+
+    /// Check message attachments' local media ids against `uploads`
+    /// instead of knowing none (§5.8).
+    #[must_use]
+    pub fn uploads(mut self, uploads: Arc<dyn Uploads>) -> Self {
+        self.uploads = Some(uploads);
         self
     }
 
@@ -279,6 +294,7 @@ impl AppStateBuilder {
             None => groups.clone(),
         };
         let keys: Arc<dyn KeyResolver> = self.keys.unwrap_or_else(|| accounts.keys.clone());
+        let clock = self.clock.clone();
         let verifier = Arc::new(Verifier::new(
             config.domain.clone(),
             MAX_SKEW_SECS,
@@ -288,6 +304,14 @@ impl AppStateBuilder {
             policy,
             self.clock,
         ));
+        let fanout = Arc::new(HubFanout::new(groups.clone()));
+        let messages = Arc::new(Messages::new(
+            db.clone(),
+            groups.clone(),
+            self.uploads.unwrap_or_else(|| Arc::new(NoUploads)),
+            fanout.clone(),
+            clock,
+        ));
         let ws = Arc::new(Hub::new(
             self.ws_config,
             verifier.clone(),
@@ -295,9 +319,11 @@ impl AppStateBuilder {
             config.domain.clone(),
             self.ws_seams.unwrap_or_else(|| Seams {
                 topics: Arc::new(GroupTopics::new(groups.clone())),
-                timeline: Arc::new(NoTimeline),
+                timeline: Arc::new(MessageTimeline::new(messages.clone())),
+                messages: Some(messages.clone()),
             }),
         ));
+        fanout.attach(&ws);
         accounts.on_revocation(ws.clone());
         // Subscriptions whose access a group change revokes end at once.
         ws::follow_groups(&runtime, &ws, &groups);
@@ -314,6 +340,7 @@ impl AppStateBuilder {
             accounts,
             admins,
             groups,
+            messages,
             verifier,
             discovery,
             federation,
@@ -338,6 +365,7 @@ impl AppState {
             liveness: None,
             ws_config: WsConfig::default(),
             ws_seams: None,
+            uploads: None,
         }
     }
 
@@ -532,6 +560,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route(discovery::PATH, get(discovery::get))
         .route("/problems/{code}", get(problem::describe))
+        .merge(messages::routes::router())
         .fallback(|| async { Problem::not_found() })
         .method_not_allowed_fallback(|| async { Problem::method_not_allowed() })
         .layer(middleware::from_fn_with_state(

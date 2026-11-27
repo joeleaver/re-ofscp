@@ -30,6 +30,7 @@ use super::Hub;
 use super::commands::{self, Session};
 use super::handshake::Handshake;
 use super::lease::{Lease, Outcome, Step};
+use super::message_commands::MESSAGE_COMMANDS;
 use super::protocol::{self, Close, Command, ErrorEvent as _, STANDARD_COMMANDS, WsError, close};
 use super::registry::{ConnId, ConnShared};
 use crate::signing::{Reconfirmed, Requester, WsVerified};
@@ -359,7 +360,10 @@ impl Reader<'_> {
                 let e = WsError::bad_request("this connection is already authenticated");
                 self.error(Some(&cmd.id), &e);
             }
-            "subscribe" | "unsubscribe" => {
+            kind if kind == "subscribe"
+                || kind == "unsubscribe"
+                || (MESSAGE_COMMANDS.contains(&kind) && self.hub.messages().is_some()) =>
+            {
                 if let Err(mpsc::error::TrySendError::Full(cmd)) = commands.try_send(cmd) {
                     let e = WsError::too_many_requests("too many commands in progress", 1);
                     self.error(Some(&cmd.id), &e);

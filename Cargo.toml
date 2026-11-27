@@ -53,6 +53,8 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls-no-p
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = "1"
 url = "2"
+# Allow-list HTML sanitizer for text/html message bodies (spec §5.3).
+ammonia = "4.2"
 
 # rhypedb (the database) — pinned to an exact upstream commit. Bump deliberately.
 rhypedb-client = { git = "https://github.com/joeleaver/rhypedb", rev = "7b78190579661cc91508afea1ee1fe2bd54881a1", features = ["async"] }

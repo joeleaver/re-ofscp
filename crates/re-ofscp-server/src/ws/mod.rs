@@ -3,7 +3,9 @@
 //!
 //! * [`protocol`]: the envelope, events, errors and close codes.
 //! * [`conn`]: one connection, from the `auth.challenge` to its close.
-//! * [`commands`]: the commands of an authenticated connection.
+//! * [`commands`]: the commands of an authenticated connection; the
+//!   messaging ones are in `message_commands`, typing state in `typing`.
+//! * [`live`]: delivering channel events, access checked at publish.
 //! * [`registry`]: live connections, caps, subscriptions and fan-out.
 //! * [`access`]: re-checking access, revocation, federation policy.
 //! * [`lease`]: re-confirming a remote actor's key.
@@ -21,9 +23,12 @@ pub mod commands;
 pub mod conn;
 mod handshake;
 pub mod lease;
+pub mod live;
+mod message_commands;
 pub mod protocol;
 pub mod registry;
 pub mod seams;
+mod typing;
 pub mod wire;
 
 use std::sync::Arc;
@@ -46,6 +51,7 @@ pub use self::seams::{
 };
 use crate::AppState;
 use crate::client::{Peer, client_keys_by};
+use crate::messages::Messages;
 use crate::problem::Problem;
 use crate::signing::{Requester, Verifier};
 
@@ -119,14 +125,19 @@ impl Default for WsConfig {
 }
 
 /// The subsystems a [`Hub`] consults. The provider's own are channel
-/// access from its groups ([`GroupTopics`]) and [`NoTimeline`]; the
-/// [`Default`] answers nothing at all readable (tests without a database).
+/// access from its groups ([`GroupTopics`]), the message log's timeline
+/// ([`crate::messages::MessageTimeline`]) and the messages themselves; the
+/// [`Default`] answers nothing at all readable and supports no messaging
+/// command (tests without a database).
 #[derive(Clone)]
 pub struct Seams {
     /// Channel access.
     pub topics: Arc<dyn TopicAuthorizer>,
     /// Channel timelines.
     pub timeline: Arc<dyn Timeline>,
+    /// Channel messages, for the messaging commands; `None` answers them
+    /// as unsupported (§7.1).
+    pub messages: Option<Arc<Messages>>,
 }
 
 impl Default for Seams {
@@ -134,6 +145,7 @@ impl Default for Seams {
         Self {
             topics: Arc::new(NoTopics),
             timeline: Arc::new(NoTimeline),
+            messages: None,
         }
     }
 }
@@ -182,6 +194,11 @@ impl Hub {
     /// The configuration.
     pub fn config(&self) -> &WsConfig {
         &self.config
+    }
+
+    /// The channel messages the messaging commands run against, if any.
+    pub fn messages(&self) -> Option<&Arc<Messages>> {
+        self.seams.messages.as_ref()
     }
 
     /// The registry of live connections.
