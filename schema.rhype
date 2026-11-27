@@ -418,7 +418,7 @@ type Presence {
 // that also requires `state == "open"`.
 //
 // It also counts the channel's messages for exact unread counts (§7.7,
-// lost-conn/ofscp#41; docs/decisions/0021). `message_count` is how many
+// lost-conn/ofscp#41; docs/decisions/0022). `message_count` is how many
 // messages the channel holds, tombstones included: a create takes its
 // position and the next count in one compare-and-set, which also requires
 // `counted == 1` and no pending create (`pending_id == ""`). The create
@@ -427,7 +427,7 @@ type Presence {
 // stopped, part-way is settled exactly by the next writer or reader: the
 // message exists, or its count and its author's tally are given back.
 // `counted` is absent on logs from before message ordinals, until the
-// channel's messages are numbered (`messages::ordinals`).
+// channel's messages are numbered (`messages::numbering`).
 //
 // Deleting a channel or its group closes its log (`state: "closed"`,
 // created closed if the channel had none), so no position can be taken
@@ -491,19 +491,19 @@ type Message {
     // same body (decision 0017).
     revision: i64
     deleted_at: i64
-    // Exact unread counts (§7.7; docs/decisions/0021). `n` is the message's
+    // Exact unread counts (§7.7; docs/decisions/0022). `n` is the message's
     // 1-based creation ordinal among the channel's messages (replies and
     // tombstones included), `author_n` its ordinal among its author's
     // messages in the channel, and `apos` is "{channel_id} {author}
     // {author_n}", so the reader's own messages can be found by ordinal.
     // Absent on messages from before ordinals until their channel is
-    // numbered (`messages::ordinals`).
+    // numbered (`messages::numbering`).
     n: i64
     author_n: i64
     apos: String @unique
 }
 
-// How many messages an author has in a channel (§7.7; docs/decisions/0021):
+// How many messages an author has in a channel (§7.7; docs/decisions/0022):
 // `key` is "{channel_id} {author}". Taken by a compare-and-set on `count`
 // with the author's next `Message.author_n`; given back with a create that
 // failed. Purged with the channel's messages.
@@ -558,7 +558,7 @@ type GroupPointer {
     updated_at: DateTime
 }
 
-// A follow (§7.6, docs/decisions/0021): a channel one of the owner's
+// A follow (§7.6, docs/decisions/0022): a channel one of the owner's
 // clients asked to see in their feed. `key` is "{owner} {channel}";
 // `channel` is a local channel's id, or a remote channel's canonical object
 // URI, so each channel is followed at most once. `slot` is "{owner} {i}"
@@ -572,7 +572,7 @@ type Follow {
     created_at: DateTime
 }
 
-// A read marker (§7.7, docs/decisions/0021): the newest message the owner
+// A read marker (§7.7, docs/decisions/0022): the newest message the owner
 // has read in a scope (a local channel's id). `key` is "{owner} {scope}";
 // `n` is that message's creation ordinal (`Message.n`), so a marker only
 // moves forward, and `own` is how many of the owner's messages in the scope

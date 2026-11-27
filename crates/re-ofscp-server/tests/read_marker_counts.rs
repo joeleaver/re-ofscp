@@ -1,7 +1,8 @@
 //! Exact unread counts (spec §7.7: "MUST be exact", lost-conn/ofscp#41;
-//! docs/decisions/0021) on a real rhypedb-server: long runs, tombstones,
-//! the reader's own messages, concurrent writers and markers, channels
-//! from before message ordinals, and creates left part-way.
+//! docs/decisions/0022) on a real rhypedb-server: long runs, tombstones,
+//! the reader's own messages, concurrent writers and markers, and creates
+//! left part-way. Channels from before message ordinals are in
+//! tests/read_marker_numbering.rs.
 
 mod common;
 
@@ -9,14 +10,12 @@ use std::collections::BTreeSet;
 
 use axum::http::StatusCode;
 use common::groups::{Env, Party, call, id};
-use common::harness::SIGNED_AT;
 use common::messages::{Chan, post, reply, text, text_with_id};
 use common::races::RACERS;
 use common::read_markers::{mark, posts, scopes, setup, unread};
 use futures_util::future::join_all;
 use re_ofscp_server::db::Ql;
-use re_ofscp_server::messages::model::MessageDoc;
-use re_ofscp_server::messages::tally;
+use re_ofscp_server::messages::{log, tally};
 use re_ofscp_server::read_markers::store::MarkerStore;
 
 /// The creation ordinal of message `m` of `chan`.
@@ -175,88 +174,6 @@ async fn concurrent_marker_updates_end_at_the_newest_message() {
     assert_eq!((stored.n, stored.own), (40, 0));
 }
 
-/// Write a message as stored before ordinals: no `n`, `author_n` or
-/// `apos`.
-async fn legacy_message(env: &Env, chan: &Chan, seq: i64, author: &Party, deleted: bool) -> String {
-    let id = format!("msg_legacy{seq}");
-    let now = SIGNED_AT.unix_timestamp();
-    let q = Ql::new("Message.create({ message_id: ")
-        .str(&id)
-        .raw(", channel_id: ")
-        .str(&chan.c)
-        .raw(", group_id: ")
-        .str(&chan.g)
-        .raw(", pos: ")
-        .str(&format!("{}:{seq}", chan.c))
-        .raw(", seq: ")
-        .int(seq)
-        .raw(", client_key: ")
-        .str(&format!("m {id}"))
-        .raw(", author: ")
-        .str(&author.actor)
-        .raw(", kind: \"message\", parent_id: \"\", reply_pos: ")
-        .str(&format!("m {id}"))
-        .raw(", reply_seq: 0, reaction_seq: 0, doc: ")
-        .str(&serde_json::to_string(&MessageDoc::default()).unwrap())
-        .raw(", created_at: ")
-        .unix_seconds(now)
-        .raw(", edit_until: 0, edited_at: 0, revision: 0, deleted_at: ")
-        .int(if deleted { now } else { 0 })
-        .raw(" })");
-    env.state.db.execute(&q).await.unwrap();
-    id
-}
-
-#[tokio::test]
-async fn channels_from_before_ordinals_are_numbered_on_first_use() {
-    let (env, alice, bob, chan) = setup().await;
-    // A log as stored before ordinals: positions 4 and 9 were edits.
-    let q = Ql::new("ChannelLog.create({ channel_id: ")
-        .str(&chan.c)
-        .raw(", group_id: ")
-        .str(&chan.g)
-        .raw(", last_seq: 12, state: \"open\", purged_at: 0 })");
-    env.state.db.execute(&q).await.unwrap();
-    let mut by_seq = std::collections::BTreeMap::new();
-    for (seq, who, deleted) in [
-        (1, &alice, false),
-        (2, &bob, false),
-        (3, &alice, false),
-        (5, &alice, true),
-        (6, &bob, false),
-        (7, &alice, false),
-        (8, &alice, false),
-        (10, &bob, false),
-        (11, &alice, false),
-        (12, &alice, false),
-    ] {
-        by_seq.insert(seq, legacy_message(&env, &chan, seq, who, deleted).await);
-    }
-    // The first readers number the channel once, whichever of them gets
-    // there first; all of them see the same exact counts.
-    let first = join_all((0..8).map(|_| unread(&env, &bob, &chan.c))).await;
-    assert!(first.iter().all(|n| *n == 7), "{first:?}");
-    assert_eq!(unread(&env, &alice, &chan.c).await, 3);
-    assert_eq!(ordinal(&env, &chan, &by_seq[&12]).await, 10);
-    assert_eq!(ordinal(&env, &chan, &by_seq[&6]).await, 5);
-
-    // Bob at his own message (seq 6): alice's 7, 8, 11, 12 are after it.
-    assert_eq!(
-        mark(&env, &bob, &[(&chan.c, &by_seq[&6])]).await[0]["unreadCount"],
-        4
-    );
-    // Alice at seq 7: bob's 10.
-    assert_eq!(
-        mark(&env, &alice, &[(&chan.c, &by_seq[&7])]).await[0]["unreadCount"],
-        1
-    );
-    // New messages continue the numbering.
-    let new = id(&post(&env, &alice, &chan, text("new")).await);
-    assert_eq!(ordinal(&env, &chan, &new).await, 11);
-    assert_eq!(unread(&env, &bob, &chan.c).await, 5);
-    assert_eq!(unread(&env, &alice, &chan.c).await, 1);
-}
-
 /// Leave a create of `author` pending on `chan`'s log as a process that
 /// stopped part-way would: its position and ordinal taken, and its
 /// author's ordinal too when `took_tally`, but no message written.
@@ -315,5 +232,29 @@ async fn a_create_left_part_way_is_settled_exactly() {
     assert_eq!(
         mark(&env, &bob, &[(&chan.c, &m)]).await[0]["unreadCount"],
         0
+    );
+}
+
+/// A create that finds another create still pending after settling under
+/// its lock can only be meeting another process's (decision 0022): the
+/// log refuses it a position (`Unsettled`), which the create answers `503`
+/// with `Retry-After` (`messages/routes.rs` pins that mapping). Nothing is
+/// taken meanwhile.
+#[tokio::test]
+async fn a_create_meeting_a_pending_create_takes_nothing() {
+    let (env, alice, _bob, chan) = setup().await;
+    posts(&env, &alice, &chan, 2).await;
+    let db = env.state.db.clone();
+    stalled_create(&env, &chan, &alice, false).await;
+    let before = log::read_counts(&db, &chan.c).await.unwrap().unwrap();
+    assert_eq!(
+        log::take_create(&db, &chan.c, "msg_other", &alice.actor)
+            .await
+            .unwrap(),
+        log::CreateTake::Unsettled
+    );
+    assert_eq!(
+        log::read_counts(&db, &chan.c).await.unwrap().unwrap(),
+        before
     );
 }

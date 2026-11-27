@@ -1,4 +1,4 @@
-//! Follows (spec §7.6; docs/decisions/0021; security requirements 1 and
+//! Follows (spec §7.6; docs/decisions/0022; security requirements 1 and
 //! 5), on a real rhypedb-server: `GET`/`POST /api/me/follows` and `DELETE
 //! /api/me/follows/{channelRef}`.
 

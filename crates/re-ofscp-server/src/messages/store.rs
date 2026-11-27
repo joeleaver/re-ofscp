@@ -58,7 +58,7 @@ struct MessageRow {
     edited_at: i64,
     revision: i64,
     deleted_at: i64,
-    // Absent on messages from before ordinals (`ordinals.rs`).
+    // Absent on messages from before ordinals (`numbering.rs`).
     #[serde(default)]
     n: Option<i64>,
 }

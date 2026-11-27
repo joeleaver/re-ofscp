@@ -57,8 +57,8 @@ pub struct StoredMessage {
     /// Its creation position in the channel's timeline.
     pub seq: i64,
     /// Its creation ordinal among the channel's messages (§7.7 counts;
-    /// docs/decisions/0021): `None` on a message from before ordinals until
-    /// its channel is numbered (`ordinals.rs`).
+    /// docs/decisions/0022): `None` on a message from before ordinals until
+    /// its channel is numbered (`numbering.rs`).
     pub n: Option<i64>,
     /// The idempotency key the create carried (§7.1), if any.
     pub client_message_id: Option<String>,

@@ -1,4 +1,4 @@
-# 0021: Follows and read markers
+# 0022: Follows and read markers
 
 - **Status:** accepted
 - **Date:** 2026-11-27
@@ -81,8 +81,8 @@ their devices.
 
 | Route | Answers |
 | --- | --- |
-| `GET /api/me/read-markers` | `200` `{scopes}`: every channel the user can read now in the groups they belong to |
-| `PATCH /api/me/read-markers` | `200` `{scopes}`: the scopes that moved; `400` malformed body |
+| `GET /api/me/read-markers` | `200` `{scopes}`: every channel the user can read now in the groups they belong to; `503` + `Retry-After` (below) |
+| `PATCH /api/me/read-markers` | `200` `{scopes}`: the scopes that moved; `400` malformed body; `503` + `Retry-After` (below) |
 
 - **Scopes.** A scope is a channel the user can read in a group they
   belong to here. Direct-message scopes (`dmId`) join when §7.4 is
@@ -104,6 +104,20 @@ their devices.
   either retries on a lost race. A marker behind or at the stored one
   changes nothing. Several markers for one scope in a request each apply;
   the scope is reported once, at its final state.
+- **Deleted channels are not scopes.** Deleting a channel or its group
+  closes the channel's logs before it removes the channel rows, so for a
+  moment a reader can still list a channel whose log is closed. Its counts
+  are gone with it (a closed log counts nothing), and it is no longer
+  readable: `GET`, `PATCH` and `read.updated` leave it out, and `PATCH`
+  stores no new marker there. The same goes for a channel with no log
+  where the reader holds a marker (only a written channel has markers, and
+  only a deleted one loses its log, when the sweeper drops it). Neither is
+  ever a `500`.
+- **`503`.** Answered with `Retry-After` when a request cannot be
+  answered exactly yet and a retry will be: a write conflict that outlasted
+  its retries or the database unreachable (`Retry-After: 1`, as for
+  messages), or a channel from before ordinals still being numbered
+  (`Retry-After: 5`, below).
 - **`read.updated`.** When any scope moved, the scopes that moved are sent
   to every connection of the user (`hub.send_to_actor`), the same entries
   the response holds. A request that moves nothing sends nothing.
@@ -126,7 +140,8 @@ their devices.
   changes while a create is pending on its channel's log (below), and
   every create moves `last_seq`, so where the two log reads agree and show
   nothing pending, the tally read between them agrees with the count. A
-  channel where they do not is settled and read under its channel lock.
+  log either read finds closed is a deleted channel (above). A channel
+  where they do not agree is settled and read under its channel lock.
   `PATCH` finds `own` by a binary search over the user's `author_n`, each
   step a point lookup on `Message.apos = "{channel} {author} {author_n}"`
   (`@unique`): O(log) lookups. The groups the scopes come from are checked
@@ -148,26 +163,61 @@ their devices.
   ordinals, giving back is always exact, and ordinals stay dense. The
   provider runs as one process (decision 0005), whose channel lock makes
   creates take turns; the compare-and-sets keep each counter atomic
-  regardless, and a second process's pending create makes a create answer
-  `409` rather than guess.
-- **Existing data: numbering on first use.** Messages and logs written
-  before ordinals have none of the new fields. rhypedb reads an absent
-  field as missing, and no filter comparison (`==`, `!=`, `== null`)
-  matches it; `@unique` admits any number of objects without the field.
-  So a create's compare-and-set (`counted == 1`) never matches a log from
-  before, and `counted` absent is what marks a channel to number. The
-  first create, marker update or count that meets one numbers it, under
-  the channel's lock: it reads the channel's positions `1..=last_seq` in
+  regardless. A create that, just after settling under its lock, still
+  finds a create pending can only be meeting another process's: it takes
+  no ordinal and answers `503` with `Retry-After: 1`, like every other
+  transient write conflict on messages (`DbError::Contended`), since a
+  retry once that create settles succeeds. `409` stays for conflicts a
+  retry does not fix by itself (an edit racing an edit).
+- **Existing data: numbering (`messages/numbering.rs`).** Messages and
+  logs written before ordinals have none of the new fields. rhypedb reads
+  an absent field as missing, and no filter comparison (`==`, `!=`,
+  `== null`) matches it; `@unique` admits any number of objects without
+  the field. So a create's compare-and-set (`counted == 1`) never matches
+  a log from before, and `counted` absent is what marks a channel to
+  number. Numbering reads the channel's positions `1..=last_seq` in
   batches of 100 point lookups, gives each message in `seq` order its `n`,
-  `author_n` and `apos`, sets each author's tally, and only then marks the
-  log counted with `message_count`, by a compare-and-set that also
-  requires `last_seq` unchanged (starting over if a position was taken).
-  Every value written depends only on the messages stored, so a numbering
-  cut short is redone by the next one, writing the same values, and
-  concurrent readers wait on the lock and find it done. It runs lazily,
-  not at startup, so a deploy does not wait on every channel and an idle
-  channel is never touched; its cost, one pass over the channel, is paid
-  once.
+  `author_n` and `apos` (16 writes at a time, skipping messages that
+  already hold the right values), sets each author's tally, and only then
+  marks the log counted with `message_count`. Every value written depends
+  only on the messages stored, so a numbering cut short is redone by the
+  next one, writing the same values.
+  - *Where it runs.* A background task started with the server (beside
+    the messages sweeper) numbers every channel: it pages through the open
+    logs, repeating its pass until one numbers nothing (rhypedb pages have
+    no order, so a log closed during a pass can shift another past it),
+    then numbers whatever requests hand it. A request (a create, a marker,
+    a count) that meets a channel not yet numbered numbers it itself only
+    when its log has handed out at most 1,000 positions; a longer one is
+    handed to the background task and the request answers `503` with
+    `Retry-After: 5` until it is done. No count is guessed meanwhile, and
+    no scope is dropped from `GET` to avoid waiting.
+  - *Bounds.* A request does at most 10 batched reads and 1,000 writes
+    numbering a channel, or none. The background task is unbounded (one
+    pass over each channel, once) but nothing waits on it: numbering takes
+    its own per-channel lock, never the channel's write lock, so edits,
+    deletes and reactions go on meanwhile; only creates there wait (with
+    `503`), since a create needs the channel numbered. Numberings of one
+    channel take turns under that lock, and creates are refused until it
+    is numbered, so no create runs beside a numbering.
+  - *The final compare-and-set* marks the log counted only if no position
+    was taken after the last one the numbering read (`last_seq`
+    unchanged): such a position could hold a create's message, which the
+    count must include. It does not restart the numbering, though. A
+    position already read never gains a message later (a message is
+    written only at the position its create took, and an edit or a delete
+    moves `last_seq` without writing one), so the numbering keeps its
+    count and tallies, reads only the positions taken since, and tries
+    again. An edit landing between the reads and the compare-and-set costs
+    one more batch; only a channel whose positions are taken faster than
+    that, 32 times running, gives up (`503`, retried by the next request
+    or pass).
+  - Numbering lazily on first use alone, as first built, made the first
+    request in a long channel do one write per message, one after another,
+    under the channel lock; numbering at startup alone would leave
+    channels unnumbered, and requests in them stuck, until the pass
+    reached them. Both together keep requests bounded and every channel
+    numbered soon after a deploy.
 - **Cleanup.** When a channel is deleted, its markers and its authors'
   tallies are removed with its messages by the sweeper, in both of its
   purges, so a marker write racing the first purge is caught by the
@@ -188,7 +238,7 @@ their devices.
   `Message.apos` (`@unique`); `ChannelLog.counted`,
   `ChannelLog.message_count`, `ChannelLog.pending_id`,
   `ChannelLog.pending_author`. rhypedb applies these additive changes on
-  reload; existing rows are numbered on first use (above) rather than by a
+  reload; existing rows are numbered in place (above) rather than by a
   migration, which would have to stop writers to stay exact.
 
 ## Interoperability notes

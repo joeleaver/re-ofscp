@@ -1,4 +1,4 @@
-//! Read markers and unread counts (spec §7.7; docs/decisions/0021): for
+//! Read markers and unread counts (spec §7.7; docs/decisions/0022): for
 //! each local user, the newest message they have read in each channel
 //! they can read in the groups they belong to, and the exact number of
 //! messages after it that they did not write (lost-conn/ofscp#41).
@@ -12,7 +12,9 @@
 //! A scope the user cannot read now is an unknown scope (§7.7, security
 //! requirement 5): never listed, never stored, never reported, and a
 //! marker for one is ignored with `200`, so nothing tells an outsider that
-//! a channel or a message exists. Direct-message scopes join this when
+//! a channel or a message exists. A channel being deleted (its log closed,
+//! its row perhaps not yet removed) is no longer readable either: it is
+//! left out of every answer and of `read.updated`. Direct-message scopes join this when
 //! direct messages (§7.4) are implemented.
 
 pub mod request;
@@ -33,7 +35,7 @@ use crate::groups::Groups;
 use crate::groups::listing::ListingError;
 use crate::groups::model::StoredChannel;
 use crate::messages::Messages;
-use crate::messages::ordinals::Totals;
+use crate::messages::ordinals::{ChannelTotals, CountError, Totals};
 use crate::ws::Hub;
 use request::MarkerUpdate;
 use store::{Advanced, MarkerStore, StoredMarker};
@@ -47,9 +49,22 @@ pub enum MarkerError {
     /// The user's groups could not be listed in full (`500`).
     #[error(transparent)]
     Listing(#[from] ListingError),
-    /// The database failed (`500`).
+    /// The database failed (`500`; `503` for a transient conflict).
     #[error(transparent)]
     Db(#[from] DbError),
+    /// A channel predates message ordinals and is being numbered (`503`
+    /// with `Retry-After`, `messages/numbering.rs`).
+    #[error("channel {0} is being numbered")]
+    Numbering(String),
+}
+
+impl From<CountError> for MarkerError {
+    fn from(e: CountError) -> Self {
+        match e {
+            CountError::Db(e) => Self::Db(e),
+            CountError::Numbering(c) => Self::Numbering(c),
+        }
+    }
 }
 
 /// Read markers.
@@ -148,7 +163,10 @@ impl ReadMarkers {
     }
 
     /// The entries for `channels` (whose ids are `ids`), in that order, with
-    /// `actor`'s markers and exact unread counts.
+    /// `actor`'s markers and exact unread counts. A channel being deleted
+    /// is left out: its log is closed, or gone while the reader still holds
+    /// a marker there (only a written channel has markers, and only a
+    /// deleted one loses its log).
     async fn entries(
         &self,
         actor: &Actor,
@@ -160,13 +178,17 @@ impl ReadMarkers {
         }
         let markers = self.store.for_scopes(actor, ids).await?;
         let totals = self.messages.totals(ids, &actor.to_string()).await?;
-        channels
-            .iter()
-            .map(|c| {
-                let t = totals.get(&c.id).copied().unwrap_or_default();
-                entry(c, markers.get(&c.id), t)
-            })
-            .collect()
+        let mut out = Vec::with_capacity(channels.len());
+        for c in channels {
+            let marker = markers.get(&c.id);
+            let t = match totals.get(&c.id).copied().unwrap_or(ChannelTotals::NoLog) {
+                ChannelTotals::Counted(t) => t,
+                ChannelTotals::NoLog if marker.is_none() => Totals::default(),
+                ChannelTotals::NoLog | ChannelTotals::Closed => continue,
+            };
+            out.push(entry(c, marker, t)?);
+        }
+        Ok(out)
     }
 }
 

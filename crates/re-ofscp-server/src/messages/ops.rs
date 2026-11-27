@@ -11,6 +11,7 @@ use serde_json::Value;
 
 use super::fanout::{Live, Origin};
 use super::model::{MessageDoc, StoredMessage};
+use super::ordinals::CountError;
 use super::pager::{self, BadCursor, CursorKind, PageRequest};
 use super::store::{Counter, NewMessage, event_kind};
 use super::validate::{self, AttachmentError, Head, Invalid};
@@ -42,9 +43,22 @@ pub enum MessageError {
     /// `409`: the change could not be applied; retry.
     #[error("{0}")]
     Conflict(&'static str),
+    /// `503` with `Retry-After`: the channel predates message ordinals and
+    /// is being numbered (`numbering.rs`).
+    #[error("channel {0} is being numbered")]
+    Numbering(String),
     /// The database failed.
     #[error(transparent)]
     Db(#[from] DbError),
+}
+
+impl From<CountError> for MessageError {
+    fn from(e: CountError) -> Self {
+        match e {
+            CountError::Db(e) => Self::Db(e),
+            CountError::Numbering(c) => Self::Numbering(c),
+        }
+    }
 }
 
 impl From<GroupError> for MessageError {
@@ -105,6 +119,16 @@ struct Draft<'a> {
     head: &'a Head,
     parent: Option<StoredMessage>,
     doc: &'a MessageDoc,
+}
+
+/// A create that found another create pending on the log just after
+/// settling it under the channel lock: only another process can have left
+/// it there. A transient conflict, so `503` with `Retry-After` (as every
+/// [`DbError::Contended`], `routes.rs`), never a guess at the ordinals.
+pub(super) fn foreign_pending(channel_id: &str) -> MessageError {
+    MessageError::Db(DbError::Contended(format!(
+        "channel log {channel_id}: another process's create is pending"
+    )))
 }
 
 fn bad(e: serde_json::Error) -> MessageError {
@@ -285,14 +309,7 @@ impl Messages {
             match log::take_create(db, channel_id, &pending.message_id, &pending.author).await? {
                 log::CreateTake::Taken { seq, n } => (seq, n),
                 log::CreateTake::Closed => return Err(MessageError::NotFound(NO_CHANNEL)),
-                // Settled just now under this lock: only another process
-                // can have left a create pending since.
-                log::CreateTake::Unsettled => {
-                    return Err(DbError::Contended(format!(
-                        "channel log {channel_id}: another process's create is pending"
-                    ))
-                    .into());
-                }
+                log::CreateTake::Unsettled => return Err(foreign_pending(channel_id)),
             };
         let written = self.write_taken(draft, &pending, seq, n).await;
         match &written {

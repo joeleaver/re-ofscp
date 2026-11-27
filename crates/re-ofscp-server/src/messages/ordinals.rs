@@ -1,5 +1,5 @@
 //! Message ordinals and the counts built on them, for exact unread counts
-//! (§7.7: "MUST be exact", lost-conn/ofscp#41; docs/decisions/0021).
+//! (§7.7: "MUST be exact", lost-conn/ofscp#41; docs/decisions/0022).
 //!
 //! Every message has `n`, its creation ordinal among its channel's
 //! messages, and `author_n`, its ordinal among its author's messages there
@@ -11,19 +11,14 @@
 //! lookups, however long the channel.
 //!
 //! This module settles what a create left unfinished (a create *pending*
-//! on the log), numbers channels written before ordinals existed, and
-//! reads counts that agree with each other.
+//! on the log) and reads counts that agree with each other. Channels
+//! written before ordinals existed are numbered by `numbering.rs`.
 //!
-//! **Numbering existing channels (the backfill).** A log from before
-//! ordinals has no `counted`, and a create refuses it (its compare-and-set
-//! requires `counted == 1`; rhypedb never matches an absent field). The
-//! first create, marker update or count that meets such a channel numbers
-//! it under the channel's lock: every message in `seq` order gets `n` and
-//! `author_n`, every author's tally is set, and only then is the log marked
-//! counted, by a compare-and-set that also requires `last_seq` unchanged.
-//! Each step writes values that depend only on the messages stored, so a
-//! numbering cut short is redone from the start by the next one, writing
-//! the same values.
+//! **Deleted channels.** Deleting a channel or its group closes the
+//! channel's logs before it removes the channel rows (`groups/store.rs`),
+//! so a reader can still list a channel whose log is closed. Nothing there
+//! is counted or readable any more: [`Messages::totals`] reports it as
+//! [`ChannelTotals::Closed`], and the read markers leave it out.
 
 use std::collections::BTreeMap;
 
@@ -31,27 +26,24 @@ use futures_util::stream::{self, StreamExt, TryStreamExt};
 use ofscp_core::LocalId;
 use serde::Deserialize;
 
-use super::store::{author_position, position};
+use super::store::author_position;
 use super::{Messages, log, tally};
-use crate::db::lookup::lookup;
 use crate::db::{DbError, Ql};
 
-/// Positions read per query while numbering a channel.
-const NUMBER_BATCH: i64 = 100;
-/// How often numbering starts over when a position was taken meanwhile.
-const NUMBER_ATTEMPTS: usize = 4;
 /// Channels settled at once by [`Messages::totals`].
 const SETTLE_CONCURRENCY: usize = 4;
 
-#[derive(Deserialize)]
-struct OrdinalRow {
-    message_id: String,
-    seq: i64,
-    author: String,
-    #[serde(default)]
-    n: Option<i64>,
-    #[serde(default)]
-    author_n: Option<i64>,
+/// Why counts could not be read.
+#[derive(Debug, thiserror::Error)]
+pub enum CountError {
+    /// The database failed.
+    #[error(transparent)]
+    Db(#[from] DbError),
+    /// The channel predates ordinals and is too long to number within a
+    /// request; the background task is numbering it (`503` with
+    /// `Retry-After`, `numbering.rs`).
+    #[error("channel {0} is being numbered")]
+    Numbering(String),
 }
 
 #[derive(Deserialize)]
@@ -71,6 +63,20 @@ pub struct Totals {
     pub own: i64,
 }
 
+/// What a channel's log says for one reader's counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelTotals {
+    /// The log is open: these are the exact totals.
+    Counted(Totals),
+    /// The channel has no log. Either nothing was ever written there (the
+    /// totals are zero), or it was deleted and its closed log since
+    /// removed; a reader who holds a marker there knows it was written to,
+    /// so for them it is the latter.
+    NoLog,
+    /// The log is closed: the channel was deleted, its row perhaps not yet.
+    Closed,
+}
+
 /// Where a read marker at a message stands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarkPoint {
@@ -84,9 +90,10 @@ pub struct MarkPoint {
 
 impl Messages {
     /// Make `channel_id`'s counts settled: number its messages if it
-    /// predates ordinals, and settle a create left pending. The caller
-    /// holds the channel's lock, so no create of this process is part-way.
-    pub(super) async fn settle_counts(&self, channel_id: &str) -> Result<(), DbError> {
+    /// predates ordinals (`numbering.rs`), and settle a create left
+    /// pending. The caller holds the channel's lock, so no create of this
+    /// process is part-way.
+    pub(super) async fn settle_counts(&self, channel_id: &str) -> Result<(), CountError> {
         let Some(counts) = log::read_counts(self.store.db(), channel_id).await? else {
             // No log, or a closed one: nothing is counted there.
             return Ok(());
@@ -94,10 +101,7 @@ impl Messages {
         if let Some(p) = &counts.pending {
             self.settle_pending(channel_id, p).await?;
         }
-        if counts.messages.is_none() {
-            self.number(channel_id).await?;
-        }
-        Ok(())
+        self.number_for_request(channel_id, &counts).await
     }
 
     /// Settle the create `p` pending on `channel_id`'s log: if its message
@@ -128,69 +132,6 @@ impl Messages {
         Ok(())
     }
 
-    /// Number the messages of `channel_id`, whose log predates ordinals
-    /// (see the module docs). The caller holds the channel's lock.
-    async fn number(&self, channel_id: &str) -> Result<(), DbError> {
-        let db = self.store.db();
-        for _ in 0..NUMBER_ATTEMPTS {
-            let Some(counts) = log::read_counts(db, channel_id).await? else {
-                return Ok(());
-            };
-            if counts.messages.is_some() {
-                return Ok(());
-            }
-            let mut n: i64 = 0;
-            let mut tallies: BTreeMap<String, i64> = BTreeMap::new();
-            let mut from = 1;
-            while from <= counts.last_seq {
-                let to = counts.last_seq.min(from + NUMBER_BATCH - 1);
-                let keys: Vec<String> = (from..=to).map(|p| position(channel_id, p)).collect();
-                let mut rows: Vec<OrdinalRow> =
-                    lookup(db, "Message.filter(", ".pos == ", &keys).await?;
-                rows.sort_by_key(|r| r.seq);
-                for row in rows {
-                    n += 1;
-                    let author_n = tallies.entry(row.author.clone()).or_insert(0);
-                    *author_n += 1;
-                    if row.n != Some(n) || row.author_n != Some(*author_n) {
-                        self.set_ordinals(channel_id, &row, n, *author_n).await?;
-                    }
-                }
-                from = to + 1;
-            }
-            for (author, count) in &tallies {
-                tally::set(db, channel_id, author, *count).await?;
-            }
-            if log::mark_counted(db, channel_id, counts.last_seq, n).await? {
-                tracing::info!(channel = channel_id, messages = n, "numbered a channel");
-                return Ok(());
-            }
-        }
-        Err(DbError::Contended(format!(
-            "channel log {channel_id}: positions kept being taken while numbering"
-        )))
-    }
-
-    /// Give `row`'s message the ordinals `n` and `author_n`.
-    async fn set_ordinals(
-        &self,
-        channel_id: &str,
-        row: &OrdinalRow,
-        n: i64,
-        author_n: i64,
-    ) -> Result<(), DbError> {
-        let q = Ql::new("Message.filter(.message_id == ")
-            .str(&row.message_id)
-            .raw(").update({ n: ")
-            .int(n)
-            .raw(", author_n: ")
-            .int(author_n)
-            .raw(", apos: ")
-            .str(&author_position(channel_id, &row.author, author_n))
-            .raw(" })");
-        self.store.db().write_one_object(&q).await.map(|_| ())
-    }
-
     /// The creation ordinal of `author`'s `author_n`th message in
     /// `channel_id`, if it is written.
     async fn n_of(
@@ -211,20 +152,22 @@ impl Messages {
     }
 
     /// Where a read marker of `reader` at message `message_id` of
-    /// `channel_id` stands: `None` if the channel holds no such message.
-    /// Numbers the channel first if it predates ordinals. `own` is found by
-    /// a binary search over the reader's ordinals, O(log) point lookups.
+    /// `channel_id` stands: `None` if the channel holds no such message,
+    /// or its log is not open (a channel being deleted takes no new
+    /// markers; one set while the close lands is purged with the channel). Numbers the channel first if it predates ordinals. `own`
+    /// is found by a binary search over the reader's ordinals, O(log)
+    /// point lookups.
     pub async fn mark_point(
         &self,
         channel_id: &str,
         message_id: &str,
         reader: &str,
-    ) -> Result<Option<MarkPoint>, DbError> {
+    ) -> Result<Option<MarkPoint>, CountError> {
         let db = self.store.db();
-        let numbered = log::read_counts(db, channel_id)
-            .await?
-            .is_some_and(|c| c.messages.is_some());
-        if !numbered {
+        let Some(counts) = log::read_counts(db, channel_id).await? else {
+            return Ok(None);
+        };
+        if counts.messages.is_none() {
             let _turn = self.locks.lock(channel_id).await;
             self.settle_counts(channel_id).await?;
         }
@@ -238,7 +181,8 @@ impl Messages {
                 Some(_) => Err(DbError::Decode(format!(
                     "message {}: no ordinal in a numbered channel",
                     message.id
-                ))),
+                ))
+                .into()),
             };
         };
         // The reader's ordinals 1..=hi, in creation order; the answer is the
@@ -259,20 +203,23 @@ impl Messages {
         }))
     }
 
-    /// The [`Totals`] of each of `channel_ids` for `reader`, by channel id.
+    /// The [`ChannelTotals`] of each of `channel_ids` for `reader`, by
+    /// channel id.
     ///
     /// Bounded: two batched reads of the logs around one batched read of
     /// the reader's tallies. A tally only changes while a create is pending
     /// on its channel's log, and every create moves `last_seq`, so where
     /// both log reads agree and show nothing pending, the tally between
-    /// them agrees with the count. A channel where they do not (a create
-    /// ran meanwhile, or one is pending, or the channel predates ordinals)
-    /// is settled and read under its lock instead.
+    /// them agrees with the count. A log closed by either read is
+    /// [`ChannelTotals::Closed`] (a closed log never opens again). A
+    /// channel where the reads do not agree (a create ran meanwhile, or one
+    /// is pending, or the channel predates ordinals) is settled and read
+    /// under its lock instead, within the bounds `numbering.rs` gives.
     pub async fn totals(
         &self,
         channel_ids: &[String],
         reader: &str,
-    ) -> Result<BTreeMap<String, Totals>, DbError> {
+    ) -> Result<BTreeMap<String, ChannelTotals>, CountError> {
         let db = self.store.db();
         let before = log::counts(db, channel_ids).await?;
         let tallies = tally::for_author(db, channel_ids, reader).await?;
@@ -281,12 +228,18 @@ impl Messages {
         let mut unsettled = Vec::new();
         for id in channel_ids {
             let agreed = match (before.get(id), after.get(id)) {
-                // No open log: nothing was ever written there.
-                (None, None) => Some(Totals::default()),
-                (Some(a), Some(b)) if a == b => a.settled().map(|messages| Totals {
-                    messages,
-                    own: tallies.get(id).copied().unwrap_or(0),
-                }),
+                (Some(log::Standing::Closed), _) | (_, Some(log::Standing::Closed)) => {
+                    Some(ChannelTotals::Closed)
+                }
+                (None, None) => Some(ChannelTotals::NoLog),
+                (Some(log::Standing::Open(a)), Some(log::Standing::Open(b))) if a == b => {
+                    a.settled().map(|messages| {
+                        ChannelTotals::Counted(Totals {
+                            messages,
+                            own: tallies.get(id).copied().unwrap_or(0),
+                        })
+                    })
+                }
                 _ => None,
             };
             match agreed {
@@ -296,10 +249,10 @@ impl Messages {
                 None => unsettled.push(id.clone()),
             }
         }
-        let settled: Vec<(String, Totals)> = stream::iter(unsettled)
+        let settled: Vec<(String, ChannelTotals)> = stream::iter(unsettled)
             .map(|id| async move {
                 let totals = self.totals_locked(&id, reader).await?;
-                Ok::<_, DbError>((id, totals))
+                Ok::<_, CountError>((id, totals))
             })
             .buffer_unordered(SETTLE_CONCURRENCY)
             .try_collect()
@@ -308,23 +261,29 @@ impl Messages {
         Ok(out)
     }
 
-    /// [`Totals`] of `channel_id` for `reader`, settled and read under the
-    /// channel's lock, so no create of this process is part-way.
-    async fn totals_locked(&self, channel_id: &str, reader: &str) -> Result<Totals, DbError> {
+    /// [`ChannelTotals`] of `channel_id` for `reader`, settled and read
+    /// under the channel's lock, so no create of this process is part-way.
+    async fn totals_locked(
+        &self,
+        channel_id: &str,
+        reader: &str,
+    ) -> Result<ChannelTotals, CountError> {
         let db = self.store.db();
         let _turn = self.locks.lock(channel_id).await;
         self.settle_counts(channel_id).await?;
-        let Some(counts) = log::read_counts(db, channel_id).await? else {
-            return Ok(Totals::default());
+        let counts = match log::standing(db, channel_id).await? {
+            None => return Ok(ChannelTotals::NoLog),
+            Some(log::Standing::Closed) => return Ok(ChannelTotals::Closed),
+            Some(log::Standing::Open(counts)) => counts,
         };
         let messages = counts.settled().ok_or_else(|| {
             DbError::Contended(format!(
                 "channel log {channel_id}: counts unsettled under its lock"
             ))
         })?;
-        Ok(Totals {
+        Ok(ChannelTotals::Counted(Totals {
             messages,
             own: tally::get(db, channel_id, reader).await?,
-        })
+        }))
     }
 }

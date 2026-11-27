@@ -1,4 +1,4 @@
-//! Concurrent follows (spec §7.6; docs/decisions/0021) on a real
+//! Concurrent follows (spec §7.6; docs/decisions/0022) on a real
 //! rhypedb-server: one row per followed channel however many requests
 //! race, and never more follows than the per-user limit.
 

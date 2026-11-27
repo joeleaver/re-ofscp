@@ -106,6 +106,9 @@ async fn main() -> anyhow::Result<()> {
     );
     let sweep_groups = tokio::spawn(state.groups.clone().sweep_forever());
     let sweep_messages = tokio::spawn(state.messages.clone().sweep_forever());
+    // Channels from before message ordinals, numbered in the background
+    // (docs/decisions/0022).
+    let number_messages = tokio::spawn(state.messages.clone().number_forever());
     let ws_recheck = tokio::spawn(state.ws.clone().recheck_forever());
     let hub = state.ws.clone();
     let app = router(state);
@@ -127,6 +130,7 @@ async fn main() -> anyhow::Result<()> {
     purge_sessions.abort();
     sweep_groups.abort();
     sweep_messages.abort();
+    number_messages.abort();
     Ok(())
 }
 

@@ -10,10 +10,11 @@
 //! (`ops.rs`). See docs/decisions/0017.
 //!
 //! The log also counts the channel's messages, for exact unread counts
-//! (§7.7, lost-conn/ofscp#41; docs/decisions/0021): a create takes its
+//! (§7.7, lost-conn/ofscp#41; docs/decisions/0022): a create takes its
 //! position and its creation ordinal together ([`take_create`]), and is
 //! *pending* on the log until its message is written. `ordinals.rs`
-//! settles a pending create and numbers logs from before ordinals.
+//! settles a pending create, and `numbering.rs` numbers logs from before
+//! ordinals.
 
 use std::collections::BTreeMap;
 
@@ -57,6 +58,15 @@ struct LogRow {
 }
 
 impl LogRow {
+    /// What the log says for counting: its counts if open, or that it is
+    /// closed.
+    fn standing(&self) -> Standing {
+        match self.counts() {
+            Some(c) => Standing::Open(c),
+            None => Standing::Closed,
+        }
+    }
+
     /// The counts of an open log; `None` for a closed one.
     fn counts(&self) -> Option<Counts> {
         if self.state != state::OPEN {
@@ -108,6 +118,18 @@ impl Counts {
             Some(_) => None,
         }
     }
+}
+
+/// What a channel's log, where it has one, says for counting. A channel
+/// with no log at all holds no messages, or held some and was deleted
+/// (its closed log since removed by the sweeper).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Standing {
+    /// Open: the channel takes messages, and these are its counts.
+    Open(Counts),
+    /// Closed: the channel was deleted, its row perhaps not yet. Nothing
+    /// there is counted or readable any more.
+    Closed,
 }
 
 /// What [`take_create`] did.
@@ -168,27 +190,61 @@ pub async fn read(db: &Db, channel_id: &str) -> Result<LogState, DbError> {
     })
 }
 
-/// The counts of each of `channel_ids`' open logs, by channel id, in a
-/// batch of point lookups. A channel with no log, or a closed one, is left
-/// out: it holds nothing to count.
-pub async fn counts(db: &Db, channel_ids: &[String]) -> Result<BTreeMap<String, Counts>, DbError> {
+/// The [`Standing`] of each of `channel_ids`' logs, by channel id, in a
+/// batch of point lookups. A channel with no log is left out.
+pub async fn counts(
+    db: &Db,
+    channel_ids: &[String],
+) -> Result<BTreeMap<String, Standing>, DbError> {
     let rows: Vec<LogRow> =
         lookup(db, "ChannelLog.filter(", ".channel_id == ", channel_ids).await?;
     Ok(rows
         .into_iter()
-        .filter_map(|r| r.counts().map(|c| (r.channel_id, c)))
+        .map(|r| {
+            let standing = r.standing();
+            (r.channel_id, standing)
+        })
         .collect())
 }
 
-/// The counts of `channel_id`'s log, if it is open.
-pub async fn read_counts(db: &Db, channel_id: &str) -> Result<Option<Counts>, DbError> {
+/// The [`Standing`] of `channel_id`'s log: `None` if it has none.
+pub async fn standing(db: &Db, channel_id: &str) -> Result<Option<Standing>, DbError> {
     let q = by_channel(channel_id).raw(")");
     Ok(db
         .fetch::<LogRow>(&q)
         .await?
         .into_iter()
         .next()
-        .and_then(|r| r.data.counts()))
+        .map(|r| r.data.standing()))
+}
+
+/// The counts of `channel_id`'s log, if it is open.
+pub async fn read_counts(db: &Db, channel_id: &str) -> Result<Option<Counts>, DbError> {
+    Ok(match standing(db, channel_id).await? {
+        Some(Standing::Open(c)) => Some(c),
+        Some(Standing::Closed) | None => None,
+    })
+}
+
+/// Up to `limit` open logs after skipping the first `offset`, with their
+/// counts: one page of a pass over every channel. rhypedb returns them in
+/// no set order, and a log closed meanwhile can shift a later one into a
+/// page already read, so the numbering pass that uses this repeats until
+/// a pass finds nothing to do (`numbering.rs`).
+pub async fn open_page(db: &Db, offset: u64, limit: u64) -> Result<Vec<(String, Counts)>, DbError> {
+    let q = Ql::new("ChannelLog.filter(.state == ")
+        .str(state::OPEN)
+        .raw(").offset(")
+        .uint(offset)
+        .raw(").limit(")
+        .uint(limit)
+        .raw(")");
+    Ok(db
+        .fetch::<LogRow>(&q)
+        .await?
+        .into_iter()
+        .filter_map(|r| r.data.counts().map(|c| (r.data.channel_id, c)))
+        .collect())
 }
 
 /// A new log's count fields: numbered, empty, nothing pending.
@@ -335,8 +391,16 @@ pub async fn give_back(db: &Db, channel_id: &str, message_id: &str) -> Result<bo
 }
 
 /// Mark the open log of `channel_id` numbered, holding `messages`
-/// messages, if no position was taken since it read `last_seq`. Returns
-/// whether it applied.
+/// messages, if no position was taken after `last_seq`, the last one the
+/// numbering read. Returns whether it applied.
+///
+/// A position taken meanwhile may be a create's, whose message the count
+/// must include, so this cannot ignore it. It does not undo the
+/// numbering, though: a position at or before `last_seq` never gains a
+/// message later (a message is written only at the position its create
+/// took, and an edit or a delete moves `last_seq` without writing one), so
+/// the numbering reads only the positions after `last_seq` and tries again
+/// (`numbering.rs`).
 pub async fn mark_counted(
     db: &Db,
     channel_id: &str,

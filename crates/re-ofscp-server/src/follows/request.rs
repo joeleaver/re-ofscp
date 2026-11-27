@@ -107,7 +107,7 @@ pub fn channel_ref(raw: &str, home: &Authority) -> Result<ChannelRef, Invalid> {
 /// (`follow-create-request.json`). Returns the channel reference's text.
 ///
 /// `groupId` is checked but not used: the provider knows a local channel's
-/// group, and a channel URI names its own (docs/decisions/0021).
+/// group, and a channel URI names its own (docs/decisions/0022).
 pub fn create_body(body: &[u8]) -> Result<String, Invalid> {
     let value: serde_json::Value = serde_json::from_slice(body)
         .map_err(|e| Invalid(format!("the body must be a JSON object: {e}")))?;

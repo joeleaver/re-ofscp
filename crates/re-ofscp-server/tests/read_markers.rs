@@ -1,4 +1,4 @@
-//! Read markers and unread counts (spec §7.7; docs/decisions/0021;
+//! Read markers and unread counts (spec §7.7; docs/decisions/0022;
 //! security requirements 1 and 5), on a real rhypedb-server: `GET`/`PATCH
 //! /api/me/read-markers` and the `read.updated` event. Exact counts are in
 //! tests/read_marker_counts.rs.
@@ -8,12 +8,11 @@ mod common;
 use std::time::Duration;
 
 use axum::http::StatusCode;
-use common::groups::{Env, Party, call, create_channel, env_with_remotes, id, remote};
+use common::groups::{call, create_channel, env_with_remotes, id, remote};
 use common::harness::SIGNED_AT;
 use common::members::kick;
 use common::messages::{Chan, public_channel};
-use common::read_markers::{mark, posts, scopes, setup};
-use common::ws::{Client, serve};
+use common::read_markers::{connect, mark, posts, scopes, setup};
 use common::{assert_valid, schema};
 use re_ofscp_server::read_markers::store::MarkerStore;
 use serde_json::{Value, json};
@@ -180,19 +179,6 @@ async fn a_deleted_channels_markers_are_purged_by_the_sweeper() {
         .await
         .unwrap();
     assert!(store.get(&bob.id(), &chan.c).await.unwrap().is_none());
-}
-
-async fn connect(env: &Env, who: &Party) -> Client {
-    let addr = serve(env.app.clone()).await;
-    let mut c = Client::connect(addr, "10.0.0.2").await;
-    c.authenticate(
-        &who.actor,
-        &who.key_id,
-        &who.key,
-        SIGNED_AT.unix_timestamp(),
-    )
-    .await;
-    c
 }
 
 #[tokio::test]

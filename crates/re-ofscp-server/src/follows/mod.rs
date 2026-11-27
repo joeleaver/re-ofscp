@@ -1,4 +1,4 @@
-//! Follows (spec §7.6; docs/decisions/0021): the channels a local user
+//! Follows (spec §7.6; docs/decisions/0022): the channels a local user
 //! follows, as pointers. The provider stores which channels, never a
 //! compiled feed; the client composes the home feed by reading each
 //! channel from its home provider.

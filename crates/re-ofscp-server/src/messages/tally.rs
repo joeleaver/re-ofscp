@@ -1,5 +1,5 @@
 //! How many messages each author has in each channel (`MessageTally` in
-//! `schema.rhype`; §7.7 unread counts, docs/decisions/0021). One row per
+//! `schema.rhype`; §7.7 unread counts, docs/decisions/0022). One row per
 //! (channel, author), keyed `@unique` by `"{channel} {author}"`: neither a
 //! channel's local id nor a canonical actor holds a space.
 //!
@@ -103,7 +103,7 @@ pub async fn give_back(db: &Db, channel_id: &str, author: &str, n: i64) -> Resul
 }
 
 /// Set `author`'s tally in `channel_id` to `count`, whatever it was:
-/// numbering a channel's existing messages (`ordinals.rs`). Idempotent.
+/// numbering a channel's existing messages (`numbering.rs`). Idempotent.
 pub async fn set(db: &Db, channel_id: &str, author: &str, count: i64) -> Result<(), DbError> {
     for _ in 0..ATTEMPTS {
         let q = by_key(channel_id, author).raw(")");

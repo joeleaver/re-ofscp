@@ -5,7 +5,8 @@
 //! * `store.rs`, `store_reactions.rs`, `log.rs`, `tally.rs`: rows in
 //!   rhypedb.
 //! * `ordinals.rs`: message ordinals and exact counts for unread counts
-//!   (§7.7; docs/decisions/0021), and numbering channels from before them.
+//!   (§7.7; docs/decisions/0022);
+//!   `numbering.rs`: numbering channels from before them.
 //! * `validate.rs`, `sanitize.rs`: checking bodies before storing them.
 //! * `ops.rs`, `reactions.rs`: the operations, with §7.1's order of checks.
 //! * `pager.rs`: paging over timeline, reply and reaction positions.
@@ -28,6 +29,7 @@ pub mod fanout;
 mod locks;
 pub mod log;
 pub mod model;
+pub mod numbering;
 mod ops;
 pub mod ordinals;
 pub mod pager;
@@ -82,6 +84,11 @@ pub struct Messages {
     clock: Arc<dyn Clock>,
     home: Authority,
     locks: ChannelLocks,
+    /// Numbering channels from before ordinals takes turns per channel
+    /// under these, apart from the write locks (`numbering.rs`).
+    numbering: ChannelLocks,
+    /// Channels handed to the background numbering task.
+    numbering_queue: numbering::Queue,
 }
 
 impl std::fmt::Debug for Messages {
@@ -110,6 +117,8 @@ impl Messages {
             fanout,
             clock,
             locks: ChannelLocks::default(),
+            numbering: ChannelLocks::default(),
+            numbering_queue: numbering::Queue::default(),
         }
     }
 
@@ -136,7 +145,7 @@ impl Messages {
             let full = batch.len() == SWEEP_BATCH;
             for closed in batch {
                 self.store.purge_channel(&closed.channel_id).await?;
-                // Readers' markers there go too (decision 0021); a marker
+                // Readers' markers there go too (decision 0022); a marker
                 // write racing the first purge is caught by the second.
                 crate::read_markers::store::MarkerStore::purge_scope(db, &closed.channel_id)
                     .await?;
