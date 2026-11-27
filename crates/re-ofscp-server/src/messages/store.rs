@@ -49,6 +49,7 @@ struct MessageRow {
     created_at: String,
     edit_until: i64,
     edited_at: i64,
+    revision: i64,
     deleted_at: i64,
 }
 
@@ -71,6 +72,7 @@ impl MessageRow {
             doc: serde_json::from_str::<MessageDoc>(&self.doc).map_err(|_| bad("doc"))?,
             edit_until: (self.edit_until > 0).then_some(self.edit_until),
             edited_at: (self.edited_at > 0).then_some(self.edited_at),
+            revision: self.revision,
             deleted_at: (self.deleted_at > 0).then_some(self.deleted_at),
             id,
             parent_id,
@@ -198,7 +200,7 @@ impl MessageStore {
             .unix_seconds(m.now)
             .raw(", edit_until: ")
             .int(m.edit_until.unwrap_or(0))
-            .raw(", edited_at: 0, deleted_at: 0 })");
+            .raw(", edited_at: 0, revision: 0, deleted_at: 0 })");
         self.db.write_one::<MessageRow>(&q).await?.data.decode()
     }
 
@@ -330,19 +332,26 @@ impl MessageStore {
     }
 
     /// Replace the body of message `id` (not a tombstone) with `doc`,
-    /// edited at `now`. `None` if it is gone or was deleted meanwhile.
+    /// edited at `now`, if it is still at `revision`: a compare-and-set,
+    /// so an edit built from an older body never overwrites a newer one.
+    /// `None` if it is gone, deleted or edited meanwhile.
     pub async fn update_doc(
         &self,
         id: &LocalId,
+        revision: i64,
         doc: &MessageDoc,
         now: i64,
     ) -> Result<Option<StoredMessage>, DbError> {
         let q = Ql::new("Message.filter(.message_id == ")
             .str(id.as_str())
-            .raw(" && .deleted_at == 0).update({ doc: ")
+            .raw(" && .deleted_at == 0 && .revision == ")
+            .int(revision)
+            .raw(").update({ doc: ")
             .str(&json(doc)?)
             .raw(", edited_at: ")
             .int(now.max(1))
+            .raw(", revision: ")
+            .int(revision + 1)
             .raw(" })");
         self.updated(q).await
     }

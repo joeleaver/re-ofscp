@@ -11,6 +11,9 @@ use common::messages::{
     Chan, assert_problem, call, ids, message_schema, page_schema, post, public_channel, raw, text,
 };
 use ofscp_core::LocalId;
+use ofscp_core::wire::MessageType;
+use re_ofscp_server::messages::model::MessageDoc;
+use re_ofscp_server::messages::store::NewMessage;
 use re_ofscp_server::messages::{MEMO_EDIT_WINDOW, MESSAGE_EDIT_WINDOW, PURGE_GRACE};
 use re_ofscp_server::timefmt;
 use serde_json::{Value, json};
@@ -345,15 +348,74 @@ async fn a_deleted_channels_messages_404_at_once_and_the_sweeper_purges_them_twi
         );
     }
     assert!(store.reaction(&pid, &alice, "up").await.unwrap().is_none());
+    // A write that took its position before the close and landed after
+    // the first purge (its writer's own take-back failed, say) is caught
+    // by the second.
+    let late = store
+        .insert(&NewMessage {
+            channel_id: &chan.c,
+            group_id: &chan.g,
+            seq: 99,
+            client_message_id: None,
+            author: &alice,
+            kind: &MessageType::Message,
+            reply: None,
+            doc: &MessageDoc::default(),
+            now,
+            edit_until: None,
+        })
+        .await
+        .unwrap();
     // Within the grace period there is nothing more to do; after it, the
     // second purge drops the log, and then nothing is left.
     let grace = PURGE_GRACE.as_secs() as i64;
     assert_eq!(env.state.messages.sweep(now + grace - 1).await.unwrap(), 0);
     assert_eq!(env.state.messages.sweep(now + grace + 1).await.unwrap(), 1);
+    assert!(
+        store
+            .message(&chan.c, late.id.as_str())
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(
         env.state.messages.sweep(now + 2 * grace + 2).await.unwrap(),
         0
     );
+}
+
+#[tokio::test]
+async fn concurrent_edits_keep_each_others_fields_and_a_stale_edit_writes_nothing() {
+    let cast = Cast::new().await;
+    let (env, chan) = (&cast.env, &cast.chan);
+    let article = json!({"type": "article", "title": "T", "content": {"mime": "text/markdown", "text": "# a"}});
+    let a = post(env, &cast.alice, chan, article).await;
+    let path = chan.message(id(&a));
+    let alice = Some(&cast.alice);
+    let (title, tags) = tokio::join!(
+        call(env, alice, "PATCH", &path, Some(json!({"title": "New"}))),
+        call(env, alice, "PATCH", &path, Some(json!({"tags": ["x"]}))),
+    );
+    assert_eq!(title.0, StatusCode::OK, "{}", title.1);
+    assert_eq!(tags.0, StatusCode::OK, "{}", tags.1);
+    let (_, now) = call(env, None, "GET", &path, None).await;
+    assert_eq!(
+        (&now["title"], &now["tags"]),
+        (&json!("New"), &json!(["x"]))
+    );
+
+    // An edit built from an older body, as one from another process
+    // racing this one would be, is refused by the revision check.
+    let store = env.state.messages.store();
+    let stored = store.message(&chan.c, id(&a)).await.unwrap().unwrap();
+    assert_eq!(stored.revision, 2);
+    let stale = store
+        .update_doc(&stored.id, 1, &MessageDoc::default(), 1)
+        .await
+        .unwrap();
+    assert!(stale.is_none());
+    let (_, after) = call(env, None, "GET", &path, None).await;
+    assert_eq!(after, now);
 }
 
 #[tokio::test]

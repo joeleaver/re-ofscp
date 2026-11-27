@@ -56,6 +56,12 @@ impl From<MessageError> for Problem {
                 tracing::error!(error = %e, "message operation: database unavailable");
                 Problem::service_unavailable(1)
             }
+            // Writers kept winning the channel's counter: nothing was
+            // written, and a retry will get its turn.
+            MessageError::Db(DbError::Contended(e)) => {
+                tracing::warn!(error = %e, "message operation: contended");
+                Problem::service_unavailable(1)
+            }
             MessageError::Db(e) => {
                 tracing::error!(error = %e, "message operation failed");
                 Problem::internal()

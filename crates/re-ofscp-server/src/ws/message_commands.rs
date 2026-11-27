@@ -77,6 +77,12 @@ fn ws_error(e: MessageError) -> WsError {
             tracing::error!(error = %e, "message command: database unavailable");
             WsError::service_unavailable("the provider is unavailable; retry", 1)
         }
+        // Writers kept winning the channel's counter: nothing was written,
+        // and a retry will get its turn.
+        MessageError::Db(DbError::Contended(e)) => {
+            tracing::warn!(error = %e, "message command: contended");
+            WsError::service_unavailable("the channel is busy; retry", 1)
+        }
         MessageError::Db(e) => {
             tracing::error!(error = %e, "message command failed");
             WsError::internal("internal error")
@@ -322,6 +328,8 @@ mod tests {
         assert_eq!(ws_error(MessageError::Forbidden("x")).code, "forbidden");
         assert_eq!(ws_error(MessageError::Conflict("x")).code, "conflict");
         let e = ws_error(MessageError::Db(DbError::Unavailable("down".into())));
+        assert_eq!(e.code, "service_unavailable");
+        let e = ws_error(MessageError::Db(DbError::Contended("busy".into())));
         assert_eq!(e.code, "service_unavailable");
     }
 }

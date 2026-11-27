@@ -224,6 +224,23 @@ pub fn may_post(
     }
 }
 
+/// Whether the caller holds a `post:<type>` grant for *some* type in the
+/// channel, custom types included (§7.1 typing; lost-conn/ofscp#37). Types
+/// are open-ended and an unlisted one falls back to the group's `post`
+/// ([`may_post`]), so this is the group's `post` or any `post:<type>`
+/// entry of the channel that grants. Read access is checked first.
+pub fn may_post_any(standing: &Standing, group: &GroupPolicy, channel: &ChannelPolicy) -> bool {
+    let prefix = actions::post_kind("");
+    may(standing, group, actions::POST)
+        || channel
+            .permissions
+            .iter()
+            .flatten()
+            .any(|(action, listed)| {
+                action.starts_with(&prefix) && granted(standing, group, Some(listed))
+            })
+}
+
 /// Whether the caller may add reactions in the channel (§5.2.1): the
 /// channel's `react` when listed, otherwise anyone who may read the
 /// channel (the caller has already passed [`can_read_channel`]).

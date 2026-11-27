@@ -78,6 +78,8 @@ pub struct StoredMessage {
     pub edit_until: Option<i64>,
     /// When it was last edited (unix seconds).
     pub edited_at: Option<i64>,
+    /// How many edits it has had (the edit compare-and-set's version).
+    pub revision: i64,
     /// When it was deleted (unix seconds): it is a tombstone.
     pub deleted_at: Option<i64>,
 }

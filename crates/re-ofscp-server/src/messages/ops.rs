@@ -74,6 +74,7 @@ const REPLIES_ONLY: &str = "you may only reply in this channel";
 const REPLY_TYPE: &str = "you may not reply to messages of this type in this channel";
 const NOT_AUTHOR: &str = "only the author may edit a message";
 const EDIT_CLOSED: &str = "the edit window of this message has closed";
+const EDITED_MEANWHILE: &str = "the message was edited meanwhile; fetch it and retry";
 const MAY_NOT_DELETE: &str = "only the author or a moderator may delete a message";
 
 /// How a delete was answered.
@@ -292,13 +293,7 @@ impl Messages {
             },
             Err(e) => return Err(e.into()),
         };
-        // A delete of the channel that closed its log after this write
-        // took its position may have purged before the write landed: take
-        // the write back (the sweeper's second purge is the backstop).
-        if !matches!(
-            log::read(self.store.db(), channel_id).await?,
-            log::LogState::Open { .. }
-        ) {
+        if !self.still_open(channel_id).await? {
             self.store.remove(&message.id).await?;
             return Err(MessageError::NotFound(NO_CHANNEL));
         }
@@ -309,8 +304,23 @@ impl Messages {
         Ok(Created::New(message))
     }
 
+    /// Whether the channel's log is still open after a write. A delete of
+    /// the channel that closed it after the write took its position may
+    /// have purged before the write landed; the writer then takes its
+    /// write back (the sweeper's second purge is the backstop).
+    async fn still_open(&self, channel_id: &str) -> Result<bool, MessageError> {
+        Ok(matches!(
+            log::read(self.store.db(), channel_id).await?,
+            log::LogState::Open { .. }
+        ))
+    }
+
     /// `PATCH …/messages/{messageId}` and `message.update` (§7.1): `body`
-    /// is the `MessageUpdate` as received.
+    /// is the `MessageUpdate` as received. The edit is built from the
+    /// message as read under the channel's lock, and written by a
+    /// compare-and-set on its revision, so no concurrent edit is lost: in
+    /// this process edits take turns, and one from another process that
+    /// landed first makes this one a `409`.
     pub async fn edit(
         &self,
         actor: &Actor,
@@ -322,6 +332,7 @@ impl Messages {
     ) -> Result<StoredMessage, MessageError> {
         let caller = Caller::Actor(actor.clone());
         self.readable(&caller, group_id, channel_id).await?;
+        let _turn = self.locks.lock(channel_id).await;
         let message = self.existing(channel_id, message_id).await?;
         // A tombstone has nothing left to edit (decision 0017).
         if message.is_deleted() {
@@ -349,14 +360,19 @@ impl Messages {
         };
         let doc = validate::edited_doc(&message.kind, &message.doc, &edit, attachments)?;
 
-        let _turn = self.locks.lock(channel_id).await;
         let seq = self.take_position(group_id, channel_id).await?;
         let now = self.now();
-        let edited = self
+        let Some(edited) = self
             .store
-            .update_doc(&message.id, &doc, now)
+            .update_doc(&message.id, message.revision, &doc, now)
             .await?
-            .ok_or(MessageError::NotFound(NO_MESSAGE))?;
+        else {
+            // Deleted, or edited by another process, since it was read.
+            return Err(match self.existing(channel_id, message_id).await? {
+                m if m.is_deleted() => MessageError::NotFound(NO_MESSAGE),
+                _ => MessageError::Conflict(EDITED_MEANWHILE),
+            });
+        };
         self.store
             .insert_event(
                 channel_id,
@@ -367,6 +383,10 @@ impl Messages {
                 now,
             )
             .await?;
+        if !self.still_open(channel_id).await? {
+            self.store.remove_event(channel_id, seq).await?;
+            return Err(MessageError::NotFound(NO_CHANNEL));
+        }
         let live = Live::Updated(channel_message(&edited, Some(seq)));
         self.fanout
             .deliver(group_id, channel_id, live, origin)
@@ -414,6 +434,10 @@ impl Messages {
                 now,
             )
             .await?;
+        if !self.still_open(channel_id).await? {
+            self.store.remove_event(channel_id, seq).await?;
+            return Err(MessageError::NotFound(NO_CHANNEL));
+        }
         let live = Live::Deleted(message_deleted(&gone, Some(seq)));
         self.fanout
             .deliver(group_id, channel_id, live, origin)

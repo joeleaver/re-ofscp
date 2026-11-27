@@ -13,8 +13,7 @@
   oracle confirmed every default except Q5 (typing also needs a post
   grant, with Joe deciding), and settled Q2 (the `Reaction` branch of
   `TimelineItem` will be narrowed away) and Q3 (replay sends current
-  state). A spec PR with these clarifications is being drafted; cite it
-  here once it is open. Spec `reference.provider`: lost-conn/ofscp#34
+  state). The clarifications are lost-conn/ofscp#37. Spec `reference.provider`: lost-conn/ofscp#34
   (300f6fa).
 
 ## Context
@@ -80,8 +79,15 @@ and are not replayed.
   message, 24 hours for a memo, no limit for an article (§7.1 leaves this
   to providers).
 - An edit is a partial `MessageUpdate`. An empty update is `400`, and so
-  is an article field (`title`, `summary`, `tags`, `cover`) on a message
-  that is not an article.
+  is one carrying only article fields (`title`, `summary`, `cover`) on a
+  message that is not an article (lost-conn/ofscp#31). `tags` apply to
+  every type.
+- Concurrent edits never lose a field. In this process they take turns
+  under the channel's lock, and each is built from the message as read
+  under it. Across processes, an edit is a compare-and-set on the
+  message's `revision`, and the one that lost the race is `409`.
+- An edit or delete that finds its channel's log closed after writing
+  its event takes the event back and answers `404`, as a create does.
 
 ### Deletes and tombstones (Q1, Q6, confirmed)
 
@@ -117,9 +123,10 @@ subscribed, that copy is its subscribed copy, not a second one.
 
 - `typing.start` and `typing.stop` need effective read access. A missing
   or unreadable channel is `not_found` (§11.3).
-- They also need some `post:<type>` grant (`message`, `memo` or
-  `article`): a reader who may post nothing gets `forbidden` (`403`). A
-  reply-restricted poster may type.
+- They also need a `post:<type>` grant for some type, custom types
+  included (`groups::access::may_post_any`: the group's `post`, or any
+  channel `post:<type>` entry that grants). A reader who may post nothing
+  gets `forbidden` (`403`). A reply-restricted poster may type.
 - There is no answer on success.
 - `channel.typing` goes to every reader subscribed to the channel, the
   typer's own connections included.
@@ -190,5 +197,4 @@ use every route exactly as local ones do, by their full `handle@domain`
 - Media uploads (§5.8), replacing `NoUploads`.
 - Notifications and mentions (§10.1). Mentions are validated and stored
   but notify no one yet.
-- Cite the oracle's clarification spec PR (Q1–Q7) here and in code
-  comments once it is open.
+- Re-check against lost-conn/ofscp#37's final text once it merges.

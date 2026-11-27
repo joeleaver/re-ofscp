@@ -219,6 +219,23 @@ fn posting_uses_the_channel_entry_for_the_type_else_the_group_post() {
 }
 
 #[test]
+fn any_post_grant_counts_custom_types_and_the_group_post() {
+    let g = group(Tier::Public);
+    let plain = channel(Tier::Public, None);
+    // The group's post (admin, member by default) covers every unlisted type.
+    assert!(may_post_any(&member("member"), &g, &plain));
+    assert!(!may_post_any(&member("guest"), &g, &plain));
+    assert!(!may_post_any(&Standing::Outsider, &g, &plain));
+    assert!(may_post_any(&Standing::Owner, &g, &plain));
+    // A channel entry for a custom type grants too, exactly.
+    let c = perms(&[("post:poll", &["guest"]), ("react", &["guest"])]);
+    assert!(may_post_any(&member("guest"), &g, &c));
+    // A non-post entry is no post grant.
+    let r = perms(&[("react", &["guest"])]);
+    assert!(!may_post_any(&member("guest"), &g, &r));
+}
+
+#[test]
 fn reacting_defaults_to_every_reader_and_otherwise_is_exact() {
     let g = group(Tier::Public);
     assert!(may_react(

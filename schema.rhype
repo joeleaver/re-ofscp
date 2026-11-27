@@ -390,6 +390,10 @@ type Message {
     // has not been edited or deleted.
     edit_until: i64
     edited_at: i64
+    // How many edits it has had: each edit is a compare-and-set on it, so
+    // two edits racing from different processes cannot both apply to the
+    // same body (decision 0017).
+    revision: i64
     deleted_at: i64
 }
 

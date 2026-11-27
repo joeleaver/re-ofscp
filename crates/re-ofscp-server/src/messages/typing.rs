@@ -3,7 +3,6 @@
 //! when a `start` expires, is the WebSocket session's state
 //! (`ws::typing`); this side checks access and fans the event out.
 
-use ofscp_core::wire::MessageType;
 use ofscp_core::ws::{ChannelTyping, TypingState};
 use ofscp_core::{Actor, LocalId};
 
@@ -19,9 +18,10 @@ const MAY_NOT_TYPE: &str = "you may not post in this channel";
 impl Messages {
     /// The group of channel `channel_id`, if `actor` may type in it.
     /// Typing needs read access, and a channel the actor cannot read is
-    /// answered as missing (§11.3). It also needs some `post:<type>`
-    /// grant: a reader who may post nothing is `403`. A reply-restricted
-    /// poster may type (the oracle's answer to Q5, decision 0017).
+    /// answered as missing (§11.3). It also needs a `post:<type>` grant
+    /// for some type, custom ones included: a reader who may post nothing
+    /// is `403`. A reply-restricted poster may type (lost-conn/ofscp#37,
+    /// decision 0017).
     pub async fn typing_target(
         &self,
         actor: &Actor,
@@ -35,13 +35,7 @@ impl Messages {
             .readable(&caller, &group_id, channel_id.as_str())
             .await?;
         let (policy, cpolicy) = (g.group.policy(), channel.policy());
-        let may_post_any = [
-            MessageType::Message,
-            MessageType::Memo,
-            MessageType::Article,
-        ]
-        .iter()
-        .any(|kind| access::may_post(&g.standing, &policy, &cpolicy, kind.as_str()));
+        let may_post_any = access::may_post_any(&g.standing, &policy, &cpolicy);
         if !may_post_any {
             return Err(MessageError::Forbidden(MAY_NOT_TYPE));
         }
