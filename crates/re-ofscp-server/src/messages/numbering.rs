@@ -16,9 +16,10 @@
 //!   numbers every channel once ([`Messages::number_all`]), then whatever
 //!   a request hands it. Between the channels of that first pass it
 //!   numbers what requests handed it meanwhile, so a channel a request is
-//!   waiting on waits behind at most the one channel being numbered, never
-//!   the whole pass. It is not bounded (one pass over each channel), and
-//!   nothing waits on it.
+//!   waiting on waits for the channel being numbered and for those handed
+//!   over before it (each numbered to the end, once), never for the rest
+//!   of the pass. It is not bounded (one pass over each channel), and no
+//!   request waits on it: a request answers `503` and is retried.
 //! - A request (a create, a marker update, a count) that meets channels
 //!   not yet numbered numbers them itself only within its
 //!   [`InlineBudget`]: [`INLINE_LIMIT`] positions over every channel it
@@ -273,22 +274,24 @@ impl Messages {
             self.numbering_queue.push(channel_id);
             return Err(CountError::Numbering(channel_id.to_owned()));
         }
-        Ok(self.number(channel_id).await?)
+        self.number(channel_id).await?;
+        Ok(())
     }
 
     /// Number `channel_id` if its log predates ordinals, to the end,
-    /// under its numbering lock.
-    pub async fn number(&self, channel_id: &str) -> Result<(), DbError> {
+    /// under its numbering lock. Returns whether this call numbered it
+    /// (`false`: it was numbered already, or is gone).
+    pub async fn number(&self, channel_id: &str) -> Result<bool, DbError> {
         let db = self.store.db();
         let _turn = self.numbering.lock(channel_id).await;
         let mut run = Numbering::new(channel_id);
         for _ in 0..ATTEMPTS {
             let Some(counts) = log::read_counts(db, channel_id).await? else {
                 // Deleted meanwhile: nothing to count.
-                return Ok(());
+                return Ok(false);
             };
             if counts.messages.is_some() {
-                return Ok(());
+                return Ok(false);
             }
             run.scan(db, counts.last_seq).await?;
             if run.finish(db).await? {
@@ -297,7 +300,7 @@ impl Messages {
                     messages = run.messages(),
                     "numbered a channel"
                 );
-                return Ok(());
+                return Ok(true);
             }
         }
         Err(DbError::Contended(format!(
@@ -308,7 +311,8 @@ impl Messages {
     /// Number every channel whose log predates ordinals, in one pass over
     /// the open logs, numbering what requests hand over between channels.
     /// A channel that fails is logged and left for a later request to hand
-    /// over again. Returns how many channels the pass numbered.
+    /// over again. Returns how many channels the pass numbered itself,
+    /// leaving out those numbered from the queue between them.
     ///
     /// rhypedb returns rows in no set order and has no ordered paging, so
     /// the pass reads key ranges rather than offsets ([`log::open_range`]):
@@ -345,7 +349,8 @@ impl Messages {
                 }
                 self.drain_queue().await;
                 match self.number(channel_id).await {
-                    Ok(()) => numbered += 1,
+                    Ok(true) => numbered += 1,
+                    Ok(false) => {}
                     Err(e) => {
                         tracing::warn!(error = %e, channel = %channel_id, "numbering a channel failed");
                     }
@@ -364,7 +369,7 @@ impl Messages {
     /// Number every channel handed over so far.
     async fn drain_queue(&self) {
         for channel_id in self.numbering_queue.take() {
-            if let Err(e) = self.number(&channel_id).await {
+            if let Err(e) = self.number(&channel_id).await.map(drop) {
                 tracing::warn!(error = %e, channel = %channel_id, "numbering a channel failed");
             }
         }

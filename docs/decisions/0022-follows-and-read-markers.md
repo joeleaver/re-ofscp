@@ -186,8 +186,9 @@ their devices.
     the messages sweeper) numbers every channel in one pass over the open
     logs, then numbers whatever requests hand it. Between the channels of
     that pass it numbers what requests handed over meanwhile, so a request
-    waiting on a channel waits behind one channel's numbering, not the
-    whole pass. A request (a create, a marker update, a count) that meets
+    waiting on a channel waits for the channel being numbered and those
+    handed over before its own (each numbered once, to the end), not for
+    the rest of the pass. A request (a create, a marker update, a count) that meets
     channels not yet numbered numbers them itself only within a budget of
     1,000 positions over every channel it meets; a channel past what is
     left of it is handed to the background task and the request answers
@@ -206,17 +207,22 @@ their devices.
   - *No count is guessed, and no scope is dropped.* `GET` must list every
     readable channel with an exact `unreadCount` (§7.7), so leaving out a
     channel still being numbered would read as one the user cannot read;
-    the whole answer is `503` instead, a wait of about one channel's
-    numbering (above). `PATCH` finds every marker's point first, numbering
+    the whole answer is `503` instead, until the channel is numbered
+    (above). `PATCH` finds every marker's point first, numbering
     within its budget, and moves no marker until all are found: a batch
     naming a channel still being numbered answers `503` with nothing
     stored, and its retry moves, reports and announces every scope
     together. (Moving the others and skipping that scope would drop a
     marker the user set, with no way in §7.7 to tell them; moving the
     others and then answering `503`, as first built, stored markers that
-    no device heard of, since the retry finds them not moved.) A database
-    failure while storing can still follow some moves; those are announced
-    (`read.updated`) before the error is returned.
+    no device heard of, since the retry finds them not moved.) Every marker
+    stored is announced (`read.updated`), whatever fails after it moved:
+    `PATCH` reads the scopes' totals before moving any marker, so if
+    reading the moved scopes again fails, their entries are built from the
+    markers as moved and those totals (exact as of that read; a message
+    posted since reaches the user's connections with its own event). A
+    database failure while storing can still follow some moves; those are
+    announced before the error is returned.
   - *Bounds.* A request does at most 10 batched reads (plus one per
     channel) and 1,000 writes numbering, over all its channels together,
     or none. It numbers under the channel's write lock (it settles a

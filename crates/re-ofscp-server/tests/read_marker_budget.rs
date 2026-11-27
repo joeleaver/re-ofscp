@@ -2,7 +2,8 @@
 //! (docs/decisions/0022 *Existing data*), on a real rhypedb-server: a
 //! `PATCH` naming one still being numbered applies nothing, one request
 //! numbers at most its budget over every channel it meets, and the
-//! startup pass reaches every log however many there are.
+//! startup pass numbers what requests hand it first and reaches every log
+//! however many there are.
 
 mod common;
 
@@ -74,8 +75,11 @@ async fn a_patch_naming_a_channel_being_numbered_applies_nothing() {
     assert!(phone.silent_for(QUIET).await);
     assert!(!numbered(&env, &long).await);
 
-    // Once the channel is numbered, nothing was stored for the other one.
-    assert_eq!(env.state.messages.number_all().await.unwrap(), 1);
+    // Once the channel is numbered (from the queue, before the pass
+    // reaches it, so not by the pass itself), nothing was stored for the
+    // other one.
+    assert_eq!(env.state.messages.number_all().await.unwrap(), 0);
+    assert!(numbered(&env, &long).await);
     let got = scopes(&env, &bob).await;
     let entry = got.iter().find(|e| e["scopeId"] == chan.c).unwrap();
     assert!(entry.get("lastReadMessageId").is_none(), "{entry}");
@@ -117,6 +121,25 @@ async fn one_request_numbers_at_most_its_budget_over_every_channel() {
         let entry = got.iter().find(|e| e["scopeId"] == chan.c).unwrap();
         assert_eq!(entry["unreadCount"], 2, "{entry}");
     }
+}
+
+#[tokio::test]
+async fn the_startup_pass_numbers_handed_over_channels_first() {
+    let (env, alice, bob, _chan) = setup().await;
+    let (handed, _) = legacy_channel(&env, &alice, &bob, 1, INLINE_LIMIT + 1).await;
+    // Too long for a request's budget: handed to the background task.
+    let path = "/api/me/read-markers";
+    let (s, body) = call(&env, Some(&bob), "GET", path, None).await;
+    assert_numbering(s, &body);
+    assert!(!numbered(&env, &handed).await);
+    // Written since, so no request has numbered it.
+    let (other, _) = legacy_channel(&env, &alice, &bob, 2, 3).await;
+
+    // The pass numbers the queue before its first channel, so it numbers
+    // only the other one itself, whichever it reaches first.
+    assert_eq!(env.state.messages.number_all().await.unwrap(), 1);
+    assert!(numbered(&env, &handed).await);
+    assert!(numbered(&env, &other).await);
 }
 
 /// A log as stored before ordinals, for a channel with nothing in it.

@@ -108,8 +108,9 @@ impl ReadMarkers {
     /// (that would read as a channel the user cannot read) and gets no
     /// guessed count: the whole answer is `503` with `Retry-After` until it
     /// is numbered. The background task numbers handed-over channels
-    /// between the channels of its startup pass, so that wait is about one
-    /// channel's numbering (`messages/numbering.rs`).
+    /// between the channels of its startup pass, so that wait is for the
+    /// channels handed over before it, never the whole pass
+    /// (`messages/numbering.rs`).
     pub async fn scopes(&self, actor: &Actor) -> Result<Vec<ReadMarker>, MarkerError> {
         let channels = self.groups.readable_member_channels(actor).await?;
         let ids: Vec<String> = channels.iter().map(|c| c.id.clone()).collect();
@@ -130,10 +131,13 @@ impl ReadMarkers {
     /// announces every scope together. Skipping that scope instead would
     /// drop a marker the user set and §7.7 gives no way to tell them.
     ///
-    /// A database failure while storing (`500`/`503`) can still come after
-    /// some markers moved; those are still reported to the user's other
-    /// connections (`read.updated`) before the error is returned, so they
-    /// hear of every marker stored even though a retry finds it not moved.
+    /// Every marker stored is announced (`read.updated`), whatever fails
+    /// after it moved, since a retry finds it not moved and would announce
+    /// nothing. The scopes' totals are read before any marker moves
+    /// ([`ReadMarkers::announced`]), so the entries for what moved can be
+    /// built even if reading them again afterwards fails. A database
+    /// failure while storing (`500`/`503`) after some markers moved is
+    /// returned once those are announced.
     pub async fn update(
         &self,
         actor: &Actor,
@@ -144,24 +148,33 @@ impl ReadMarkers {
         // the entries below find every moved scope numbered.
         let budget = InlineBudget::new();
         let points = self.resolve(actor, updates, &budget).await?;
-        let mut moved: Vec<StoredChannel> = Vec::new();
+        let mut named: Vec<String> = points.iter().map(|(c, _)| c.id.clone()).collect();
+        named.sort_unstable();
+        named.dedup();
+        // Read before anything moves, so a failure here stores nothing.
+        let before = self
+            .messages
+            .totals(&named, &actor.to_string(), &budget)
+            .await?;
+        // Each scope that moved, with its marker as this request left it.
+        let mut moved: Vec<(StoredChannel, StoredMarker)> = Vec::new();
         let mut failed = None;
         for (channel, at) in &points {
             match self.store.advance(actor, &channel.id, at, now).await {
-                Ok(Advanced::Moved(_)) => {
-                    if !moved.iter().any(|c| c.id == channel.id) {
-                        moved.push(channel.clone());
+                Ok(Advanced::Moved(marker)) => {
+                    match moved.iter_mut().find(|(c, _)| c.id == channel.id) {
+                        Some((_, m)) => *m = marker,
+                        None => moved.push((channel.clone(), marker)),
                     }
                 }
-                Ok(_) => {}
+                Ok(Advanced::Behind) => {}
                 Err(e) => {
                     failed = Some(e);
                     break;
                 }
             }
         }
-        let ids: Vec<String> = moved.iter().map(|c| c.id.clone()).collect();
-        let scopes = self.entries(actor, &moved, &ids, &budget).await?;
+        let scopes = self.announced(actor, &moved, &before, &budget).await;
         if !scopes.is_empty() {
             let event = ReadUpdated {
                 markers: scopes.clone(),
@@ -175,6 +188,29 @@ impl ReadMarkers {
             Some(e) => Err(e.into()),
             None => Ok(scopes),
         }
+    }
+
+    /// The entries for the scopes that `moved`, read afresh. Should that
+    /// read fail, they are built from the markers as moved and the totals
+    /// read `before` any moved, exact as of that read (every marker's
+    /// message was stored by then); a message posted since is announced to
+    /// the user's connections with its own event. Never fails, so what
+    /// moved is always announced.
+    async fn announced(
+        &self,
+        actor: &Actor,
+        moved: &[(StoredChannel, StoredMarker)],
+        before: &BTreeMap<String, ChannelTotals>,
+        budget: &InlineBudget,
+    ) -> Vec<ReadMarker> {
+        let channels: Vec<StoredChannel> = moved.iter().map(|(c, _)| c.clone()).collect();
+        let ids: Vec<String> = channels.iter().map(|c| c.id.clone()).collect();
+        let e = match self.entries(actor, &channels, &ids, budget).await {
+            Ok(scopes) => return scopes,
+            Err(e) => e,
+        };
+        tracing::warn!(error = %e, "re-reading moved read markers failed; announcing them as read before");
+        entries_as_read(moved, before)
     }
 
     /// Where each of `updates` would put its marker, in order, leaving out
@@ -264,6 +300,29 @@ impl ReadMarkers {
     }
 }
 
+/// The entries for the scopes that `moved`, from their markers as moved
+/// and the totals read `before` any moved. A scope whose log was closed
+/// or gone by then is left out (deleted, as in `entries`); one whose entry
+/// cannot be built is logged and left out.
+fn entries_as_read(
+    moved: &[(StoredChannel, StoredMarker)],
+    before: &BTreeMap<String, ChannelTotals>,
+) -> Vec<ReadMarker> {
+    let mut out = Vec::with_capacity(moved.len());
+    for (channel, marker) in moved {
+        let Some(ChannelTotals::Counted(t)) = before.get(&channel.id).copied() else {
+            continue;
+        };
+        match entry(channel, Some(marker), t) {
+            Ok(e) => out.push(e),
+            Err(e) => {
+                tracing::error!(error = %e, channel = %channel.id, "building a moved read marker failed");
+            }
+        }
+    }
+    out
+}
+
 /// The entry for `channel`, given the reader's marker and totals there.
 fn entry(
     channel: &StoredChannel,
@@ -281,4 +340,80 @@ fn entry(
         unread_count: unread::count(&channel.id, totals, marker)?,
         group_id: Some(LocalId::new(&channel.group_id).map_err(|_| bad("group id"))?),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::groups::model::ChannelDoc;
+    use re_ofscp_types::groups::{ChannelType, Tier};
+
+    fn channel(id: &str) -> StoredChannel {
+        StoredChannel {
+            id: id.into(),
+            group_id: "grp_g".into(),
+            kind: ChannelType::Text,
+            tier: Tier::Public,
+            revision: 0,
+            doc: ChannelDoc::default(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    fn marker(scope: &str, message: &str, n: i64, own: i64) -> StoredMarker {
+        StoredMarker {
+            scope_id: scope.into(),
+            message_id: message.into(),
+            n,
+            own,
+        }
+    }
+
+    #[test]
+    fn moved_scopes_are_built_from_the_totals_read_before() {
+        let moved = [
+            (channel("chn_a"), marker("chn_a", "msg_a", 3, 1)),
+            (channel("chn_closed"), marker("chn_closed", "msg_c", 1, 0)),
+            (channel("chn_gone"), marker("chn_gone", "msg_g", 1, 0)),
+        ];
+        let before = BTreeMap::from([
+            (
+                "chn_a".to_owned(),
+                ChannelTotals::Counted(Totals {
+                    messages: 10,
+                    own: 4,
+                }),
+            ),
+            ("chn_closed".to_owned(), ChannelTotals::Closed),
+        ]);
+        // 7 after the marker, 3 of them the reader's own; the deleted
+        // channels are left out.
+        let got = entries_as_read(&moved, &before);
+        let want = ReadMarker {
+            scope_id: LocalId::new("chn_a").unwrap(),
+            last_read_message_id: Some(LocalId::new("msg_a").unwrap()),
+            unread_count: 4,
+            group_id: Some(LocalId::new("grp_g").unwrap()),
+        };
+        assert_eq!(got, [want]);
+    }
+
+    #[test]
+    fn a_scope_whose_entry_cannot_be_built_is_left_out() {
+        // A marker past the count is a contradiction, never a guess.
+        let moved = [
+            (channel("chn_a"), marker("chn_a", "msg_a", 5, 0)),
+            (channel("chn_b"), marker("chn_b", "msg_b", 1, 0)),
+        ];
+        let counted = |messages| ChannelTotals::Counted(Totals { messages, own: 0 });
+        let before = BTreeMap::from([
+            ("chn_a".to_owned(), counted(2)),
+            ("chn_b".to_owned(), counted(2)),
+        ]);
+        let got = entries_as_read(&moved, &before);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].scope_id.as_str(), "chn_b");
+        assert_eq!(got[0].unread_count, 1);
+    }
 }
