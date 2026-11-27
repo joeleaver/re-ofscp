@@ -158,16 +158,13 @@ impl PointerStore {
             .map(|r| r.data.decode()))
     }
 
-    /// Remove `owner`'s pointer to `group`. `true` if one was removed.
-    pub async fn delete(&self, owner: &Actor, group: &str) -> Result<bool, DbError> {
+    /// Remove `owner`'s pointer to `group`, if there is one. rhypedb's
+    /// `delete` returns no rows, so whether one was removed is not known
+    /// here: the caller reads first (decision 0018).
+    pub async fn delete(&self, owner: &Actor, group: &str) -> Result<(), DbError> {
         let q = Ql::new("GroupPointer.filter(.key == ")
             .str(&key(owner, group))
             .raw(").delete()");
-        Ok(!self
-            .db
-            .write_one_object(&q)
-            .await?
-            .into_objects()
-            .is_empty())
+        self.db.write_one_object(&q).await.map(|_| ())
     }
 }

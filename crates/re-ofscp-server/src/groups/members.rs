@@ -4,7 +4,8 @@
 //! A membership is written `pending` and made `active` once its writer has
 //! confirmed that the group is still active (see `store.rs`), so a
 //! membership never outlives its group. Removing one first makes it
-//! `leaving` (`member_ops.rs`). Every read sees active rows only.
+//! `leaving` (`member_ops.rs`); a deleting group's memberships are
+//! `ended` before its purge (`ending.rs`). Every read sees active rows only.
 
 use re_ofscp_types::Actor;
 use serde::Deserialize;
@@ -277,10 +278,13 @@ impl GroupStore {
     }
 
     /// End `actor`'s membership of `group_id`, pending or active (a no-op
-    /// if there is none).
+    /// if there is none). An `ended` row (a deleting group's, `ending.rs`)
+    /// is left for the purge, so the sweeper can still name its member.
     pub async fn remove_member(&self, group_id: &str, actor: &Actor) -> Result<(), DbError> {
         let q = Ql::new("Membership.filter(.key == ")
             .str(&member_key(group_id, actor))
+            .raw(" && .status != ")
+            .str(status::ENDED)
             .raw(").delete()");
         self.db.write_one_object(&q).await.map(|_| ())
     }

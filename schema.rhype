@@ -259,8 +259,10 @@ type Membership {
     group_id: String @indexed
     actor: String @indexed
     role: String
-    // "pending" or "active", as for Channel.status, or "leaving": being
-    // removed (docs/decisions/0020), and no longer a membership.
+    // "pending" or "active", as for Channel.status; "leaving": being
+    // removed (docs/decisions/0020), and no longer a membership; or
+    // "ended": a membership of a group being deleted, named to group lists
+    // before the purge (docs/decisions/0018).
     status: String @indexed
     joined_at: DateTime
     // When the role last changed, or when the row began leaving. Absent =

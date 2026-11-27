@@ -139,6 +139,7 @@ pub struct AppStateBuilder {
     ws_config: WsConfig,
     ws_seams: Option<Seams>,
     uploads: Option<Arc<dyn Uploads>>,
+    group_list_backlog: usize,
 }
 
 impl AppStateBuilder {
@@ -226,6 +227,16 @@ impl AppStateBuilder {
     #[must_use]
     pub fn uploads(mut self, uploads: Arc<dyn Uploads>) -> Self {
         self.uploads = Some(uploads);
+        self
+    }
+
+    /// Hold at most `max` distinct hosted-membership changes waiting to
+    /// become `groups.updated` (default [`my_groups::events::PENDING_MAX`]).
+    /// A change that does not fit closes its member's connections (`1013`,
+    /// decision 0018); tests use `0` to force that.
+    #[must_use]
+    pub fn group_list_backlog(mut self, max: usize) -> Self {
+        self.group_list_backlog = max;
         self
     }
 
@@ -331,7 +342,7 @@ impl AppStateBuilder {
         // Subscriptions whose access a group change revokes end at once.
         ws::follow_groups(&runtime, &ws, &groups);
         // Hosted membership changes reach the member's group list (§5.7).
-        my_groups::events::follow(&runtime, &ws, &groups);
+        my_groups::events::follow(&runtime, &ws, &groups, self.group_list_backlog);
         let my_groups = Arc::new(my_groups::MyGroups::new(
             my_groups::store::PointerStore::new(db.clone()),
             groups.clone(),
@@ -378,6 +389,7 @@ impl AppState {
             ws_config: WsConfig::default(),
             ws_seams: None,
             uploads: None,
+            group_list_backlog: my_groups::events::PENDING_MAX,
         }
     }
 

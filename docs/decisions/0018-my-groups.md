@@ -23,15 +23,17 @@ of changes through `groups.updated`.
 
 | Route | Answers |
 | --- | --- |
-| `GET /api/me/groups` | `200` `{groups, metadata: []}`: hosted entries, then pointers, each sorted by URI |
-| `PUT /api/me/groups/{groupRef}` | `200` entry; `400`; `403` denied provider; `404` hosted group, not a member; `409` pointer limit; `503` policy not loaded |
+| `GET /api/me/groups` | `200` `{groups, metadata: []}`: hosted entries, then pointers, each sorted by URI; `500` (logged) over a bound |
+| `PUT /api/me/groups/{groupRef}` | `200` entry; `400`; `403` denied provider; `404` hosted group, not a member; `409` pointer limit; `503` policy not loaded (remote groups only) |
 | `DELETE /api/me/groups/{groupRef}` | `204` (also when there is none); `400`; `409` hosted group the caller belongs to |
 
 - **Order of checks.** A remote or provider signer gets `403` first (a
   local-account endpoint, requirement 1), then the request is read (`400`,
-  recording nothing), then the federation policy is applied to the group's
-  provider (`403`, or `503` while the policy is not loaded: fail closed,
-  as everywhere else, decision 0008).
+  recording nothing). A group hosted here is then answered at once: it
+  involves no other provider, so no federation policy, and it works even
+  before the policy has loaded. For any other group the federation policy
+  is applied to its provider (`403`, or `503` while the policy is not
+  loaded: fail closed, as everywhere else, decision 0008).
 - **`{groupRef}`.** The router decodes the segment exactly once. It must be
   `https://{authority}/api/groups/{id}` with nothing after the id (no
   query, fragment, trailing slash or further segments) and a valid local id.
@@ -76,12 +78,20 @@ entry dates from `joined_at` or the group's `created_at`. The reads are in
   and again after it, and a create that finds the user over the limit
   takes its row back, as for groups (decision 0014). Changing or removing
   an existing pointer always works.
-- **Hosted memberships:** `MAX_MEMBERSHIPS_PER_ACTOR` (1,000), and owned
-  groups are bounded by `MAX_GROUPS_PER_OWNER`. `GET` must list every
-  group, so it reads one row more than the limit, and a user over it gets
-  `500` (logged) rather than a list with some left out. Joins have to
-  enforce the limit for that never to happen; that check belongs to the
-  membership seams (`add_member`), on the membership branch.
+- **Hosted memberships:** at most `MAX_MEMBERSHIPS_PER_ACTOR` (1,000, in
+  `groups/mod.rs`) per actor, owned groups aside, enforced in
+  `Groups::add_member`, the seam every join goes through. An existing
+  member is answered first (`Ok(false)`, whatever the count). Then the
+  active memberships are counted before the write, and again once the
+  new one is active; a join that finds the actor over the limit takes its
+  row back (announced, since it was briefly active). Either way the join is
+  `403 forbidden` (provider policy, like the owned-group limit). Owned
+  groups are bounded by `MAX_GROUPS_PER_OWNER`.
+- **No partial lists.** `GET` must list every group, so it reads one row
+  more than each bound (owned groups, memberships, pointers). A list that
+  finds the extra row is `500` (logged), never a list with some left out.
+  The writes above make that unreachable; the check keeps a bug or a
+  manual database edit from turning into a silently short list.
 
 ### Storage (`schema.rhype`)
 
@@ -105,25 +115,44 @@ and tries again (up to five times, then `409`).
   The provider runs as one process. If it ever runs several, the data stays
   correct through the unique key and the guarded update, but events could
   cross between processes.
-- **Hosted memberships** change inside `Groups`, which broadcasts an
-  `AccessChange` after every membership write (decision 0014).
-  `my_groups::events::follow` subscribes:
-  - `Member { group, actor }` for a **local** actor (a remote member's list
-    lives at their own home provider): that actor's entry is read afresh
-    and sent as changed, or as removed when there is none. A fresh read
-    makes ordering and duplicates harmless, because the last event always
-    carries the state at the time.
-  - `Group { group }` for a group no longer active (being deleted, or
-    gone): every member row still there, and the owner, is handled as
-    above. A change to an active group's settings changes no entry.
-  - `Channel` changes are ignored.
-  - Actors with no live connection are skipped. The change committed before
-    it was announced, so a client that connects later reads it.
-- **Group deletion** now names every member, and the owner, as a `Member`
-  change before the purge (`ops::delete_group`), the same way it already
-  names channels, because the purge removes the rows a receiver would read.
-  If the members cannot be read, the purge is left to the sweeper, so the
-  `Group` change's receiver still finds the rows.
+- **Hosted memberships** change inside `Groups`. Besides the bounded
+  `AccessChange` broadcast (decision 0014), which live subscriptions
+  follow, `Groups` tells every registered `MembershipListener` of each
+  membership change, synchronously, from the write that made it
+  (`Groups::on_membership`; `member_changed` calls both). A listener
+  cannot lag, however many changes one operation makes. The group list
+  registers one (`my_groups::events::follow`) and never reads the
+  broadcast. The listener does no I/O. It keeps a change only for a
+  **local** actor (a remote member's list lives at their own home
+  provider) with a **live connection** (the change committed before it was
+  announced, so a client that connects later reads it). Each is a
+  `(group, actor)` key in a coalescing set. A second task resolves each
+  key: the actor's entry is read afresh and sent as changed, or as
+  removed when there is none. A fresh read makes ordering and duplicates
+  harmless, because the last event always carries the state at the time.
+- **Group deletion** (`groups/ending.rs`). The purge removes the
+  membership rows through which a member's list is found, so each
+  membership is first **ended**: a new `ended` status, invisible to every
+  read. That happens in pages of 500, each one guarded write,
+  `Membership.filter(.group_id == g && .status == "active").limit(500)
+  .update({status: "ended"})`. It returns exactly the rows it wrote
+  (compare-and-set per object since rhypedb #59, decision 0012), and
+  those members are named to the listeners. A short page may have lost
+  rows to a race (`.limit` picks before the re-check), so the loop ends
+  only when a plain read finds no active row; only then does
+  `delete_group` purge. Otherwise (a failed page, or five pages in a row
+  that ended nothing while rows remained) the purge is left to the
+  sweeper. Its `finish_deletion` names every `ended` row again (offset
+  paging: ended rows never change, and `remove_member` leaves them alone,
+  so the pages are stable), because a failed page may have committed
+  without anyone being named. It then ends the rest, names the owner, and
+  purges. The owner is named by `delete_group` as soon as the group is
+  hidden. Nothing per member goes on the broadcast: the WebSocket
+  follower re-checks subscriptions per channel, and `delete_group`
+  already names every channel and the group. So a group of any size
+  cannot overflow the broadcast and force a full re-check. (rhypedb's
+  limited index scans counted deleted rows before 7b78190 #61; the pinned
+  commit has the fix, so `limit` pages are exact.)
 - **Ownership transfer** (membership branch) announces `Member` for both
   the old and the new owner after `Group.owner` has changed, so the fresh
   read gives `owner` and the old owner's new role.
@@ -132,24 +161,31 @@ and tries again (up to five times, then `409`).
   entry as it is, which can be a `removed` for a group the user was never
   in. Clients treat a removal of an entry they do not hold as a no-op.
 
-### Nothing is dropped quietly (lag)
+### Nothing is dropped quietly
 
-The broadcast is bounded (1,024 per receiver). One task only moves changes
-into a coalescing set and does no I/O, and a second task resolves them, so
-a burst collapses instead of lagging. Changes can still be lost: the
-receiver lags anyway, or the set passes 65,536 distinct changes, or an
-entry cannot be read or encoded. The spec has no way to say "your list
-changed in ways I cannot name". Resending the full list as `groups` cannot
-express removals, so it would leave a client holding groups it has left.
+The listener cannot lag. Changes can still be lost in two ways, and the
+spec has no way to say "your list changed in ways I cannot name".
+Resending the full list as `groups` cannot express removals, so it would
+leave a client holding groups it has left. Instead, only the actor the
+lost change concerns loses their connections, never anyone else (an
+earlier draft closed every local connection, `1013`, when the broadcast
+lagged, which a single large group's deletion could trigger):
 
-Instead, the affected connections get an `error` (`too_many_requests`,
-`429`), and are then closed with `1013`. That is every local connection
-when the lost change cannot be named, or the one member's connections when
-only their entry failed. This is the close §7.1 already defines for events
-a provider could not deliver to a slow consumer, and this provider already
-uses it that way (decision 0010). Nothing missed while disconnected is
-replayed, so a reconnecting client re-reads `GET /api/me/groups`. The close
-is costly but rare, and it never leaves a list silently wrong.
+- **The coalescing set is full** (65,536 distinct waiting changes,
+  `AppStateBuilder::group_list_backlog`, which tests set to `0`). That is
+  an outbound overflow, as from a slow consumer, so the §7.1 close
+  applies: an `error` `too_many_requests` (`429`) with
+  `details.retryAfter` (5 seconds, as the backlog drains at database
+  speed), then `1013`. This provider already uses that close for a slow
+  consumer (decision 0010). A key already waiting always fits: it
+  coalesces.
+- **The entry cannot be read or encoded.** That is the provider's
+  fault, not the client's, so the close is not a slow-consumer one: an
+  `error` `internal_error` (`500`), then `1011`.
+
+Nothing missed while disconnected is replayed, so a reconnecting client
+re-reads `GET /api/me/groups`. The close is rare, and it never leaves a
+list silently wrong.
 
 ## Consequences
 

@@ -347,10 +347,7 @@ async fn deleting_a_group_names_each_channel_before_the_purge() {
                 assert_eq!(group_id, gid);
                 break;
             }
-            // The owner's group list (decision 0018).
-            GroupChange::Member { group_id, actor } => {
-                assert_eq!((group_id, actor), (gid.clone(), owner.id()));
-            }
+            other => panic!("unexpected {other:?}"),
         }
     }
     named.sort();

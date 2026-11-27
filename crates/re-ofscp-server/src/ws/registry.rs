@@ -368,17 +368,6 @@ impl Registry {
             .is_some_and(|ids| !ids.is_empty())
     }
 
-    /// Every local actor (of this registry's provider) with at least one
-    /// authenticated connection.
-    pub fn local_actors(&self) -> Vec<Actor> {
-        self.lock()
-            .by_actor
-            .iter()
-            .filter(|(actor, ids)| !ids.is_empty() && actor.is_local_to(&self.local))
-            .map(|(actor, _)| actor.clone())
-            .collect()
-    }
-
     /// Queue `text` for every authenticated connection of `actor`.
     pub fn send_to_actor(&self, actor: &Actor, text: &Arc<str>) {
         let s = self.lock();

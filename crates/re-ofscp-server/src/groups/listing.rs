@@ -14,16 +14,8 @@ use re_ofscp_types::Actor;
 use serde::Deserialize;
 
 use super::store::{GroupStore, status};
-use super::{Groups, MAX_GROUPS_PER_OWNER};
+use super::{Groups, MAX_GROUPS_PER_OWNER, MAX_MEMBERSHIPS_PER_ACTOR};
 use crate::db::{DbError, Ql};
-
-/// Most memberships one actor may hold (provider policy). `GET
-/// /api/me/groups` lists every one, so the joins that create memberships
-/// enforce it; a list that finds more fails rather than leave some out.
-pub const MAX_MEMBERSHIPS_PER_ACTOR: usize = 1_000;
-
-/// Members of a deleting group read per page while announcing its end.
-const MEMBERS_PAGE: usize = 500;
 
 /// One entry of the caller's hosted group list.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,9 +34,14 @@ pub enum ListingError {
     /// The database failed.
     #[error(transparent)]
     Db(#[from] DbError),
-    /// The actor holds more memberships than [`MAX_MEMBERSHIPS_PER_ACTOR`].
+    /// The actor holds more memberships than [`MAX_MEMBERSHIPS_PER_ACTOR`]
+    /// (`Groups::add_member` refuses the join that would do it).
     #[error("{0} holds more memberships than this provider allows")]
     TooMany(Actor),
+    /// The actor owns more groups than [`MAX_GROUPS_PER_OWNER`]
+    /// (`Groups::create_group` refuses the create that would do it).
+    #[error("{0} owns more groups than this provider allows")]
+    TooManyOwned(Actor),
 }
 
 #[derive(Deserialize)]
@@ -83,11 +80,6 @@ impl OwnerRow {
     }
 }
 
-#[derive(Deserialize)]
-struct ActorRow {
-    actor: String,
-}
-
 /// A group row, whatever its status: who owns it and whether it is live.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupOwner {
@@ -98,7 +90,8 @@ pub struct GroupOwner {
 }
 
 impl GroupStore {
-    /// The active groups `owner` owns, as owner entries.
+    /// The active groups `owner` owns, as owner entries: at most one past
+    /// [`MAX_GROUPS_PER_OWNER`], so the caller can tell a list over it.
     async fn owner_entries(&self, owner: &Actor) -> Result<Vec<HostedEntry>, DbError> {
         let q = Ql::new("Group.filter(.owner == ")
             .str(&owner.to_string())
@@ -176,44 +169,19 @@ impl GroupStore {
             active: row.data.status == status::ACTIVE,
         }))
     }
-
-    /// Every actor with an active membership of `group_id`, read in pages.
-    /// Meant for a group being deleted, whose membership no longer changes.
-    pub async fn member_actors(&self, group_id: &str) -> Result<Vec<Actor>, DbError> {
-        let mut actors = Vec::new();
-        let mut offset = 0usize;
-        loop {
-            let q = Ql::new("Membership.filter(.group_id == ")
-                .str(group_id)
-                .raw(" && .status == ")
-                .str(status::ACTIVE)
-                .raw(").offset(")
-                .uint(offset as u64)
-                .raw(").limit(")
-                .uint(MEMBERS_PAGE as u64)
-                .raw(")");
-            let page = self.db.fetch::<ActorRow>(&q).await?;
-            let full = page.len() == MEMBERS_PAGE;
-            offset += page.len();
-            for row in page {
-                let actor = Actor::parse_canonical(&row.data.actor)
-                    .map_err(|_| DbError::Decode(format!("group {group_id}: bad member")))?;
-                actors.push(actor);
-            }
-            if !full {
-                return Ok(actors);
-            }
-        }
-    }
 }
 
 impl Groups {
     /// Every active group hosted here that `actor` owns or is an active
-    /// member of, by group id. Fails with [`ListingError::TooMany`] rather
-    /// than leave a membership out.
+    /// member of, by group id. Fails with [`ListingError::TooMany`] or
+    /// [`ListingError::TooManyOwned`] rather than leave a group out.
     pub async fn hosted_entries(&self, actor: &Actor) -> Result<Vec<HostedEntry>, ListingError> {
         let mut entries: BTreeMap<String, HostedEntry> = BTreeMap::new();
-        for e in self.store.owner_entries(actor).await? {
+        let owned = self.store.owner_entries(actor).await?;
+        if owned.len() > MAX_GROUPS_PER_OWNER {
+            return Err(ListingError::TooManyOwned(actor.clone()));
+        }
+        for e in owned {
             entries.insert(e.group_id.clone(), e);
         }
         let rows = self

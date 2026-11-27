@@ -68,6 +68,11 @@ pub enum MyGroupsError {
     /// The hosted list could not be read in full (`500`).
     #[error(transparent)]
     Listing(#[from] ListingError),
+    /// The caller holds more pointers than [`MAX_POINTERS_PER_ACTOR`]
+    /// (`500`): `PUT` refuses the write that would do it, so the list is
+    /// refused rather than shown with some left out.
+    #[error("{0} holds more group pointers than this provider allows")]
+    TooManyPointers(Actor),
     /// The database failed (`500`).
     #[error(transparent)]
     Db(#[from] DbError),
@@ -150,7 +155,10 @@ impl MyGroups {
         for e in self.groups.hosted_entries(actor).await? {
             out.push(hosted_pointer(self.home(), &e)?);
         }
-        let mut stored = self.store.list(actor, MAX_POINTERS_PER_ACTOR).await?;
+        let mut stored = self.store.list(actor, MAX_POINTERS_PER_ACTOR + 1).await?;
+        if stored.len() > MAX_POINTERS_PER_ACTOR {
+            return Err(MyGroupsError::TooManyPointers(actor.clone()));
+        }
         stored.sort_by(|a, b| a.group.cmp(&b.group));
         for p in &stored {
             out.push(stored_pointer(p)?);
@@ -166,16 +174,18 @@ impl MyGroups {
         role: Option<&str>,
         now: i64,
     ) -> Result<GroupPointer, MyGroupsError> {
-        match self.policy.decide(&group.authority) {
-            Decision::Permitted => {}
-            Decision::Denied => return Err(MyGroupsError::Denied(group.authority.clone())),
-            Decision::Unknown => return Err(MyGroupsError::PolicyUnknown),
-        }
+        // A hosted group involves no other provider, so no federation
+        // policy: it is answered even before the policy has loaded.
         if group.authority == *self.home() {
             return match self.groups.hosted_entry(actor, &group.group_id).await? {
                 Some(e) => Ok(hosted_pointer(self.home(), &e)?),
                 None => Err(MyGroupsError::NotMember),
             };
+        }
+        match self.policy.decide(&group.authority) {
+            Decision::Permitted => {}
+            Decision::Denied => return Err(MyGroupsError::Denied(group.authority.clone())),
+            Decision::Unknown => return Err(MyGroupsError::PolicyUnknown),
         }
         let uri = group.uri();
         let _held = self.lock(actor).await;

@@ -36,7 +36,9 @@ impl From<MyGroupsError> for Problem {
             MyGroupsError::Hosted(_) | MyGroupsError::Limit | MyGroupsError::Contended => {
                 Problem::conflict()
             }
-            MyGroupsError::Listing(_) | MyGroupsError::Db(_) => {
+            MyGroupsError::Listing(_)
+            | MyGroupsError::TooManyPointers(_)
+            | MyGroupsError::Db(_) => {
                 tracing::error!(error = %detail, "group list operation failed");
                 return Problem::internal();
             }

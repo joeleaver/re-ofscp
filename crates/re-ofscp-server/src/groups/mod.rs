@@ -12,6 +12,8 @@
 //!   requests ([`joining`]), the member list (`roster.rs`, paged by
 //!   [`paging`]), leave, kick, role and nickname changes ([`member_edits`])
 //!   and ownership transfer (`transfer.rs`; docs/decisions/0020).
+//! - `ending.rs`: ending a deleted group's memberships, announcing each to
+//!   the [`MembershipListener`]s, before the purge.
 //!
 //! The owner is the group's `owner` field and every other member is a
 //! `Membership` row ([`Groups::add_member`], [`Groups::set_role`],
@@ -20,6 +22,7 @@
 
 pub mod access;
 mod claims;
+mod ending;
 pub mod joining;
 pub mod listing;
 pub mod member_edits;
@@ -41,7 +44,7 @@ pub mod validate;
 
 pub use member_ops::Updated;
 
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
 use re_ofscp_types::{Actor, Authority};
@@ -104,6 +107,21 @@ pub enum AccessChange {
     },
 }
 
+/// Told of every membership change, synchronously and in full, from the
+/// write that made it (registered with [`Groups::on_membership`]).
+///
+/// Unlike the bounded [`AccessChange`] broadcast, nothing here can lag: a
+/// group's deletion names every one of its members, in pages, which could
+/// be far more than a broadcast buffers. A listener must not block or do
+/// I/O (it runs inside the write); it records the change and returns.
+pub trait MembershipListener: Send + Sync {
+    /// `actor`'s membership of `group_id` began, ended or changed role, or
+    /// the group was deleted. The change has committed (or may have: a
+    /// failed write is announced too, decision 0014), so a fresh read
+    /// shows its effect.
+    fn membership_changed(&self, group_id: &str, actor: &Actor);
+}
+
 /// Who is calling, as far as group access is concerned.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Caller {
@@ -122,6 +140,7 @@ pub struct Groups {
     home: Authority,
     clock: Arc<dyn Clock>,
     changes: broadcast::Sender<AccessChange>,
+    listeners: RwLock<Vec<Arc<dyn MembershipListener>>>,
 }
 
 impl std::fmt::Debug for Groups {
@@ -139,6 +158,7 @@ impl Groups {
             home,
             clock,
             changes: broadcast::channel(CHANGE_BUFFER).0,
+            listeners: RwLock::new(Vec::new()),
         }
     }
 
@@ -155,6 +175,26 @@ impl Groups {
     /// Receive every [`AccessChange`] from now on.
     pub fn subscribe_changes(&self) -> broadcast::Receiver<AccessChange> {
         self.changes.subscribe()
+    }
+
+    /// Tell `listener` of every membership change from now on.
+    pub fn on_membership(&self, listener: Arc<dyn MembershipListener>) {
+        self.listeners
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(listener);
+    }
+
+    /// Tell the [`MembershipListener`]s, and them only, that `actor`'s
+    /// membership of `group_id` changed.
+    fn tell_listeners(&self, group_id: &str, actor: &Actor) {
+        let listeners = self
+            .listeners
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        for l in listeners.iter() {
+            l.membership_changed(group_id, actor);
+        }
     }
 
     fn changed(&self, change: AccessChange) {
@@ -180,15 +220,19 @@ impl Groups {
         })
     }
 
+    /// Announce a change to `actor`'s membership of `group_id`: to live
+    /// readers (the broadcast) and to the membership listeners.
     fn member_changed(&self, group_id: &str, actor: &Actor) {
         self.changed(AccessChange::Member {
             group_id: group_id.to_owned(),
             actor: actor.clone(),
         });
+        self.tell_listeners(group_id, actor);
     }
 
     /// One sweeper pass at `now` (unix seconds): finish the group
-    /// deletions a crash or a database fault interrupted, expire the
+    /// deletions a crash or a database fault interrupted (announcing their
+    /// memberships' end first, `finish_deletion` in `ending.rs`), expire the
     /// pending channels and memberships whose writers never confirmed them
     /// (older than [`PENDING_TTL`]), finish interrupted ownership transfers
     /// (`transfer.rs`), and delete expired revision claims. A
@@ -212,7 +256,7 @@ impl Groups {
             let full = batch.len() == SWEEP_BATCH;
             let mut failed = false;
             for id in batch {
-                match self.store.purge_group(&id).await {
+                match self.finish_deletion(&id).await {
                     Ok(()) => purged += 1,
                     Err(e) => {
                         tracing::warn!(group = %id, error = %e, "purging a deleted group failed");
