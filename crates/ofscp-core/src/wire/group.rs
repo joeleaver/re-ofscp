@@ -255,6 +255,15 @@ pub struct Channel {
     pub metadata: Vec<MetadataObject>,
 }
 
+/// `GET /api/groups/{groupId}/channels` (§5.5): the channels the caller
+/// may read, all at once. Unlike most lists this one is not paged, so it
+/// has no `page` and does not decode as [`super::Paged`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChannelsResponse {
+    /// The channels.
+    pub items: Vec<Channel>,
+}
+
 /// `POST /api/groups/{groupId}/channels` (§5.5).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChannelCreateRequest {

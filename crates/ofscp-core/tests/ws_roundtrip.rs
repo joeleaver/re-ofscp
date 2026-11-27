@@ -15,35 +15,12 @@ use std::path::PathBuf;
 use ofscp_core::ws::{Body, Command, DecodeError, EncodeError, Envelope, Event};
 use serde_json::{Value, json};
 
-fn spec_dir() -> PathBuf {
-    std::env::var_os("OFSCP_SPEC_DIR").map_or_else(
-        || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../ofscp"),
-        PathBuf::from,
-    )
-}
+mod common;
+
+use common::{errors_against, spec_dir};
 
 fn tests_dir() -> PathBuf {
     spec_dir().join("tests")
-}
-
-/// The `$id` prefix of the spec's schemas.
-const SCHEMA_ID_BASE: &str = "https://example.invalid/ofscp/schemas/v0.1/";
-
-/// Resolves the schemas' relative `$ref`s to files in the spec checkout.
-struct SpecRetriever;
-
-impl jsonschema::Retrieve for SpecRetriever {
-    fn retrieve(
-        &self,
-        uri: &jsonschema::Uri<String>,
-    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        let rel = uri
-            .as_str()
-            .strip_prefix(SCHEMA_ID_BASE)
-            .ok_or_else(|| format!("unexpected schema uri {uri}"))?;
-        let path = spec_dir().join("schemas/v0.1").join(rel);
-        Ok(serde_json::from_str(&std::fs::read_to_string(path)?)?)
-    }
 }
 
 /// The errors of `instance` against `schemas/v0.1/ws/<name>`.
@@ -52,15 +29,7 @@ fn schema_errors(name: &str, instance: &Value) -> Vec<String> {
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("cannot read {} ({e})", path.display()));
     let schema: Value = serde_json::from_str(&text).unwrap();
-    let validator = jsonschema::options()
-        .should_validate_formats(true)
-        .with_retriever(SpecRetriever)
-        .build(&schema)
-        .unwrap_or_else(|e| panic!("schema {name} does not compile: {e}"));
-    validator
-        .iter_errors(instance)
-        .map(|e| format!("{name}: {e} at {}", e.instance_path()))
-        .collect()
+    errors_against(name, &schema, instance)
 }
 
 fn read(name: &str) -> String {
