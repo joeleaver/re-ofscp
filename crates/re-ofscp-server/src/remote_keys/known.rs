@@ -62,7 +62,7 @@ mod tests {
     use super::*;
 
     fn user(id: &str) -> Source {
-        Source::User(Actor::parse_canonical(id).unwrap())
+        Source::of(&Actor::parse_canonical(id).unwrap())
     }
 
     fn assert_consistent(k: &KnownSources) {

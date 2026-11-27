@@ -45,15 +45,15 @@ fn resolver_allowing(allow_hosts: Vec<Authority>) -> (RemoteKeys, Arc<TestClock>
 }
 
 /// `alice@127.0.0.1`: an IP-literal host our outbound rules refuse.
-fn loopback_alice() -> Signer {
-    Signer::Actor(Actor::new("alice", Authority::parse_canonical("127.0.0.1").unwrap()).unwrap())
+fn loopback_alice() -> Actor {
+    Actor::new("alice", Authority::parse_canonical("127.0.0.1").unwrap()).unwrap()
 }
 
 fn client() -> Requester {
     Requester::new("203.0.113.7")
 }
 
-fn cache(keys: &RemoteKeys, signer: &Signer, key: ed25519_dalek::VerifyingKey, expires: i64) {
+fn cache(keys: &RemoteKeys, signer: &Actor, key: ed25519_dalek::VerifyingKey, expires: i64) {
     let set: KeySet = [("dk_1".to_owned(), key)].into_iter().collect();
     keys.inner
         .tables()
@@ -102,7 +102,7 @@ async fn a_refusal_after_lookup_falls_back_the_same_way() {
     // as `Refused`; `settle` treats it like the IP-literal case.
     let (keys, clock) = resolver();
     let key = SigningKey::from_bytes(&[9; 32]).verifying_key();
-    let signer = Signer::Provider(Authority::parse_canonical("internal.example").unwrap());
+    let signer = Actor::parse_canonical("alice@internal.example").unwrap();
     let source = Source::of(&signer);
     cache(&keys, &signer, key, T + 30);
     let refused = || Fetched::Refused("internal.example resolves to 10.0.0.1".to_owned());
@@ -117,8 +117,8 @@ async fn a_refusal_after_lookup_falls_back_the_same_way() {
     ));
 }
 
-fn remote(id: &str) -> Signer {
-    Signer::Actor(Actor::parse_canonical(id).unwrap())
+fn remote(id: &str) -> Actor {
+    Actor::parse_canonical(id).unwrap()
 }
 
 fn retry_after(r: Result<Resolved, KeyError>) -> u64 {
@@ -166,8 +166,7 @@ async fn a_capacity_refusal_charges_no_budget() {
         let mut tables = keys.inner.tables();
         for i in 0..MAX_ENTRIES {
             let (_tx, answer) = watch::channel(None);
-            let other =
-                Source::Provider(Authority::parse_canonical(&format!("p{i}.example")).unwrap());
+            let other = Source::of(&remote(&format!("bob@p{i}.example")));
             tables.flights.insert(
                 other,
                 Flight {
@@ -293,7 +292,7 @@ async fn hosts_under_an_unknown_suffix_are_refused_at_no_cost() {
     for i in 0..DOMAIN_BURST + CLIENT_BURST {
         for signer in [
             remote(&format!("xxx@n{i}.zzqq")),
-            Signer::Provider(Authority::parse_canonical(&format!("n{i}.zzqq:8443")).unwrap()),
+            remote(&format!("yyy@n{i}.zzqq:8443")),
         ] {
             for fresh in [false, true] {
                 assert!(
@@ -440,7 +439,7 @@ fn one_key(key: ed25519_dalek::VerifyingKey) -> Arc<KeySet> {
 }
 
 /// Every one of `victims` is served `key` from cache, with no fetch.
-async fn all_cached(keys: &RemoteKeys, victims: &[Signer], key: ed25519_dalek::VerifyingKey) {
+async fn all_cached(keys: &RemoteKeys, victims: &[Actor], key: ed25519_dalek::VerifyingKey) {
     for victim in victims {
         assert_eq!(
             keys.resolve(victim, "dk_1", false, &client()).await,

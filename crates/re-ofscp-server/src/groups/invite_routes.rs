@@ -58,7 +58,7 @@ async fn create_invite(
     Path(g): Path<String>,
     bytes: Bytes,
 ) -> Result<Response, Problem> {
-    let actor = auth.actor()?;
+    let actor = auth.actor();
     group_id(&g)?;
     let invite = state.groups.create_invite(actor, &g, &bytes).await?;
     Ok((StatusCode::CREATED, Json(invite)).into_response())
@@ -72,7 +72,7 @@ async fn list_invites(
     Path(g): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<Paged<Invite>>, Problem> {
-    let actor = auth.actor()?;
+    let actor = auth.actor();
     group_id(&g)?;
     let query = super::paging::PageQuery::from_params(&params);
     Ok(Json(state.groups.list_invites(actor, &g, &query).await?))
@@ -84,7 +84,7 @@ async fn revoke_invite(
     auth: Authenticated,
     Path((g, i)): Path<(String, String)>,
 ) -> Result<StatusCode, Problem> {
-    let actor = auth.actor()?;
+    let actor = auth.actor();
     group_id(&g)?;
     local_id(&i, "no such invite")?;
     state.groups.revoke_invite(actor, &g, &i).await?;
@@ -98,7 +98,7 @@ async fn redeem(
     auth: Authenticated,
     Path(token): Path<String>,
 ) -> Result<Json<InviteRedeemResponse>, Problem> {
-    let actor = auth.actor()?;
+    let actor = auth.actor();
     let redeemed = state.groups.redeem_invite(actor, &token).await?;
     Ok(Json(redeemed.response))
 }

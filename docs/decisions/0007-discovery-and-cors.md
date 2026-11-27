@@ -81,11 +81,10 @@ invalid for every reader, so we publish a real key.
   drift out of step with the key.
 - **`created_at`** is omitted (it is optional and the server cannot know
   when the secret was generated).
-- **Our own signatures:** a provider-signed request naming this provider
-  (`X-OFSCP-Provider` = `DOMAIN`) is verified against the published keys
-  held in memory (`ProviderKey::published`, passed to the account
-  resolver), never by fetching our own discovery document. An unknown key
-  id is `401`.
+- **Our own signatures** (superseded by 0021): a provider-signed request
+  naming this provider is no longer verified. No route accepts provider
+  signatures (lost-conn/ofscp#42), so it gets `401` like any other
+  provider signer, and its discovery document is never fetched.
 - **Rotation (planned, not built):** nothing signs with the key yet, so
   replacing the secret is safe today. Once we send provider-signed requests
   (webhooks, §10), rotation becomes a window:
@@ -125,5 +124,6 @@ invalid for every reader, so we publish a real key.
   defaults), `federation.realtimeDelivery: "none"` (no WebSocket yet), and
   both optional discovery features `false`. Each grows as its feature
   lands. The deprecated `endpoints` section is not sent.
-- The wire types live in `re-ofscp-types::discovery`, so reading remote
-  discovery documents (§8.1 provider-signed verification) can reuse them.
+- The wire types live in `re-ofscp-types::discovery`, so clients and a
+  future §10 receiving route (§8.1 provider-signed verification, see 0021)
+  can reuse them.

@@ -7,8 +7,8 @@ use axum::http::StatusCode;
 use ed25519_dalek::SigningKey;
 use re_ofscp_server::privacy::seams::RelFuture;
 use re_ofscp_server::privacy::{GroupMemberships, Liveness, Viewer};
-use re_ofscp_server::signing::{Signer, StaticKeys};
-use re_ofscp_types::{Actor, Authority};
+use re_ofscp_server::signing::StaticKeys;
+use re_ofscp_types::Actor;
 use serde_json::Value;
 
 use super::accounts::{Env, NOW, create, login, register_key};
@@ -72,19 +72,14 @@ impl Remote {
         }
     }
 
-    /// A resolver that knows both keys.
+    /// A resolver that knows bob's key. The provider's is never resolved:
+    /// no route accepts provider signatures (lost-conn/ofscp#42).
     pub fn keys(&self) -> StaticKeys {
-        StaticKeys::default()
-            .with(
-                Signer::Actor(Actor::parse_canonical(&self.bob.id).unwrap()),
-                &self.bob.key_id,
-                self.bob.key.verifying_key(),
-            )
-            .with(
-                Signer::Provider(Authority::parse_canonical(&self.provider.id).unwrap()),
-                &self.provider.key_id,
-                self.provider.key.verifying_key(),
-            )
+        StaticKeys::default().with(
+            Actor::parse_canonical(&self.bob.id).unwrap(),
+            &self.bob.key_id,
+            self.bob.key.verifying_key(),
+        )
     }
 }
 

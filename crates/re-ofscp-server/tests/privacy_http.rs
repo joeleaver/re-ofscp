@@ -194,7 +194,7 @@ async fn presence_is_derived_from_liveness_and_filtered_by_policy() {
     assert_eq!(presence(&env, &alice, path).await, real);
     // Default policy sharedGroups and no groups: everyone else sees the
     // uniform offline, identical to really being offline.
-    for viewer in [&bob, &remote.bob, &remote.provider] {
+    for viewer in [&bob, &remote.bob] {
         assert_eq!(presence(&env, viewer, path).await, hidden);
     }
     // Public: everyone sees it; remote bob denied by full actor.
@@ -205,8 +205,11 @@ async fn presence_is_derived_from_liveness_and_filtered_by_policy() {
     )
     .await;
     assert_eq!(presence(&env, &bob, path).await, real);
-    assert_eq!(presence(&env, &remote.provider, path).await, real);
     assert_eq!(presence(&env, &remote.bob, path).await, hidden);
+    // A provider signature is never an anonymous viewer, even of public
+    // presence: 401 (§4.5 *Anonymous viewers*, lost-conn/ofscp#42).
+    let (status, p) = call(&env, &remote.provider, "GET", path, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{p}");
 
     // PUT replaces: no status now. `offline` cannot be set.
     let (status, own) = call(
@@ -258,10 +261,19 @@ async fn memberships_follow_membership_visibility() {
     let listed = json!({"groups": [{"id": uri}], "metadata": []});
     let empty = json!({"groups": [], "metadata": []});
 
-    // Default authenticated: users see it, a provider does not.
+    // Default authenticated: users see it. A provider signature is refused
+    // outright (lost-conn/ofscp#42).
     assert_eq!(groups(&env, &bob).await, listed);
     assert_eq!(groups(&env, &remote.bob).await, listed);
-    assert_eq!(groups(&env, &remote.provider).await, empty);
+    let (status, p) = call(
+        &env,
+        &remote.provider,
+        "GET",
+        "/api/users/alice/groups",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{p}");
     // nobody: only alice; refusal looks like having no groups.
     put_privacy(&env, &alice, json!({"membershipVisibility": "nobody"})).await;
     assert_eq!(groups(&env, &alice).await, listed);

@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use re_ofscp_server::accounts::{
     CreateError, MAX_DEVICE_KEYS, Revocation, RevocationListener, StoreError,
 };
-use re_ofscp_server::signing::{Signer, StaticKeys};
+use re_ofscp_server::signing::StaticKeys;
 use re_ofscp_types::Actor;
 use serde_json::{Value, json};
 
@@ -329,11 +329,7 @@ async fn remote_actors_cannot_use_local_account_endpoints() {
     let bob = new_key();
     let bob_actor = Actor::parse_canonical("bob@providerb.com").unwrap();
     let env = env_with(EnvOptions {
-        remote: Some(StaticKeys::default().with(
-            Signer::Actor(bob_actor),
-            "dk_bob",
-            bob.verifying_key(),
-        )),
+        remote: Some(StaticKeys::default().with(bob_actor, "dk_bob", bob.verifying_key())),
         ..EnvOptions::default()
     })
     .await;

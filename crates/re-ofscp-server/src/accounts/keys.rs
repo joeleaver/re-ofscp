@@ -1,11 +1,10 @@
 //! Resolving signing keys (spec §4.5 step 6, §4.6).
 //!
 //! [`ProviderKeys`] answers for actors of this provider from the account
-//! store, and hands remote actors and remote providers to a remote resolver
-//! (`crate::remote_keys`, docs/decisions/0006). A provider signature naming
-//! this provider itself is never fetched (that would only fetch our own
-//! discovery document): it is checked against the provider signing keys
-//! this provider publishes (§8.1, docs/decisions/0007), held in memory.
+//! store, and hands remote actors to a remote resolver (`crate::remote_keys`,
+//! docs/decisions/0006). Provider signatures are never verified, ours
+//! included: no route accepts them (lost-conn/ofscp#42,
+//! docs/decisions/0021).
 //!
 //! Local keys are cached briefly (positive results only). Revoking a key or
 //! disabling an account invalidates the cache at once, in this process; a
@@ -17,13 +16,13 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::VerifyingKey;
-use re_ofscp_types::Authority;
+use re_ofscp_types::{Actor, Authority};
 
 use super::store::AccountStore;
 use crate::signing::canonical::decode_public_key;
 use crate::signing::{
     KeyError, KeyFuture, KeyResolver, Lifetime, ReconfirmFuture, Reconfirmed, Requester, Resolved,
-    Signer, classify,
+    classify,
 };
 
 /// How long a resolved local key is cached.
@@ -58,8 +57,6 @@ struct Cache {
 /// Local keys from the account store; everything else from `remote`.
 pub struct ProviderKeys {
     local: Authority,
-    /// This provider's own published signing keys, by key id (§8.1).
-    own: Vec<(String, VerifyingKey)>,
     store: AccountStore,
     remote: Arc<dyn KeyResolver>,
     cache: Mutex<Cache>,
@@ -74,17 +71,10 @@ impl std::fmt::Debug for ProviderKeys {
 }
 
 impl ProviderKeys {
-    /// Resolve `local`'s actors from `store`, `local` itself from `own`
-    /// (its published provider keys, by id), others via `remote`.
-    pub fn new(
-        local: Authority,
-        own: Vec<(String, VerifyingKey)>,
-        store: AccountStore,
-        remote: Arc<dyn KeyResolver>,
-    ) -> Self {
+    /// Resolve `local`'s actors from `store`, others via `remote`.
+    pub fn new(local: Authority, store: AccountStore, remote: Arc<dyn KeyResolver>) -> Self {
         Self {
             local,
-            own,
             store,
             remote,
             cache: Mutex::new(Cache::default()),
@@ -154,50 +144,37 @@ impl ProviderKeys {
 impl KeyResolver for ProviderKeys {
     fn resolve<'a>(
         &'a self,
-        signer: &'a Signer,
+        actor: &'a Actor,
         key_id: &'a str,
         fresh: bool,
         requester: &'a Requester,
     ) -> KeyFuture<'a> {
         Box::pin(async move {
-            match signer {
-                Signer::Actor(actor) if actor.is_local_to(&self.local) => {
-                    self.resolve_local(actor.handle(), key_id, fresh).await
-                }
-                Signer::Provider(authority) if *authority == self.local => {
-                    Ok(Resolved::authoritative(
-                        self.own
-                            .iter()
-                            .find(|(id, _)| id == key_id)
-                            .map(|(_, key)| *key),
-                    ))
-                }
-                _ => self.remote.resolve(signer, key_id, fresh, requester).await,
+            if actor.is_local_to(&self.local) {
+                self.resolve_local(actor.handle(), key_id, fresh).await
+            } else {
+                self.remote.resolve(actor, key_id, fresh, requester).await
             }
         })
     }
 
     fn reconfirm<'a>(
         &'a self,
-        signer: &'a Signer,
+        actor: &'a Actor,
         key_id: &'a str,
         key: &'a VerifyingKey,
         held: Lifetime,
         requester: &'a Requester,
     ) -> ReconfirmFuture<'a> {
         Box::pin(async move {
-            let ours = match signer {
-                Signer::Actor(actor) => actor.is_local_to(&self.local),
-                Signer::Provider(authority) => *authority == self.local,
-            };
-            if ours {
-                match self.resolve(signer, key_id, true, requester).await {
+            if actor.is_local_to(&self.local) {
+                match self.resolve(actor, key_id, true, requester).await {
                     Ok(r) => classify(r.key.as_ref(), key, r.lifetime),
                     Err(e) => Reconfirmed::Unconfirmed(e.to_string()),
                 }
             } else {
                 self.remote
-                    .reconfirm(signer, key_id, key, held, requester)
+                    .reconfirm(actor, key_id, key, held, requester)
                     .await
             }
         })

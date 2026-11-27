@@ -331,7 +331,17 @@ impl ReplayStore {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn warm_up(&self, surface: Surface, u: &NonceUse<'_>, now: i64) -> Result<(), ReplayError> {
+    /// The restart warm-up gate alone (§4.5 *Restarts*): `WarmingUp` for a
+    /// signed request whose timestamp is not past T₀ + skew. [`check`] and
+    /// [`record`] apply it too; a verifier that must answer some requests
+    /// without verifying them (a denied signer's `403`) runs
+    /// [`check_unseen`] first and this gate only once it knows the
+    /// signature will be verified.
+    ///
+    /// [`check`]: Self::check
+    /// [`record`]: Self::record
+    /// [`check_unseen`]: Self::check_unseen
+    pub fn warm_up(&self, surface: Surface, u: &NonceUse<'_>, now: i64) -> Result<(), ReplayError> {
         let warm_until = self.warm_until.load(Ordering::SeqCst);
         if surface == Surface::SignedRequest && u.signed_at <= warm_until {
             return Err(ReplayError::WarmingUp {
@@ -440,6 +450,15 @@ impl ReplayStore {
     /// Step 4: would this use be accepted? Records nothing.
     pub fn check(&self, surface: Surface, u: &NonceUse<'_>, now: i64) -> Result<(), ReplayError> {
         self.warm_up(surface, u, now)?;
+        self.check_unseen(u, now)
+    }
+
+    /// Step 4 without the restart warm-up gate: freshness, replay, quotas
+    /// and capacity. Records nothing. Pair it with [`warm_up`] before the
+    /// signature is verified.
+    ///
+    /// [`warm_up`]: Self::warm_up
+    pub fn check_unseen(&self, u: &NonceUse<'_>, now: i64) -> Result<(), ReplayError> {
         let mut inner = self.lock();
         let now = inner.advance(now);
         self.fresh(u, now)?;

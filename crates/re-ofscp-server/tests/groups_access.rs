@@ -12,8 +12,6 @@ use common::groups::{
 };
 use common::harness::{new_key, send, signed_as};
 use re_ofscp_server::groups::AccessChange;
-use re_ofscp_server::signing::{Signer, StaticKeys};
-use re_ofscp_types::Authority;
 use serde_json::{Value, json};
 
 const TIERS: [&str; 4] = ["private", "group", "public", "discoverable"];
@@ -246,19 +244,14 @@ async fn a_remote_actor_is_never_the_local_account_of_the_same_handle() {
 }
 
 #[tokio::test]
-async fn a_provider_signature_reads_as_anonymous_and_cannot_act() {
+async fn a_provider_signature_is_never_an_anonymous_viewer() {
+    // §4.5 *Anonymous viewers*, §5.5, §8 *Authorization*
+    // (lost-conn/ofscp#42): a provider-signed request is a signed request,
+    // and no route accepts provider signatures, so a permitted provider
+    // gets 401 even where an unsigned request would be served.
     let provider_key = new_key();
-    let authority = Authority::parse_canonical("providerb.example").unwrap();
-    let keys = StaticKeys::default().with(
-        Signer::Provider(authority),
-        "pk_1",
-        provider_key.verifying_key(),
-    );
-    let env = env_with(EnvOptions {
-        remote: Some(keys),
-        ..Default::default()
-    })
-    .await;
+    // No resolver knows its key: it is never resolved (lost-conn/ofscp#42).
+    let env = env_with(EnvOptions::default()).await;
     let alice = local(&env, "alice").await;
     let open = id(&create_group(&env, &alice, group_body("Open", "public")).await);
     let closed = id(&create_group(&env, &alice, group_body("Closed", "group")).await);
@@ -274,27 +267,37 @@ async fn a_provider_signature_reads_as_anonymous_and_cannot_act() {
         )
     };
 
-    let (s, _, _, _) = send(
-        &env.app,
-        as_provider("GET", &format!("/api/groups/{open}"), ""),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK);
-    let (s, _, _, _) = send(
-        &env.app,
-        as_provider("GET", &format!("/api/groups/{closed}"), ""),
-    )
-    .await;
-    assert_eq!(s, StatusCode::FORBIDDEN);
+    for path in [
+        format!("/api/groups/{open}"),
+        format!("/api/groups/{open}/channels"),
+        format!("/api/groups/{closed}"),
+    ] {
+        let (s, p, _, _) = send(&env.app, as_provider("GET", &path, "")).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED, "{path}: {p}");
+        assert_eq!(p["errorCode"], "unauthorized");
+    }
+    // The same reads unsigned are an anonymous viewer's.
+    for path in [
+        format!("/api/groups/{open}"),
+        format!("/api/groups/{open}/channels"),
+    ] {
+        assert_eq!(call(&env, None, "GET", &path, None).await.0, StatusCode::OK);
+    }
+    assert_eq!(
+        call(&env, None, "GET", &format!("/api/groups/{closed}"), None)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
     let body = json!({"name": "x"}).to_string();
     let (s, p, _, _) = send(
         &env.app,
         as_provider("PATCH", &format!("/api/groups/{open}"), &body),
     )
     .await;
-    assert_eq!(s, StatusCode::FORBIDDEN, "{p}");
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "{p}");
     let (s, p, _, _) = send(&env.app, as_provider("POST", "/api/groups", &body)).await;
-    assert_eq!(s, StatusCode::FORBIDDEN, "{p}");
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "{p}");
 }
 
 /// The next change event (none may be pending but this one).

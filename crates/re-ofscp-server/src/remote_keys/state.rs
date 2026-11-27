@@ -170,12 +170,12 @@ impl Tables {
 
 #[cfg(test)]
 mod tests {
-    use re_ofscp_types::Authority;
+    use re_ofscp_types::Actor;
 
     use super::*;
 
     fn source(i: usize) -> Source {
-        Source::Provider(Authority::parse_canonical(&format!("p{i}.example")).unwrap())
+        Source::of(&Actor::parse_canonical(&format!("bob@p{i}.example")).unwrap())
     }
 
     #[test]
@@ -226,7 +226,7 @@ mod tests {
     }
 
     fn user(id: &str) -> Source {
-        Source::User(re_ofscp_types::Actor::parse_canonical(id).unwrap())
+        Source::of(&Actor::parse_canonical(id).unwrap())
     }
 
     #[test]
@@ -274,7 +274,7 @@ mod tests {
     #[test]
     fn the_cache_is_bounded_dropping_expired_then_the_largest_groups_oldest() {
         let mut t = Tables::with_cache_caps(4, 100, 100);
-        let sub = Source::Provider(Authority::parse_canonical("a.p1.example").unwrap());
+        let sub = Source::of(&Actor::parse_canonical("bob@a.p1.example").unwrap());
         // p0 expires at 50; p1.example holds two entries. The table is full.
         t.store(&source(0), keys(), Some(50), 0);
         t.store(&source(1), keys(), Some(1000), 1);

@@ -96,8 +96,22 @@ impl Client {
 
     /// Connect, or the HTTP status the upgrade was refused with.
     pub async fn try_connect(addr: SocketAddr, ip: &str) -> Result<Self, u16> {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-test-ip", ip.parse().unwrap());
+        Self::try_connect_with(addr, &headers).await
+    }
+
+    /// Connect sending `headers` on the upgrade request too (they replace
+    /// any the client would set, `Host` included), or the HTTP status the
+    /// upgrade was refused with.
+    pub async fn try_connect_with(
+        addr: SocketAddr,
+        headers: &axum::http::HeaderMap,
+    ) -> Result<Self, u16> {
         let mut req = format!("ws://{addr}/api/ws").into_client_request().unwrap();
-        req.headers_mut().insert("x-test-ip", ip.parse().unwrap());
+        for (name, value) in headers {
+            req.headers_mut().insert(name, value.clone());
+        }
         match tokio_tungstenite::connect_async(req).await {
             Ok((ws, _)) => Ok(Self { ws, next_id: 1 }),
             Err(tokio_tungstenite::tungstenite::Error::Http(res)) => Err(res.status().as_u16()),
@@ -262,6 +276,17 @@ impl Provider {
         config: WsConfig,
         build: impl FnOnce(AppStateBuilder) -> AppStateBuilder,
     ) -> Self {
+        Self::started_ago(301, allow_hosts, config, build).await
+    }
+
+    /// As [`Provider::start`], its replay store started `secs` before
+    /// `SIGNED_AT` (under 301: still in its restart warm-up, §4.5).
+    pub async fn started_ago(
+        secs: i64,
+        allow_hosts: Option<String>,
+        config: WsConfig,
+        build: impl FnOnce(AppStateBuilder) -> AppStateBuilder,
+    ) -> Self {
         let cfg = Config::from_lookup(|k| match k {
             "DOMAIN" => Some("providera.com".into()),
             "PROVIDER_SIGNING_KEY" => Some(super::PROVIDER_SIGNING_KEY.into()),
@@ -272,7 +297,7 @@ impl Provider {
             _ => None,
         })
         .unwrap();
-        let clock = SettableClock::at(SIGNED_AT - time::Duration::seconds(301));
+        let clock = SettableClock::at(SIGNED_AT - time::Duration::seconds(secs));
         let builder = AppState::builder(cfg)
             .ledger(Arc::new(NoLedger))
             .clock(clock.clone())

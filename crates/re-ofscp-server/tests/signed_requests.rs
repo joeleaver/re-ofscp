@@ -10,9 +10,8 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use common::harness::*;
 use ed25519_dalek::VerifyingKey;
-use re_ofscp_server::signing::{
-    KeyError, KeyFuture, KeyResolver, Requester, Resolved, Signer, StaticKeys,
-};
+use re_ofscp_server::signing::{KeyError, KeyFuture, KeyResolver, Requester, Resolved, StaticKeys};
+use re_ofscp_types::Actor;
 
 #[tokio::test]
 async fn spec_vector_request_authenticates_as_alice() {
@@ -181,7 +180,7 @@ impl RotatedKeys {
 impl KeyResolver for RotatedKeys {
     fn resolve<'a>(
         &'a self,
-        _signer: &'a Signer,
+        _actor: &'a Actor,
         _key_id: &'a str,
         fresh: bool,
         _requester: &'a Requester,
@@ -237,7 +236,7 @@ struct FailingKeys(KeyError);
 impl KeyResolver for FailingKeys {
     fn resolve<'a>(
         &'a self,
-        _signer: &'a Signer,
+        _actor: &'a Actor,
         _key_id: &'a str,
         _fresh: bool,
         _requester: &'a Requester,
@@ -308,7 +307,7 @@ struct RecordingKeys {
 impl KeyResolver for RecordingKeys {
     fn resolve<'a>(
         &'a self,
-        _signer: &'a Signer,
+        _actor: &'a Actor,
         _key_id: &'a str,
         _fresh: bool,
         requester: &'a Requester,

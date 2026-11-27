@@ -13,7 +13,12 @@
 //! A request with **no** signing headers passes through anonymously (public
 //! endpoints such as discovery). A request with **any** signing header must
 //! verify completely, or it is rejected; a half-signed request is never
-//! treated as anonymous.
+//! treated as anonymous. Nor is a provider-signed one: no route accepts
+//! provider signatures, so it is answered `403` (denied provider) or `401`
+//! on every route, discovery, the keys endpoint and the `/api/ws` upgrade
+//! included (§8 *Authorization*, lost-conn/ofscp#42). An unsigned upgrade
+//! passes through and authenticates inside the socket (§7.1); see
+//! docs/decisions/0021.
 
 pub mod canonical;
 pub mod keys;
@@ -178,21 +183,18 @@ impl<S: Send + Sync> FromRequestParts<S> for MaybeAuthenticated {
 }
 
 impl Authenticated {
-    /// The signing actor, if a user signed. Provider-signed requests get `403`.
-    pub fn actor(&self) -> Result<&Actor, Problem> {
-        match &self.0.signer {
-            Signer::Actor(a) => Ok(a),
-            Signer::Provider(_) => {
-                Err(Problem::forbidden().with_detail("this endpoint requires a user signature"))
-            }
-        }
+    /// The signing actor. Only actors are ever verified: a provider
+    /// signature was already answered `403` or `401` by the middleware
+    /// (lost-conn/ofscp#42).
+    pub fn actor(&self) -> &Actor {
+        &self.0.actor
     }
 
     /// The signing actor, required to be a local account of `home`. Remote
     /// actors are refused with `403` (§4.7, security requirement 1): a remote
     /// `alice@elsewhere` is never treated as local `alice`.
     pub fn local_actor(&self, home: &Authority) -> Result<&Actor, Problem> {
-        let actor = self.actor()?;
+        let actor = self.actor();
         if actor.is_local_to(home) {
             Ok(actor)
         } else {

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
+use re_ofscp_types::Actor;
 use re_ofscp_types::profile::Visibility;
-use re_ofscp_types::{Actor, Authority};
 
 use super::seams::RelFuture;
 use super::*;
@@ -111,24 +111,18 @@ async fn the_subject_always_sees_their_own_data() {
 #[tokio::test]
 async fn tiers_without_lists() {
     let anon = Viewer::Anonymous;
-    let provider = Viewer::Provider(Authority::parse_canonical("b.com").unwrap());
     let user = Viewer::Actor(remote_bob());
     let r = none();
-    // (tier, anonymous, provider, an unrelated user)
+    // (tier, anonymous, an unrelated user)
     let table = [
-        (Visibility::Public, true, true, true),
-        (Visibility::Authenticated, false, false, true),
-        (Visibility::SharedGroups, false, false, false),
-        (Visibility::Contacts, false, false, false),
-        (Visibility::Nobody, false, false, false),
+        (Visibility::Public, true, true),
+        (Visibility::Authenticated, false, true),
+        (Visibility::SharedGroups, false, false),
+        (Visibility::Contacts, false, false),
+        (Visibility::Nobody, false, false),
     ];
-    for (v, a, p, u) in table {
+    for (v, a, u) in table {
         assert_eq!(admits(v, &[], &[], &anon, &r).await, a, "{v:?} anonymous");
-        assert_eq!(
-            admits(v, &[], &[], &provider, &r).await,
-            p,
-            "{v:?} provider"
-        );
         assert_eq!(admits(v, &[], &[], &user, &r).await, u, "{v:?} user");
     }
 }
@@ -184,13 +178,18 @@ async fn lists_match_the_full_actor_never_the_bare_handle() {
 }
 
 #[tokio::test]
-async fn lists_never_apply_to_anonymous_or_provider_viewers() {
+async fn lists_never_apply_to_anonymous_viewers() {
     let r = none();
-    let provider = Viewer::Provider(Authority::parse_canonical("b.com").unwrap());
-    // A provider is not a user: allow-listing a user on its domain admits
-    // nothing, and the deny list does not hide `public` data from it.
-    assert!(!admits(Visibility::Nobody, &[remote_bob()], &[], &provider, &r).await);
-    assert!(admits(Visibility::Public, &[], &[remote_bob()], &provider, &r).await);
+    assert!(
+        !admits(
+            Visibility::Nobody,
+            &[remote_bob()],
+            &[],
+            &Viewer::Anonymous,
+            &r
+        )
+        .await
+    );
     assert!(
         admits(
             Visibility::Public,

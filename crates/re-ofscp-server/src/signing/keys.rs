@@ -1,6 +1,8 @@
-//! Key resolution for the verifier (spec §4.5 step 6, §4.6, §8.1).
+//! Key resolution for the verifier (spec §4.5 step 6, §4.6). Only actors'
+//! keys are ever resolved: no route accepts provider signatures
+//! (lost-conn/ofscp#42, docs/decisions/0021).
 //!
-//! A [`KeyResolver`] finds the active public key a signer uses under a key
+//! A [`KeyResolver`] finds the active public key an actor uses under a key
 //! id, and says whether its answer came from a cache. The verifier needs
 //! that to apply the §4.6 re-fetch rule (lost-conn/ofscp#19): when a cached
 //! answer has no matching key, or the key does not verify the signature, it
@@ -12,7 +14,7 @@ use std::pin::Pin;
 
 use ed25519_dalek::VerifyingKey;
 
-use super::verify::Signer;
+use re_ofscp_types::Actor;
 
 /// How long an answer may be relied on. Single requests ignore it; a
 /// long-lived connection authenticated with the key keeps it, and must
@@ -162,26 +164,26 @@ impl Requester {
 /// Boxed future returned by [`KeyResolver::resolve`].
 pub type KeyFuture<'a> = Pin<Box<dyn Future<Output = Result<Resolved, KeyError>> + Send + 'a>>;
 
-/// Finds the active (non-revoked) public key a signer uses under a key id.
+/// Finds the active (non-revoked) public key an actor uses under a key id.
 ///
 /// `fresh = false` may answer from cache. The verifier calls again with
 /// `fresh = true` only when a *cached* answer had no such key or its key
-/// did not verify the signature, so rotated keys are picked up (§4.6,
-/// §8.1). That happens on failed signatures, forgeries included, so an
+/// did not verify the signature, so rotated keys are picked up (§4.6).
+/// That happens on failed signatures, forgeries included, so an
 /// implementation that fetches remotely **must** rate-limit fresh lookups
 /// (§8 "Outbound requests"); otherwise a stream of forged requests becomes
 /// a stream of outbound fetches. It also charges fetches to `requester`.
 pub trait KeyResolver: Send + Sync {
-    /// Resolve `key_id` for `signer`, on behalf of `requester`.
+    /// Resolve `key_id` for `actor`, on behalf of `requester`.
     fn resolve<'a>(
         &'a self,
-        signer: &'a Signer,
+        actor: &'a Actor,
         key_id: &'a str,
         fresh: bool,
         requester: &'a Requester,
     ) -> KeyFuture<'a>;
 
-    /// Re-confirm that `signer` still publishes `key` under `key_id`, for a
+    /// Re-confirm that `actor` still publishes `key` under `key_id`, for a
     /// live connection that has relied on it for `held` (§7.1). A resolver
     /// that fetches remotely should fetch unless a fetch completed since
     /// `held` began would answer, and charge it like an expiry re-fetch,
@@ -191,14 +193,14 @@ pub trait KeyResolver: Send + Sync {
     /// answer read from the authoritative source.
     fn reconfirm<'a>(
         &'a self,
-        signer: &'a Signer,
+        actor: &'a Actor,
         key_id: &'a str,
         key: &'a VerifyingKey,
         _held: Lifetime,
         requester: &'a Requester,
     ) -> ReconfirmFuture<'a> {
         Box::pin(async move {
-            match self.resolve(signer, key_id, true, requester).await {
+            match self.resolve(actor, key_id, true, requester).await {
                 Ok(r) if r.from_cache => {
                     Reconfirmed::Unconfirmed("only a cached answer was available".to_owned())
                 }
@@ -227,14 +229,14 @@ pub fn classify(
 /// answers are authoritative: there is nothing to re-fetch.
 #[derive(Debug, Default, Clone)]
 pub struct StaticKeys {
-    keys: Vec<(Signer, String, VerifyingKey)>,
+    keys: Vec<(Actor, String, VerifyingKey)>,
 }
 
 impl StaticKeys {
     /// Add a key.
     #[must_use]
-    pub fn with(mut self, signer: Signer, key_id: &str, key: VerifyingKey) -> Self {
-        self.keys.push((signer, key_id.to_owned(), key));
+    pub fn with(mut self, actor: Actor, key_id: &str, key: VerifyingKey) -> Self {
+        self.keys.push((actor, key_id.to_owned(), key));
         self
     }
 }
@@ -242,7 +244,7 @@ impl StaticKeys {
 impl KeyResolver for StaticKeys {
     fn resolve<'a>(
         &'a self,
-        signer: &'a Signer,
+        actor: &'a Actor,
         key_id: &'a str,
         _fresh: bool,
         _requester: &'a Requester,
@@ -250,7 +252,7 @@ impl KeyResolver for StaticKeys {
         let found = self
             .keys
             .iter()
-            .find(|(s, k, _)| s == signer && k == key_id)
+            .find(|(a, k, _)| a == actor && k == key_id)
             .map(|(_, _, key)| *key);
         Box::pin(async move { Ok(Resolved::authoritative(found)) })
     }

@@ -6,9 +6,7 @@ use std::sync::Arc;
 use ed25519_dalek::VerifyingKey;
 use re_ofscp_server::outbound::OutboundClient;
 use re_ofscp_server::remote_keys::RemoteKeys;
-use re_ofscp_server::signing::{
-    KeyError, KeyResolver, Lifetime, Reconfirmed, Requester, Resolved, Signer,
-};
+use re_ofscp_server::signing::{KeyError, KeyResolver, Lifetime, Reconfirmed, Requester, Resolved};
 use re_ofscp_server::timefmt::rfc3339;
 use re_ofscp_types::Actor;
 
@@ -38,12 +36,8 @@ impl Setup {
         format!("{handle}@{}", self.peer.authority())
     }
 
-    pub fn actor(&self, handle: &str) -> Signer {
-        Signer::Actor(Actor::parse_canonical(&self.actor_id(handle)).unwrap())
-    }
-
-    pub fn provider(&self) -> Signer {
-        Signer::Provider(self.peer.authority())
+    pub fn actor(&self, handle: &str) -> Actor {
+        Actor::parse_canonical(&self.actor_id(handle)).unwrap()
     }
 
     /// Unix seconds now, on the test clock.
@@ -69,7 +63,7 @@ impl Setup {
 
     pub async fn resolve(
         &self,
-        signer: &Signer,
+        signer: &Actor,
         key_id: &str,
         fresh: bool,
     ) -> Result<Resolved, KeyError> {
@@ -82,7 +76,7 @@ impl Setup {
     pub async fn resolve_as(
         &self,
         requester: &Requester,
-        signer: &Signer,
+        signer: &Actor,
         key_id: &str,
         fresh: bool,
     ) -> Result<Resolved, KeyError> {
@@ -95,7 +89,7 @@ impl Setup {
     /// Resolve for [`client`], keeping the answer's lifetime.
     pub async fn resolve_with_lifetime(
         &self,
-        signer: &Signer,
+        signer: &Actor,
         key_id: &str,
         fresh: bool,
     ) -> Result<Resolved, KeyError> {
@@ -105,7 +99,7 @@ impl Setup {
     /// Re-confirm `key` for a connection holding it for `held`.
     pub async fn reconfirm(
         &self,
-        signer: &Signer,
+        signer: &Actor,
         key_id: &str,
         key: &VerifyingKey,
         held: Lifetime,

@@ -3,6 +3,10 @@
 - **Status:** accepted
 - **Date:** 2026-11-25; revised 2026-11-25 (target groups by the PSL's
   ICANN section only; a per-/48 client tier)
+- **Superseded in part by 0021:** provider discovery keys are no longer
+  fetched or parsed. No route accepts provider signatures
+  (lost-conn/ofscp#42), so only actor user-key fetches remain, and the
+  provider budgets below are gone.
 
 ## Context
 

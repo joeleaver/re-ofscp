@@ -1,8 +1,9 @@
-//! Resolving remote signers' keys (spec §4.6, §8.1; docs/decisions/0006).
+//! Resolving remote actors' keys (spec §4.6; docs/decisions/0006).
 //!
-//! A remote actor's keys come from its provider's user keys endpoint, a
-//! remote provider's from its discovery document, both fetched through the
-//! SSRF-safe [`OutboundClient`]. How a fetch's outcome maps to the
+//! A remote actor's keys come from its provider's user keys endpoint,
+//! fetched through the SSRF-safe [`OutboundClient`]. A provider's discovery
+//! keys are never fetched: no route accepts provider signatures
+//! (lost-conn/ofscp#42, docs/decisions/0021). How a fetch's outcome maps to the
 //! verifier's answer follows lost-conn/ofscp#19 and #20:
 //!
 //! * a completed fetch (valid `200`, or a user-keys `404`) is authoritative;
@@ -35,6 +36,7 @@ mod state;
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use re_ofscp_types::Actor;
 use tokio::sync::watch;
 
 use self::budget::{Budgets, Standing};
@@ -44,7 +46,7 @@ use crate::federation::{Decision, UNKNOWN_RETRY_SECS};
 use crate::outbound::{OutboundClient, OutboundError, Reservation};
 use crate::registrable::has_unknown_suffix;
 use crate::signing::{
-    Clock, KeyError, KeyFuture, KeyResolver, Lifetime, ReconfirmFuture, Requester, Resolved, Signer,
+    Clock, KeyError, KeyFuture, KeyResolver, Lifetime, ReconfirmFuture, Requester, Resolved,
 };
 
 pub use self::budget::{CLIENT_BURST, CLIENT_PER_MINUTE, DOMAIN_BURST, DOMAIN_PER_MINUTE};
@@ -108,13 +110,13 @@ impl RemoteKeys {
 impl KeyResolver for RemoteKeys {
     fn resolve<'a>(
         &'a self,
-        signer: &'a Signer,
+        actor: &'a Actor,
         key_id: &'a str,
         fresh: bool,
         requester: &'a Requester,
     ) -> KeyFuture<'a> {
         Box::pin(async move {
-            let source = Source::of(signer);
+            let source = Source::of(actor);
             match self.inner.plan(&source, key_id, fresh, requester) {
                 Plan::Answer(answer) => answer,
                 Plan::Wait(flight) => {
@@ -128,7 +130,7 @@ impl KeyResolver for RemoteKeys {
 
     fn reconfirm<'a>(
         &'a self,
-        signer: &'a Signer,
+        actor: &'a Actor,
         key_id: &'a str,
         key: &'a ed25519_dalek::VerifyingKey,
         held: Lifetime,
@@ -136,7 +138,7 @@ impl KeyResolver for RemoteKeys {
     ) -> ReconfirmFuture<'a> {
         Box::pin(
             self.inner
-                .reconfirm(Source::of(signer), key_id, key, held, requester),
+                .reconfirm(Source::of(actor), key_id, key, held, requester),
         )
     }
 }

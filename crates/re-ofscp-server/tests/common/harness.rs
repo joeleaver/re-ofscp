@@ -17,7 +17,7 @@ use re_ofscp_server::problem::{self, ProblemBase};
 use re_ofscp_server::replay::{NoLedger, ReplayLimits, ReplayStore};
 use re_ofscp_server::signing::canonical::{CanonicalRequest, content_digest, sign};
 use re_ofscp_server::signing::{
-    Authenticated, Clock, KeyResolver, SignatureLayer, Signer, StaticKeys, Verifier, authenticate,
+    Authenticated, Clock, KeyResolver, SignatureLayer, StaticKeys, Verifier, authenticate,
 };
 use re_ofscp_types::{Actor, Authority};
 use time::OffsetDateTime;
@@ -77,17 +77,7 @@ pub fn key() -> SigningKey {
 }
 
 pub fn alice_keys() -> StaticKeys {
-    StaticKeys::default()
-        .with(
-            Signer::Actor(alice()),
-            "dk_abc123xyz",
-            key().verifying_key(),
-        )
-        .with(
-            Signer::Provider(provider_a()),
-            "dk_abc123xyz",
-            key().verifying_key(),
-        )
+    StaticKeys::default().with(alice(), "dk_abc123xyz", key().verifying_key())
 }
 
 pub struct Harness {
@@ -149,10 +139,7 @@ pub fn harness_policy(
         .route(
             PATH,
             post(|auth: Authenticated| async move {
-                match auth.0.signer {
-                    Signer::Actor(a) => format!("actor {a} {}", auth.0.key_id),
-                    Signer::Provider(p) => format!("provider {p} {}", auth.0.key_id),
-                }
+                format!("actor {} {}", auth.0.actor, auth.0.key_id)
             }),
         )
         .layer(middleware::from_fn_with_state(

@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use common::harness::new_key;
 use common::key_setup::{Setup, cached, client, fetched, nth_client, unavailable};
-use common::remote_peer::{DISCOVERY_PATH, Reply, discovery_doc, keys_doc, keys_path};
-use re_ofscp_server::signing::{KeyResolver, Lifetime, Requester, Signer};
+use common::remote_peer::{Reply, keys_doc, keys_path};
+use re_ofscp_server::signing::{KeyResolver, Lifetime, Requester};
 use re_ofscp_server::timefmt::rfc3339;
 use re_ofscp_types::Actor;
 
@@ -69,8 +69,7 @@ async fn another_port_of_the_host_shares_its_bucket() {
     // bucket before anything is fetched (otherwise our outbound rules would
     // refuse its loopback address: 401).
     let other_port = s.peer.port.wrapping_add(1).max(1);
-    let elsewhere =
-        Signer::Actor(Actor::parse_canonical(&format!("xxx@localhost:{other_port}")).unwrap());
+    let elsewhere = Actor::parse_canonical(&format!("xxx@localhost:{other_port}")).unwrap();
     assert_eq!(
         unavailable(
             s.resolve_as(&nth_client(99), &elsewhere, "dk_1", false)
@@ -79,30 +78,6 @@ async fn another_port_of_the_host_shares_its_bucket() {
         2
     );
     assert_eq!(s.peer.total_hits(), 20);
-}
-
-#[tokio::test]
-async fn discovery_works_while_the_user_keys_bucket_is_empty() {
-    let s = Setup::new().await;
-    drain_user_keys_bucket(&s).await;
-    assert_eq!(
-        unavailable(
-            s.resolve_as(&nth_client(99), &s.actor("bob"), "dk_1", false)
-                .await
-        ),
-        2
-    );
-    let k = new_key().verifying_key();
-    let authority = s.peer.authority().to_string();
-    s.peer.set(
-        DISCOVERY_PATH,
-        Reply::json(200, &discovery_doc(&authority, &[("pk_1", k)])),
-    );
-    assert_eq!(
-        s.resolve_as(&nth_client(99), &s.provider(), "pk_1", false)
-            .await,
-        fetched(Some(k))
-    );
 }
 
 #[tokio::test]
@@ -193,7 +168,7 @@ async fn joining_a_fetch_under_way_is_free() {
 
 /// Each `(client, signer)` looks `signer` up for `key_id`; the answers do
 /// not matter.
-async fn spam(s: &Setup, lookups: Vec<(Requester, Signer)>, key_id: &str, fresh: bool) {
+async fn spam(s: &Setup, lookups: Vec<(Requester, Actor)>, key_id: &str, fresh: bool) {
     for (spammer, signer) in lookups {
         let _ = s.resolve_as(&spammer, &signer, key_id, fresh).await;
     }

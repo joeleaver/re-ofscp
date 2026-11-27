@@ -19,8 +19,6 @@ use common::invites::{
 use common::members::{group_with_policy, join_http, leave, roster, set_role};
 use common::{assert_valid, schema};
 use re_ofscp_server::groups::invites::MAX_INVITES_PER_GROUP;
-use re_ofscp_server::signing::{Signer, StaticKeys};
-use re_ofscp_types::Authority;
 use serde_json::{Value, json};
 
 async fn group(env: &Env, owner: &Party, tier: &str, policy: &str) -> String {
@@ -549,17 +547,8 @@ async fn a_group_holds_a_bounded_number_of_invites() {
 #[tokio::test]
 async fn tokens_and_signatures_are_checked() {
     let provider_key = new_key();
-    let authority = Authority::parse_canonical("providerb.example").unwrap();
-    let keys = StaticKeys::default().with(
-        Signer::Provider(authority),
-        "pk_1",
-        provider_key.verifying_key(),
-    );
-    let env = env_with(EnvOptions {
-        remote: Some(keys),
-        ..Default::default()
-    })
-    .await;
+    // No resolver knows its key: it is never resolved (lost-conn/ofscp#42).
+    let env = env_with(EnvOptions::default()).await;
     let alice = local(&env, "alice").await;
     let bob = local(&env, "bob").await;
     let g = group(&env, &alice, "private", "invite").await;
@@ -597,7 +586,11 @@ async fn tokens_and_signatures_are_checked() {
             NOW,
         );
         let (s, _, _, _) = send(&env.app, req).await;
-        assert_eq!(s, StatusCode::FORBIDDEN, "provider-signed {method} {path}");
+        assert_eq!(
+            s,
+            StatusCode::UNAUTHORIZED,
+            "provider-signed {method} {path}"
+        );
     }
     assert!(
         !roster(&env, &alice, &g)

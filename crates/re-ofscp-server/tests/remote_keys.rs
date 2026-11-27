@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use common::harness::new_key;
 use common::key_setup::{Setup, cached, client, fetched, unavailable};
-use common::remote_peer::{DISCOVERY_PATH, RemotePeer, Reply, discovery_doc, keys_doc, keys_path};
-use re_ofscp_server::signing::{KeyError, KeyResolver, Lifetime, Signer};
+use common::remote_peer::{RemotePeer, Reply, keys_doc, keys_path};
+use re_ofscp_server::signing::{KeyError, KeyResolver, Lifetime};
 use re_ofscp_server::timefmt::rfc3339;
 use re_ofscp_types::Actor;
 use serde_json::json;
@@ -102,79 +102,6 @@ async fn every_other_answer_is_a_fetch_failure() {
             5,
             "{what}"
         );
-    }
-}
-
-#[tokio::test]
-async fn discovery_supplies_provider_keys() {
-    let s = Setup::new().await;
-    let k = new_key().verifying_key();
-    let authority = s.peer.authority().to_string();
-    s.peer.set(
-        DISCOVERY_PATH,
-        Reply::json(200, &discovery_doc(&authority, &[("pk_1", k)]))
-            .header("cache-control", "max-age=120"),
-    );
-    let provider = s.provider();
-    assert_eq!(s.resolve(&provider, "pk_1", false).await, fetched(Some(k)));
-    s.advance(119);
-    assert_eq!(s.resolve(&provider, "pk_1", false).await, cached(Some(k)));
-    s.advance(1);
-    assert_eq!(
-        s.resolve(&provider, "pk_1", false).await,
-        fetched(Some(k)),
-        "max-age passed"
-    );
-    assert_eq!(s.peer.hits(DISCOVERY_PATH), 2);
-}
-
-#[tokio::test]
-async fn discovery_failures() {
-    let s = Setup::new().await;
-    let k = new_key().verifying_key();
-    let provider = s.provider();
-    for (what, reply) in [
-        // §8.1: for discovery even a 404 is a fetch failure.
-        ("404", Reply::new(404, "")),
-        (
-            "domain mismatch",
-            Reply::json(200, &discovery_doc("other.example", &[("pk_1", k)])),
-        ),
-        (
-            "no port",
-            Reply::json(200, &discovery_doc("localhost", &[("pk_1", k)])),
-        ),
-        ("500", Reply::new(500, "")),
-    ] {
-        s.peer.set(DISCOVERY_PATH, reply);
-        s.advance(61);
-        assert_eq!(
-            unavailable(s.resolve(&provider, "pk_1", false).await),
-            5,
-            "{what}"
-        );
-    }
-}
-
-#[tokio::test]
-async fn discovery_no_store_is_not_cached() {
-    let s = Setup::new().await;
-    let k = new_key().verifying_key();
-    let doc = discovery_doc(&s.peer.authority().to_string(), &[("pk_1", k)]);
-    for header in ["no-store", "no-cache", "max-age=0"] {
-        s.peer.set(
-            DISCOVERY_PATH,
-            Reply::json(200, &doc).header("cache-control", header),
-        );
-        let before = s.peer.hits(DISCOVERY_PATH);
-        for _ in 0..2 {
-            assert_eq!(
-                s.resolve(&s.provider(), "pk_1", false).await,
-                fetched(Some(k)),
-                "{header}"
-            );
-        }
-        assert_eq!(s.peer.hits(DISCOVERY_PATH), before + 2, "{header}");
     }
 }
 
@@ -373,8 +300,7 @@ async fn an_outbound_refusal_is_401() {
     s.serve_keys("alice", &[("dk_1", new_key().verifying_key())], 600);
     for signer in [
         s.actor("alice"),
-        Signer::Actor(Actor::parse_canonical(&format!("alice@{ip}")).unwrap()),
-        Signer::Provider(ip.clone()),
+        Actor::parse_canonical(&format!("alice@{ip}")).unwrap(),
     ] {
         for fresh in [false, true] {
             assert!(
