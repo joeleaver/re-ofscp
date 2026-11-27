@@ -155,6 +155,35 @@ async fn federation_policy_refuses_before_fetching_and_closes_live_connections()
 }
 
 #[tokio::test]
+async fn during_the_warm_up_a_denied_actor_is_refused_as_forbidden() {
+    // The handshake is exempt from the restart warm-up (§4.5 *Restarts*),
+    // so a denied actor's provider is judged by the §8 policy at once:
+    // `forbidden`, with no key fetched, as when warm.
+    let peer = RemotePeer::start().await;
+    let client = peer.allowed_client();
+    let provider =
+        Provider::started_ago(0, None, fast_config(), |b| b.outbound(Arc::new(client))).await;
+    assert!(provider.state.verifier.replay_store().warming_up());
+    let r = Remote {
+        peer,
+        provider,
+        key: new_key(),
+    };
+    r.serve(true, 600);
+    r.provider
+        .state
+        .federation
+        .policy()
+        .install(denying(&r.peer.authority()));
+    let mut c = r.connect().await;
+    r.answer(&mut c).await;
+    let (code, events) = c.closed().await;
+    assert_eq!(code, 4001);
+    assert_eq!(events[0]["data"]["code"], "forbidden");
+    assert_eq!(r.peer.total_hits(), 0, "no fetch for a denied provider");
+}
+
+#[tokio::test]
 async fn a_key_dropped_by_its_provider_closes_4003() {
     let r = Remote::start().await;
     r.serve(true, 30);

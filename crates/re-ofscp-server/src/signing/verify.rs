@@ -351,13 +351,16 @@ impl Verifier {
         //
         // Only an actor's nonce is checked. A provider signature is never
         // verified, so its nonce is never recorded and the check could find
-        // nothing; nor does the restart warm-up apply to it: its `403` or
-        // `401` is answered during the warm-up too (§4.5 *Restarts*,
-        // lost-conn/ofscp#42).
+        // nothing (lost-conn/ofscp#42).
+        //
+        // The restart warm-up is not applied here but in `complete`, after
+        // the §8 deny check: the warm-up `503` is only for a request whose
+        // signature will be verified, and a denied actor's `403` is
+        // answered during the warm-up too (§4.5 *Restarts*).
         if let Signer::Actor(actor) = &h.signer {
             let entry = ActorNonce::new(actor, h.key_id, h.nonce, signed_at);
             self.replay
-                .check(Surface::SignedRequest, &entry.nonce_use(), now)
+                .check_unseen(&entry.nonce_use(), now)
                 .map_err(replay_error)?;
         }
         Ok(Precheck {
@@ -375,7 +378,9 @@ impl Verifier {
     /// `pre` came from; remote key fetches are charged to `requester`, the
     /// client that sent it. A provider signer stops after step 5 and the
     /// federation policy: `403` if its provider is denied, otherwise `401`
-    /// (§8 *Authorization*, lost-conn/ofscp#42).
+    /// (§8 *Authorization*, lost-conn/ofscp#42). An actor signer is judged
+    /// by the policy next, then by the restart warm-up, and only then is
+    /// its key resolved (§4.5 *Restarts*).
     pub async fn complete(
         &self,
         pre: Precheck,
@@ -391,6 +396,13 @@ impl Verifier {
         let actor = match pre.signer {
             Signer::Actor(actor) => {
                 self.check_policy(actor.domain())?;
+                // The policy permits it, so the signature will be verified:
+                // now the restart warm-up applies (§4.5 *Restarts*), before
+                // any key is fetched.
+                let entry = ActorNonce::new(&actor, &pre.key_id, &pre.nonce, pre.signed_at);
+                self.replay
+                    .warm_up(Surface::SignedRequest, &entry.nonce_use(), self.now())
+                    .map_err(replay_error)?;
                 actor
             }
             // The policy check sits where §8.1 step 2 would begin, and §8.1

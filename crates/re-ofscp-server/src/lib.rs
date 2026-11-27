@@ -596,6 +596,14 @@ pub fn router(state: AppState) -> Router {
         .route(discovery::PATH, get(discovery::get))
         .route("/problems/{code}", get(problem::describe))
         .merge(messages::routes::router())
+        // The upgrade is normally unsigned, and the `authenticate` handshake
+        // inside the socket authenticates (§7.1). It sits inside the
+        // signature layer all the same: an upgrade that carries `X-OFSCP-*`
+        // headers is a signed request on a route of this specification, so
+        // it must verify like any other, and a provider-signed one gets
+        // `403`/`401` instead of a socket (§4.5, §8 *Authorization*;
+        // docs/decisions/0021).
+        .route(ws::PATH, get(ws::upgrade))
         .fallback(|| async { Problem::not_found() })
         .method_not_allowed_fallback(|| async { Problem::method_not_allowed() })
         .layer(middleware::from_fn_with_state(
@@ -609,9 +617,6 @@ pub fn router(state: AppState) -> Router {
         // requests are authenticated by the admin session, never by OFSCP
         // signatures (docs/decisions/0005).
         .merge(admin::routes::router())
-        // Unsigned upgrade: the handshake inside the socket authenticates
-        // (§7.1).
-        .route(ws::PATH, get(ws::upgrade))
         .layer(middleware::map_response_with_state(
             ProblemBase::new(&state.config.domain),
             problem::render,

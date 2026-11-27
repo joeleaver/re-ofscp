@@ -28,15 +28,81 @@ use re_ofscp_types::federation::{FederationMode, RuleList, RuleScope};
 
 const TIMESTAMP: &str = "2026-01-01T12:00:00Z";
 
+#[tokio::test]
+async fn during_the_warm_up_a_denied_actor_still_gets_403() {
+    // The §8 deny check comes before the warm-up `503`: a denied actor's
+    // signature is never verified, so it gets its `403` during the warm-up
+    // too, with no key fetched and no nonce recorded (§4.5 *Restarts*).
+    let key = new_key();
+    let peer = peer_publishing(&key).await;
+    let (app, state) = production(&peer, deny(&peer), 0);
+    let actor = format!("alice@{}", peer.authority());
+    for (method, path, body) in ROUTES {
+        let req = signed_as(
+            &key,
+            ("x-ofscp-actor", &actor),
+            "dk_1",
+            method,
+            path,
+            body,
+            TIMESTAMP,
+        );
+        let (status, json, _, retry) = send(&app, req).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}: {json}");
+        assert_eq!(json["errorCode"], "forbidden", "{method} {path}");
+        assert_eq!(retry, None, "{method} {path}");
+    }
+    // A bad digest is still answered first (§8 *Authorization*: "a digest
+    // `400` from those steps wins").
+    let mut tampered = signed_as(
+        &key,
+        ("x-ofscp-actor", &actor),
+        "dk_1",
+        "POST",
+        "/api/groups",
+        "{}",
+        TIMESTAMP,
+    );
+    *tampered.body_mut() = axum::body::Body::from(r#"{"name":"x"}"#);
+    assert_eq!(send(&app, tampered).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(peer.total_hits(), 0, "no key fetch");
+    let now = SIGNED_AT.unix_timestamp();
+    assert!(state.verifier.replay_store().is_empty(now), "no nonce");
+}
+
+#[tokio::test]
+async fn a_provider_signed_websocket_upgrade_is_refused_before_upgrading() {
+    // `/api/ws` is a route of this specification, and an upgrade carrying
+    // `X-OFSCP-Provider` is a signed request (§4.5), so it gets `401` (or
+    // `403`) like every other route instead of a socket (§8 *Authorization*;
+    // docs/decisions/0021).
+    let key = new_key();
+    let peer = peer_publishing(&key).await;
+    for (policy, status) in [
+        (Arc::new(FederationPolicy::open()), 401),
+        (deny(&peer), 403),
+    ] {
+        let (app, state) = production(&peer, policy, 301);
+        let addr = common::ws::serve(app).await;
+        let signed = from_provider(&key, &peer, "GET", "/api/ws", "");
+        let refused = common::ws::Client::try_connect_with(addr, signed.headers()).await;
+        assert_eq!(refused.err(), Some(status));
+        let now = SIGNED_AT.unix_timestamp();
+        assert!(state.verifier.replay_store().is_empty(now), "no nonce");
+    }
+    assert_eq!(peer.total_hits(), 0, "no discovery or key fetch");
+}
+
 /// One route of each kind: (method, path, body). A signed-only route, an
-/// anonymous-reader route (§5.5 GET group), discovery (§3.1) and the keys
-/// endpoint (§4.6).
-const ROUTES: [(&str, &str, &str); 5] = [
+/// anonymous-reader route (§5.5 GET group), discovery (§3.1), the keys
+/// endpoint (§4.6) and the WebSocket upgrade (§7.1).
+const ROUTES: [(&str, &str, &str); 6] = [
     ("POST", "/api/groups", r#"{"name":"g"}"#),
     ("GET", "/api/me", ""),
     ("GET", "/api/groups/g_1", ""),
     ("GET", "/.well-known/ofscp-provider", ""),
     ("GET", "/.well-known/ofscp/users/alice/keys", ""),
+    ("GET", "/api/ws", ""),
 ];
 
 /// The production router for `providera.com`, with `peer` reachable (as

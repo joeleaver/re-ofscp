@@ -30,8 +30,8 @@ and attack surface.
 ## Decision
 
 A provider-signed request is answered as follows, on every OFSCP route
-(discovery, user keys and `/problems/*` included, since the signature
-middleware covers them all):
+(discovery, user keys, `/problems/*` and the `/api/ws` upgrade included,
+since the signature middleware covers them all):
 
 1. **§4.5 steps 1–5 run first.** A missing or malformed header, a stale
    timestamp, or a bad digest gets the answer it always got (`401`/`400`).
@@ -46,6 +46,50 @@ middleware covers them all):
 4. **Otherwise `401 unauthorized`**, detail "this route does not accept
    provider signatures" (`VerifyError::ProviderSignature`). No discovery
    fetch, no signature check, no nonce recorded.
+
+### The restart warm-up comes after the deny check for actors too
+
+§4.5 *Restarts* exempts every request "answered without verification",
+naming "`403` for a denied signer". An actor signer whose provider the
+policy denies is such a request, so the warm-up `503` must not reach it.
+The HTTP verifier therefore splits step 4: `precheck` runs the replay
+store's `check_unseen` (freshness, replay, quotas and capacity, no
+warm-up), and `complete` applies the warm-up gate (`ReplayStore::warm_up`)
+only after the digest (step 5) and the §8 deny check, just before the key
+is resolved. A denied actor gets `403` during the warm-up, with no key
+fetched and no nonce recorded; a bad digest still gets its `400` first
+(§8 *Authorization*: "a digest `400` from those steps wins"). Only a
+request whose signature will be verified meets the `503`.
+
+The WebSocket `authenticate` handshake needs no reordering: §4.5
+*Restarts* exempts it from the warm-up altogether, so its §8 deny check
+(`ws_complete`, before any key fetch) answers `forbidden` during the
+warm-up as at any other time.
+
+### The WebSocket upgrade is a route like any other
+
+The `/api/ws` upgrade used to sit outside the signature middleware, so an
+upgrade carrying `X-OFSCP-Provider` was upgraded instead of refused. §7.1
+says the handshake "is **not** signed", which describes the protocol (a
+browser cannot set the headers), not an exemption for an upgrade that
+does carry them. The spec is explicit that such a request is in scope:
+
+- §4.5 *Anonymous viewers*: "A request that carries **any** `X-OFSCP-*`
+  signature header is a signed request, and the checks above apply to it".
+- §8 *Authorization*: the inbound policy "applies to every **signed**
+  request, on every route", and "No route of this specification accepts
+  provider-signed requests, so this applies on every route". `/api/ws` is
+  a route of this specification (§7.1).
+- "Over WebSocket, the same check applies to the `authenticate` actor"
+  adds the in-socket check; it does not take the upgrade request out of
+  "every route".
+
+So the upgrade route now sits inside the signature middleware. An
+unsigned upgrade passes through untouched and authenticates inside the
+socket as before. A provider-signed upgrade gets `403` (denied) or `401`
+before any socket is opened; an actor-signed one must verify like any
+signed `GET` (a successful verification records its nonce and the socket
+then runs the ordinary `authenticate` handshake).
 
 A provider signature is never an anonymous viewer: a public read that
 would serve an unsigned request still gets `401` when provider-signed

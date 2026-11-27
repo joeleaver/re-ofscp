@@ -15,8 +15,10 @@
 //! verify completely, or it is rejected; a half-signed request is never
 //! treated as anonymous. Nor is a provider-signed one: no route accepts
 //! provider signatures, so it is answered `403` (denied provider) or `401`
-//! on every route, discovery and the keys endpoint included (§8
-//! *Authorization*, lost-conn/ofscp#42).
+//! on every route, discovery, the keys endpoint and the `/api/ws` upgrade
+//! included (§8 *Authorization*, lost-conn/ofscp#42). An unsigned upgrade
+//! passes through and authenticates inside the socket (§7.1); see
+//! docs/decisions/0021.
 
 pub mod canonical;
 pub mod keys;
