@@ -7,10 +7,12 @@
 //! look below it. So a feed is read whole by one query bounded by
 //! [`FEED_CAP`] rows (rhypedb has no ordering or counting), and sorted here.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use serde::Deserialize;
 
+use crate::db::lookup::lookup;
 use crate::db::{Db, DbError, Ql};
 use crate::messages::locks::ChannelLocks;
 
@@ -81,6 +83,17 @@ pub struct NewEntry<'a> {
 #[derive(Deserialize)]
 struct FeedRow {
     last_n: i64,
+}
+
+#[derive(Deserialize)]
+struct OwnerRow {
+    owner: String,
+}
+
+/// An entry's `@unique` `source_key`: at most one per owner per message.
+/// A canonical actor holds no space.
+fn source_key(owner: &str, message_id: &str) -> String {
+    format!("{owner} {message_id}")
 }
 
 /// What [`FeedStore::mark`] sets.
@@ -172,7 +185,7 @@ impl FeedStore {
         let q = Ql::new("Notification.create({ id: ")
             .str(&id)
             .raw(", source_key: ")
-            .str(&format!("{} {}", entry.owner, entry.message_id))
+            .str(&source_key(entry.owner, entry.message_id))
             .raw(", owner: ")
             .str(entry.owner)
             .raw(", n: ")
@@ -214,6 +227,19 @@ impl FeedStore {
             tracing::warn!(error = %e, "pruning a notification feed failed");
         }
         Ok(Some(stored))
+    }
+
+    /// Those of `owners` who already have an entry for `message_id`, in
+    /// batched point lookups by `source_key`.
+    pub async fn owners_with_entry(
+        &self,
+        message_id: &str,
+        owners: &[String],
+    ) -> Result<BTreeSet<String>, DbError> {
+        let keys: Vec<String> = owners.iter().map(|o| source_key(o, message_id)).collect();
+        let rows: Vec<OwnerRow> =
+            lookup(&self.db, "Notification.filter(", ".source_key == ", &keys).await?;
+        Ok(rows.into_iter().map(|r| r.owner).collect())
     }
 
     /// Every entry in `owner`'s kept window, in no particular order.

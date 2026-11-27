@@ -6,9 +6,10 @@
 //! request mid-way still leaves every entry made, and a client that waits
 //! sees what the future made in place when the create answers. Work whose
 //! size the author does not control (the feed's `message` entries for
-//! `all` settings) the notifier spawns itself and leaves out of the future,
-//! so it never holds up the create. A failure is the notifier's to log;
-//! the message stands either way.
+//! `all` settings) the notifier leaves out of the future: the future only
+//! queues it, and waits only while that bounded queue is full
+//! (back-pressure, docs/decisions/0023). A failure is the notifier's to
+//! log; the message stands either way.
 
 use std::future::Future;
 use std::pin::Pin;

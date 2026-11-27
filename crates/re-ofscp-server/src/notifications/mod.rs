@@ -4,7 +4,8 @@
 //! - [`mentions`]: who a message mentions.
 //! - [`create`]: making entries when a channel message is created (the
 //!   [`crate::messages::Notify`] seam).
-//! - [`background`]: the part of that a create does not wait for.
+//! - [`background`]: the queue of what a create does not wait for.
+//! - [`all_mode`]: the `message` entries that queue's turns make.
 //! - [`store`]: the `Notification` rows and each user's feed positions.
 //! - [`settings`]: the `NotificationSetting` rows.
 //! - [`request`]: reading queries and bodies (`400`s).
@@ -15,6 +16,7 @@
 //! requirements 5 and 7): never made, never listed, never counted and never
 //! marked, so nothing tells the user more than the channel would.
 
+mod all_mode;
 pub mod background;
 pub mod create;
 pub mod mentions;
@@ -34,9 +36,10 @@ use ofscp_core::{Actor, Authority, LocalId};
 use crate::accounts::store::AccountStore;
 use crate::db::{Db, DbError};
 use crate::groups::Groups;
+use crate::messages::store::MessageStore;
 use crate::timefmt;
 use crate::ws::Hub;
-use background::Background;
+use background::{Background, Batch, Run};
 use request::{ListQuery, Scope};
 use settings::{PutError, SettingStore};
 use store::{FeedStore, Mark, StoredEntry, kind};
@@ -70,11 +73,15 @@ pub struct Notifications {
     settings: SettingStore,
     groups: Arc<Groups>,
     accounts: AccountStore,
+    /// The messages `message` entries are made for, read again when their
+    /// turn comes.
+    messages: MessageStore,
     home: Authority,
     /// Where `notification.created` goes; attached once the hub is built
     /// (the hub owns the messages that own this, so it is held weakly).
     hub: OnceLock<Weak<Hub>>,
-    /// `message` entries being made off the request path.
+    /// Messages whose `message` entries are still to be made, off the
+    /// request path.
     background: Background,
 }
 
@@ -89,16 +96,29 @@ impl std::fmt::Debug for Notifications {
 impl Notifications {
     /// Feeds stored in `db`, for `accounts`' users, over `groups`'
     /// channels.
-    pub fn new(db: Arc<Db>, groups: Arc<Groups>, accounts: AccountStore) -> Self {
-        Self {
-            feed: FeedStore::new(db.clone()),
-            settings: SettingStore::new(db),
-            home: groups.home().clone(),
-            groups,
-            accounts,
-            hub: OnceLock::new(),
-            background: Background::default(),
-        }
+    pub fn new(db: Arc<Db>, groups: Arc<Groups>, accounts: AccountStore) -> Arc<Self> {
+        Arc::new_cyclic(|this: &Weak<Self>| {
+            // The queue's turns reach the feed weakly: the feed owns them.
+            let this = this.clone();
+            let run: Run = Arc::new(move |batch: Batch| {
+                let this = this.clone();
+                Box::pin(async move {
+                    if let Some(feed) = this.upgrade() {
+                        feed.all_mode_entries(batch).await;
+                    }
+                })
+            });
+            Self {
+                feed: FeedStore::new(db.clone()),
+                settings: SettingStore::new(db.clone()),
+                messages: MessageStore::new(db),
+                home: groups.home().clone(),
+                groups,
+                accounts,
+                hub: OnceLock::new(),
+                background: Background::new(run),
+            }
+        })
     }
 
     /// Announce new entries through `hub` from now on. Attached once; a
@@ -109,12 +129,18 @@ impl Notifications {
         }
     }
 
-    /// Wait until every entry a create left to the background so far has
-    /// been made (or has failed, which is logged): for tests, which then
-    /// see the `message` entries of what they posted, and for graceful
+    /// Wait until every message a create queued so far has had its
+    /// `message` entries made (or failed, which is logged): for tests,
+    /// which then see the entries of what they posted, and for graceful
     /// shutdown.
     pub async fn flush(&self) {
         self.background.flush().await;
+    }
+
+    /// The queue of messages whose `message` entries are still to be made
+    /// (docs/decisions/0023, *The background queue*).
+    pub fn background(&self) -> &Background {
+        &self.background
     }
 
     /// `actor`'s entries about channels they can read now.

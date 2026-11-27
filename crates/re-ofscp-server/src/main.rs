@@ -5,7 +5,7 @@ use tracing_subscriber::EnvFilter;
 /// How long startup waits for the replay ledger and the federation policy
 /// before serving (both keep retrying in the background after that).
 const STARTUP_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
-/// How long shutdown waits for background notification entries.
+/// How long shutdown waits for the notification queue to drain.
 const NOTIFICATION_DRAIN: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[tokio::main]
@@ -125,13 +125,17 @@ async fn main() -> anyhow::Result<()> {
         hub.shutdown().await;
     })
     .await?;
-    // Feed entries the drained requests left to the background
-    // (docs/decisions/0023), given a bounded time to finish.
+    // Messages the drained requests queued for their `message` feed
+    // entries (docs/decisions/0023), given a bounded time; what is still
+    // queued after it is lost, and counted here.
     if tokio::time::timeout(NOTIFICATION_DRAIN, notifications.flush())
         .await
         .is_err()
     {
-        tracing::warn!("shutting down before every notification entry was made");
+        tracing::warn!(
+            messages = notifications.background().unfinished(),
+            "shutting down with messages whose `message` notification entries were not made"
+        );
     }
     ws_recheck.abort();
     stop_replay.abort();

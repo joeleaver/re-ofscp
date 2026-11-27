@@ -6,10 +6,13 @@
 //! - **Direct:** the local users the message mentions (at most
 //!   `MAX_MENTIONS`, `mentions.rs`) and the local author of the message it
 //!   replies to. These are made in the future the create awaits.
-//! - **`all`:** the users whose channel or group setting is `all`, less
-//!   the direct ones. Anyone may hold such a setting for any scope (§10.2),
-//!   so these are made off the request path, in [`Background`], and the
-//!   create never waits on how many there are.
+//! - **`all`:** the users whose channel or group setting is `all`. Anyone
+//!   may hold such a setting for any scope (§10.2), so once the direct
+//!   entries are made the future only queues the message's id
+//!   ([`super::background`]), and only if its channel or group has an `all`
+//!   setting at all; the entries are made off the request path
+//!   (`all_mode.rs`), and a direct candidate's entry, made first, outranks
+//!   a `message` one.
 //!
 //! Each candidate gets at most one entry, of the highest-precedence type
 //! that applies (mention, then reply, then message), and only if, at that
@@ -21,14 +24,14 @@
 //! batched lookup and nothing more. Readability is checked again just
 //! before each `notification.created` is sent.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Weak};
 
 use futures_util::stream::{self, StreamExt};
 use ofscp_core::Actor;
 use ofscp_core::ws::NotificationCreated;
 
-use super::settings::{mode, scope};
+use super::settings::mode;
 use super::store::{NewEntry, StoredEntry, kind};
 use super::{NOTIFICATION_CREATED, Notifications, mentions, to_wire};
 use crate::accounts::store::StoreError;
@@ -41,7 +44,7 @@ const CONCURRENCY: usize = 16;
 
 /// Why a set of entries was not made.
 #[derive(Debug, thiserror::Error)]
-enum MakeError {
+pub(super) enum MakeError {
     #[error(transparent)]
     Db(#[from] DbError),
     #[error(transparent)]
@@ -49,7 +52,7 @@ enum MakeError {
 }
 
 /// Candidates by handle, with the type of entry each would get.
-type Candidates = BTreeMap<String, &'static str>;
+pub(super) type Candidates = BTreeMap<String, &'static str>;
 
 impl Notify for Notifications {
     fn message_created(
@@ -58,20 +61,13 @@ impl Notify for Notifications {
         parent_author: Option<Actor>,
     ) -> NotifyFuture {
         let direct = self.direct_candidates(&message, parent_author.as_ref());
-        // Started before the returned future runs, so it counts as
-        // unfinished (`Background::flush`) once the create has answered.
-        let this = self.clone();
-        let m = message.clone();
-        let skip: BTreeSet<String> = direct.keys().cloned().collect();
-        self.background.spawn(async move {
-            if let Err(e) = this.all_mode_entries(&m, &skip).await {
-                tracing::error!(error = %e, message = %m.id, "making `all` notification entries failed");
-            }
-        });
         Box::pin(async move {
             if let Err(e) = self.make(&message, direct).await {
                 tracing::error!(error = %e, message = %message.id, "making notification entries failed");
             }
+            // After the direct entries, so none of them can lose to a
+            // `message` entry for the same user.
+            self.queue_all_mode(&message).await;
         })
     }
 }
@@ -98,43 +94,29 @@ impl Notifications {
         }
     }
 
-    /// Make the `message` entries of `m` for the users whose mode is `all`,
-    /// other than those in `skip` (the direct candidates, whose entry, if
-    /// any, outranks a `message` one).
-    async fn all_mode_entries(
-        &self,
-        m: &StoredMessage,
-        skip: &BTreeSet<String>,
-    ) -> Result<(), MakeError> {
-        let mut owners = self
-            .settings
-            .all_mode_owners(scope::CHANNEL, m.channel_id.as_str())
-            .await?;
-        owners.extend(
-            self.settings
-                .all_mode_owners(scope::GROUP, m.group_id.as_str())
-                .await?,
-        );
-        let mut want = Candidates::new();
-        for owner in owners {
-            if let Ok(a) = Actor::parse_canonical(&owner)
-                && a.is_local_to(&self.home)
-                && !skip.contains(a.handle())
-            {
-                want.insert(a.handle().to_owned(), kind::MESSAGE);
-            }
-        }
-        self.drop_author(m, &mut want);
-        self.make(m, want).await
-    }
-
     /// Make the entries `want` names for `m`, for the candidates every
     /// rule allows, and announce them.
     async fn make(&self, m: &StoredMessage, want: Candidates) -> Result<(), MakeError> {
-        if want.is_empty() {
-            return Ok(());
-        }
         let channel_id = m.channel_id.as_str();
+        let work = self
+            .permitted(channel_id, m.group_id.as_str(), &want)
+            .await?;
+        let made = self.insert_all(m, work).await;
+        self.announce(channel_id, made).await
+    }
+
+    /// Those of `want` that every rule allows the entry `want` names for a
+    /// message of `channel_id` in `group_id`, checked now (all but the
+    /// author rule, which is the caller's).
+    pub(super) async fn permitted(
+        &self,
+        channel_id: &str,
+        group_id: &str,
+        want: &Candidates,
+    ) -> Result<Vec<(Actor, &'static str)>, MakeError> {
+        if want.is_empty() {
+            return Ok(Vec::new());
+        }
         let actors: Vec<Actor> = want
             .keys()
             .filter_map(|h| Actor::new(h, self.home.clone()).ok())
@@ -153,23 +135,35 @@ impl Notifications {
         // 3. Whose effective mode allows the entry.
         let modes = self
             .settings
-            .effective_modes(&owners, channel_id, m.group_id.as_str())
+            .effective_modes(&owners, channel_id, group_id)
             .await?;
-        let work: Vec<_> = readers
+        Ok(readers
             .into_iter()
             .filter_map(|actor| {
                 let k = *want.get(actor.handle())?;
                 let mode = modes.get(&actor.to_string())?;
                 let allowed = mode != mode::NONE && (k != kind::MESSAGE || mode == mode::ALL);
-                allowed.then(|| self.insert(m, actor, k))
+                allowed.then_some((actor, k))
             })
+            .collect())
+    }
+
+    /// Write each of `work`'s entries for `m`, [`CONCURRENCY`] at a time:
+    /// those made.
+    pub(super) async fn insert_all(
+        &self,
+        m: &StoredMessage,
+        work: Vec<(Actor, &'static str)>,
+    ) -> Vec<(Actor, StoredEntry)> {
+        let writes: Vec<_> = work
+            .into_iter()
+            .map(|(actor, k)| self.insert(m, actor, k))
             .collect();
-        let made: Vec<(Actor, StoredEntry)> = stream::iter(work)
+        stream::iter(writes)
             .buffer_unordered(CONCURRENCY)
             .filter_map(|made| async move { made })
             .collect()
-            .await;
-        self.announce(channel_id, made).await
+            .await
     }
 
     /// Write `actor`'s entry of `kind` for `m`: `None` if it was not made
@@ -206,7 +200,7 @@ impl Notifications {
     /// the writes, so access lost while the entries were written sends
     /// nothing; the event carries no counts. An entry left unsent this way
     /// stays stored, unlisted while the channel is unreadable (`visible`).
-    async fn announce(
+    pub(super) async fn announce(
         &self,
         channel_id: &str,
         made: Vec<(Actor, StoredEntry)>,

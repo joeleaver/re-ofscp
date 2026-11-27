@@ -65,20 +65,18 @@ Candidates come in two sets, made separately:
   outside the channel's lock: a dropped request still finishes it, and a
   client sees its mention and reply entries in place when the create
   answers.
-- **`all`:** every user whose channel or group setting is `all`, less the
-  direct candidates (whose entry, if they get one, outranks a `message`
-  entry; if a rule refuses them one, it refuses the `message` entry too).
-  Any local account may hold an `all` setting for any scope (§10.2; the
-  scope is not checked, see *Endpoints*), so their number is not the
-  author's to bound and the create must not wait on it. The seam starts
-  this work in its own spawned task (`src/notifications/background.rs`)
-  before its future runs and does not await it. At most 4 such tasks run
-  at once; the rest wait their turn, so the feed's background work holds a
-  bounded share of the database however many settings exist. Nothing is
-  dropped: a task that waits still runs, and finishes whatever becomes of
-  the request. Tests (and graceful shutdown, for up to 10 s) wait for
-  them with `Notifications::flush`, which returns once every task started
-  so far has finished.
+- **`all`:** every user whose channel or group setting is `all`. Any
+  local account may hold an `all` setting for any scope (§10.2; the scope
+  is not checked, see *Endpoints*), so their number is not the author's to
+  bound and the create must not wait on it. Once the direct entries are
+  made, the seam's future only queues the message's id (*The background
+  queue*, below), and only if its channel or group has an `all` setting
+  at that moment (one query reading at most one row per scope). The
+  entries are made later, off the request path. Because the direct
+  entries are made before the id is queued, a direct candidate's entry is
+  never beaten by a `message` entry; a turn skips everyone who already has
+  an entry for the message (one batched lookup by `source_key`), so a
+  direct candidate costs no feed position there either.
 
 Each candidate gets at most one entry (a `@unique` `source_key`
 `"{owner} {message_id}"` enforces it), of type mention, else reply, else
@@ -118,6 +116,62 @@ Feed order is the order entries were made (positions, below). A
 `message` entry made in the background can therefore come after the
 mention entry of a later message; `createdAt` is always the source
 message's creation time.
+
+### The background queue (`src/notifications/background.rs`, `all_mode.rs`)
+
+Creates have no rate limit, and anyone may set `all` anywhere, so the
+work they leave behind is queued under explicit bounds:
+
+- **Ids, coalesced per channel.** The queue holds message ids, never
+  message copies. Each channel with work has one entry holding its ids in
+  arrival order (with its group's id).
+- **Turns, round-robin.** At most 4 drainer tasks run. Each takes a turn:
+  the channel at the front of the ready list and up to 64 of its ids. If
+  more of that channel's ids wait, the channel goes to the back of the
+  list. A channel is in at most one turn at a time, so its messages are
+  handled in order. A flood in one channel therefore delays another
+  channel's entries by at most one turn per channel ahead of it, never by
+  the length of the flood.
+- **Bounds.** At most 256 ids wait per channel and 8192 in all; turns in
+  progress hold at most 4 × 64 more. Memory is bounded by those numbers,
+  whatever is posted.
+- **When a bound is reached, nothing is dropped.** The create that would
+  queue past it waits for room instead (it is woken when a turn takes ids
+  out), and logs once that it waited. That is back-pressure on whoever
+  posts faster than the queue drains: a flooded channel's own creates
+  wait once its 256 are queued, while other channels still have room.
+  Only when 8192 ids are queued across channels does every create that
+  needs the queue wait. A create that needs no `all` entries never
+  touches the queue and never waits.
+- **One turn's work.** The scope's `all` owners are read once per turn
+  (by key range, see *Storage*) and checked once (readable channel,
+  active account, effective mode `all`). The turn's messages are then read
+  again in one batched lookup: a message deleted since it was queued, or
+  gone with its channel, gets no entries. Then, message by message in
+  creation order, the checked owners other than its author and other than
+  those who already have an entry for it get a `message` entry, and each
+  entry is announced (below). A database failure is logged. One that hits
+  the turn's setup loses that turn's entries; one that hits a single
+  message loses that message's entries.
+- **Settings racing a create.** The no-`all` check runs after the message
+  is stored. An `all` setting stored after that check does not apply to
+  the message, which is older than the setting. A turn reads the settings
+  as they are when it runs, so a setting changed while the message waited
+  applies as changed. If the check itself fails, the message is queued
+  anyway.
+- **Shutdown and crashes.** The queue lives in memory. Graceful shutdown
+  waits up to 10 s for it to drain (`Notifications::flush`). Ids still
+  queued after that, or at a crash, are lost: those messages get no
+  `message` entries. Shutdown logs how many. Their mention and reply
+  entries are unaffected, since the create made those before answering.
+  Making the queue durable would mean a stored per-channel progress
+  marker written on every turn and a scan on startup. For entries that
+  are a convenience on top of the channel itself, that cost is not
+  worthwhile.
+- **Tests.** Tests wait with `Notifications::flush`, which returns once
+  every id queued so far has been handled. `Background::hold` keeps work
+  queued, so a test can check what was queued or change things before a
+  turn runs.
 
 ### Mentions (`src/notifications/mentions.rs`)
 
@@ -189,9 +243,11 @@ rhypedb has no ordering, counting or projection, so everything is bounded:
 
 ### Latency
 
-The create waits only for its mention and reply entries: at most 101
+The create waits for its mention and reply entries: at most 101
 candidates, checked in a few batched lookups, then one write sequence per
-entry (16 at a time). `message` entries for `all` settings are made after
-the create has answered, normally within moments; a client that reads its
+entry (16 at a time). After that it waits for one or two single-row
+queries (is there an `all` setting?), plus the queue only while the queue
+is full (*The background queue*). `message` entries are made after the
+create has answered, normally within moments. A client that reads its
 feed at once may not see them yet, and sees them in the order they were
 made.

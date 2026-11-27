@@ -264,6 +264,19 @@ impl SettingStore {
             .collect())
     }
 
+    /// Whether anyone's mode for the scope is `all`: one query reading at
+    /// most one row.
+    pub async fn has_all_mode(&self, scope_type: &str, scope_id: &str) -> Result<bool, DbError> {
+        let q = Ql::new("NotificationSetting.filter(.scope_id == ")
+            .str(scope_id)
+            .raw(" && .scope_type == ")
+            .str(scope_type)
+            .raw(" && .mode == ")
+            .str(mode::ALL)
+            .raw(").limit(1)");
+        Ok(!self.db.fetch::<StoredSetting>(&q).await?.is_empty())
+    }
+
     /// Every owner whose mode for the scope is `all`, however many.
     ///
     /// rhypedb promises no order, so the scope's rows are read by ranges of

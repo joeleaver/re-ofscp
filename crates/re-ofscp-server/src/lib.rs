@@ -325,11 +325,8 @@ impl AppStateBuilder {
             self.clock,
         ));
         let fanout = Arc::new(HubFanout::new(groups.clone()));
-        let notifications = Arc::new(notifications::Notifications::new(
-            db.clone(),
-            groups.clone(),
-            accounts.store.clone(),
-        ));
+        let notifications =
+            notifications::Notifications::new(db.clone(), groups.clone(), accounts.store.clone());
         let messages = Arc::new(Messages::new(
             db.clone(),
             groups.clone(),
