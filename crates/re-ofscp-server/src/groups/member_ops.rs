@@ -9,6 +9,7 @@
 //! read here (docs/decisions/0020).
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::time::Instant;
 
 use re_ofscp_types::Actor;
@@ -18,7 +19,7 @@ use super::access::{Standing, roles};
 use super::members::StoredMember;
 use super::model::StoredGroup;
 use super::ops::{ACTIVATE_WITHIN, GroupError, NO_GROUP, SLOW_WRITE, announce_unless, member_role};
-use super::{Groups, MAX_GROUPS_PER_OWNER, MAX_MEMBERS_PER_GROUP, MAX_MEMBERSHIPS_PER_ACTOR};
+use super::{Groups, MAX_MEMBERS_PER_GROUP, MAX_MEMBERSHIPS_PER_ACTOR};
 use crate::db::DbError;
 use crate::timefmt;
 
@@ -140,7 +141,8 @@ impl Groups {
     /// [`MAX_MEMBERS_PER_GROUP`] members refuses more, and an actor already
     /// in [`MAX_MEMBERSHIPS_PER_ACTOR`] groups may join no more (both
     /// `403`). Announces the change once the row may be active, on every
-    /// exit from then on, errors included ([`Self::settle_join`]).
+    /// exit from then on, errors included ([`Self::settle_join`]), even if
+    /// this future is dropped meanwhile ([`Self::finish_join`]).
     pub async fn add_member(
         &self,
         group_id: &str,
@@ -176,14 +178,42 @@ impl Groups {
         {
             return Ok(false);
         }
-        let activated = match self.store.activate_member(group_id, actor).await {
-            Ok(true) => Ok(()),
-            // Known to have activated nothing: there is nothing to announce.
-            Ok(false) => return Err(self.not_activated(group_id).await),
-            // May have committed: settled (and announced) as if it had.
-            Err(e) => Err(e.into()),
-        };
-        self.settle_join(group_id, actor, activated).await
+        self.finish_join(group_id, actor).await
+    }
+
+    /// Activate `actor`'s pending membership of `group_id`, then settle the
+    /// join ([`Self::settle_join`]), in a task of its own, spawned before
+    /// this returns: a request dropped meanwhile (the client went away)
+    /// cannot stop a membership that may be active from being announced,
+    /// counted and, if need be, taken back. The returned future answers
+    /// the task's result.
+    pub(super) fn finish_join(
+        &self,
+        group_id: &str,
+        actor: &Actor,
+    ) -> impl Future<Output = Result<bool, GroupError>> + Send + 'static {
+        let this = self.clone();
+        let (group_id, actor) = (group_id.to_owned(), actor.clone());
+        let task = tokio::spawn(async move {
+            let activated = match this.store.activate_member(&group_id, &actor).await {
+                Ok(true) => Ok(()),
+                // Known to have activated nothing: nothing to announce.
+                Ok(false) => return Err(this.not_activated(&group_id).await),
+                // May have committed: settled (and announced) as if it had.
+                Err(e) => Err(e.into()),
+            };
+            this.settle_join(&group_id, &actor, activated).await
+        });
+        async move {
+            match task.await {
+                Ok(settled) => settled,
+                // The task panicked or the runtime is shutting down: the
+                // join's state is unknown.
+                Err(e) => Err(GroupError::Db(DbError::Query(format!(
+                    "settling a join failed: {e}"
+                )))),
+            }
+        }
     }
 
     /// The rest of [`Self::add_member`] once its row may be active: the
@@ -225,11 +255,12 @@ impl Groups {
 
     /// How many groups `actor` is a member of, counted up to one past
     /// [`MAX_MEMBERSHIPS_PER_ACTOR`]. A row left for them in a group they
-    /// own is not a membership and does not count.
+    /// own is not a membership and does not count; every owned group is
+    /// read (`all_owned_groups`), so no such row can pass for one.
     pub(super) async fn membership_count(&self, actor: &Actor) -> Result<usize, GroupError> {
         let owned: HashSet<String> = self
             .store
-            .owned_groups(actor, MAX_GROUPS_PER_OWNER + 1)
+            .all_owned_groups(actor)
             .await?
             .into_iter()
             .map(|g| g.id)

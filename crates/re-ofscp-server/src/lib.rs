@@ -12,6 +12,7 @@ pub mod db;
 pub mod discovery;
 pub mod federation;
 pub mod groups;
+pub mod logpath;
 pub mod messages;
 pub mod my_groups;
 pub mod outbound;
@@ -556,6 +557,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/tiers", get(groups::routes::tiers))
         .merge(groups::member_routes::routes())
+        .merge(groups::invite_routes::routes())
         .route("/api/me", get(profiles::routes::me))
         .route(
             "/api/me/profile",
@@ -618,14 +620,15 @@ pub fn router(state: AppState) -> Router {
         .layer(middleware::from_fn(cors::layer))
         .layer(
             tower_http::trace::TraceLayer::new_for_http().make_span_with(
-                // The path only: query strings can carry secrets (invite
-                // tokens in `?invite=`, §4.1.1 "SHOULD NOT log invite
-                // tokens").
+                // The path only, with invite tokens redacted: query strings
+                // and some paths carry secrets (invite tokens in `?invite=`,
+                // §4.1.1 "SHOULD NOT log invite tokens"; group invite tokens
+                // in `/api/invites/{token}/…`, §5.6).
                 |req: &axum::http::Request<axum::body::Body>| {
                     tracing::info_span!(
                         "request",
                         method = %req.method(),
-                        path = %req.uri().path(),
+                        path = %logpath::loggable(req.uri().path()),
                     )
                 },
             ),

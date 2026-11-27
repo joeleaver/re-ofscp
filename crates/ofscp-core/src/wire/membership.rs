@@ -10,9 +10,70 @@ use crate::{Actor, LocalId};
 
 /// A link that lets people join a group (§5.6). Its `token` is a bearer
 /// secret: `Debug` never shows it.
+///
+/// Only the `201` that creates an invite must carry the token
+/// ([`InviteCreateResponse`]); a provider may omit it from every other
+/// `Invite` it serves, such as its listing, to keep only a digest
+/// (lost-conn/ofscp#40).
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Invite {
+    /// The invite's local id.
+    pub id: LocalId,
+    /// The group it is for.
+    pub group_id: LocalId,
+    /// The channel to land in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<LocalId>,
+    /// The secret token in the link, when the provider serves it (always
+    /// in the create's answer, [`InviteCreateResponse`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    /// The role it gives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<Role>,
+    /// Whether someone without an account may use it as a guest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grants_guest: Option<bool>,
+    /// How many times it may be used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_uses: Option<u32>,
+    /// How many times it has been used.
+    pub uses: u32,
+    /// When it stops working.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<Timestamp>,
+    /// Who made it.
+    pub created_by: Actor,
+    /// When.
+    pub created_at: Timestamp,
+}
+
+impl fmt::Debug for Invite {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Invite")
+            .field("id", &self.id)
+            .field("group_id", &self.group_id)
+            .field("channel_id", &self.channel_id)
+            .field("token", &self.token.as_ref().map(|_| REDACTED))
+            .field("role", &self.role)
+            .field("grants_guest", &self.grants_guest)
+            .field("max_uses", &self.max_uses)
+            .field("uses", &self.uses)
+            .field("expires_at", &self.expires_at)
+            .field("created_by", &self.created_by)
+            .field("created_at", &self.created_at)
+            .finish()
+    }
+}
+
+/// The answer to `POST /api/groups/{groupId}/invites`: the created
+/// [`Invite`], which must carry its `token` (§5.6,
+/// `invite-create-response.json`, lost-conn/ofscp#40). `Debug` never shows
+/// the token.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InviteCreateResponse {
     /// The invite's local id.
     pub id: LocalId,
     /// The group it is for.
@@ -42,9 +103,9 @@ pub struct Invite {
     pub created_at: Timestamp,
 }
 
-impl fmt::Debug for Invite {
+impl fmt::Debug for InviteCreateResponse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Invite")
+        f.debug_struct("InviteCreateResponse")
             .field("id", &self.id)
             .field("group_id", &self.group_id)
             .field("channel_id", &self.channel_id)
@@ -57,6 +118,24 @@ impl fmt::Debug for Invite {
             .field("created_by", &self.created_by)
             .field("created_at", &self.created_at)
             .finish()
+    }
+}
+
+impl From<InviteCreateResponse> for Invite {
+    fn from(r: InviteCreateResponse) -> Self {
+        Self {
+            id: r.id,
+            group_id: r.group_id,
+            channel_id: r.channel_id,
+            token: Some(r.token),
+            role: r.role,
+            grants_guest: r.grants_guest,
+            max_uses: r.max_uses,
+            uses: r.uses,
+            expires_at: r.expires_at,
+            created_by: r.created_by,
+            created_at: r.created_at,
+        }
     }
 }
 
@@ -172,6 +251,33 @@ mod tests {
         .unwrap();
         let shown = format!("{invite:?}");
         assert!(shown.contains("inv_1") && !shown.contains("kQ8sJ2mZ0rV1xN6bC3dF9wYt"));
+    }
+
+    #[test]
+    fn a_listed_invite_may_omit_its_token() {
+        let body = json!({
+            "id": "inv_1", "groupId": "grp_1", "uses": 2,
+            "createdBy": "jane@a.com", "createdAt": "2025-03-01T12:00:00Z"
+        });
+        let invite: Invite = serde_json::from_value(body.clone()).unwrap();
+        assert_eq!(invite.token, None);
+        assert_eq!(serde_json::to_value(&invite).unwrap(), body);
+        assert!(format!("{invite:?}").contains("token: None"));
+    }
+
+    #[test]
+    fn the_create_answer_requires_its_token_and_hides_it_from_debug() {
+        let mut body = json!({
+            "id": "inv_1", "groupId": "grp_1", "token": "kQ8sJ2mZ0rV1xN6bC3dF9wYt",
+            "uses": 0, "createdBy": "jane@a.com", "createdAt": "2025-03-01T12:00:00Z"
+        });
+        let created: InviteCreateResponse = serde_json::from_value(body.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&created).unwrap(), body);
+        assert!(!format!("{created:?}").contains("kQ8sJ2mZ0rV1xN6bC3dF9wYt"));
+        let invite = Invite::from(created);
+        assert_eq!(invite.token.as_deref(), Some("kQ8sJ2mZ0rV1xN6bC3dF9wYt"));
+        body.as_object_mut().unwrap().remove("token");
+        assert!(serde_json::from_value::<InviteCreateResponse>(body).is_err());
     }
 
     #[test]

@@ -89,7 +89,9 @@ An entry's `role` is `owner` for the group's owner (`Group.owner`, not a
   the change (`Groups::settle_join`), errors included: an activation that
   failed may have committed, and a join whose activation or recount failed
   is taken back (announced again), so no group list misses a membership
-  that may exist. Owned
+  that may exist. The activation and the settling run in a task of their
+  own (`Groups::finish_join`), so a request dropped meanwhile (a client
+  disconnecting) cannot cut them short. Owned
   groups are bounded by `MAX_GROUPS_PER_OWNER`.
 - **No partial lists.** `GET` must list every group, so it reads one row
   more than each bound (owned groups, memberships, pointers). A list that

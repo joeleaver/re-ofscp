@@ -126,6 +126,44 @@ async fn a_failed_activation_is_announced_and_taken_back() {
 }
 
 #[tokio::test]
+async fn a_dropped_join_still_settles_and_announces() {
+    // The client goes away once the join's activation is under way: the
+    // request's future is dropped unpolled. The activation (which may
+    // have committed, as its failure here may have) is still settled,
+    // announced and taken back, by its own task.
+    let groups = unreachable();
+    let recorder = Arc::new(Recorder::default());
+    groups.on_membership(recorder.clone());
+    let mut changes = groups.subscribe_changes();
+    let bob = actor("bob@providera.com");
+    drop(groups.finish_join("grp_1", &bob));
+    let settled = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while recorder.0.lock().unwrap().len() < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(settled.is_ok(), "the dropped join was never settled");
+    let want = AccessChange::Member {
+        group_id: "grp_1".into(),
+        actor: bob.clone(),
+    };
+    // Once for the join, once for the take-back.
+    assert_eq!(changes.try_recv(), Ok(want.clone()));
+    assert_eq!(changes.try_recv(), Ok(want));
+    let told = recorder.0.lock().unwrap().clone();
+    assert_eq!(told, vec![("grp_1".to_owned(), bob.clone()); 2]);
+}
+
+#[tokio::test]
+async fn an_awaited_join_answers_its_settled_result() {
+    let groups = unreachable();
+    let bob = actor("bob@providera.com");
+    let err = groups.finish_join("grp_1", &bob).await.unwrap_err();
+    assert!(matches!(err, GroupError::Db(_)), "{err:?}");
+}
+
+#[tokio::test]
 async fn a_failed_recount_after_activation_is_announced_and_taken_back() {
     let (err, broadcast, told) = settle(Ok(())).await;
     assert!(matches!(err, GroupError::Db(_)), "{err:?}");

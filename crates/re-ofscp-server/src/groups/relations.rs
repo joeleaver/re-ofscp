@@ -12,17 +12,10 @@ use re_ofscp_types::Actor;
 
 use super::access::{self, Standing};
 use super::model::StoredGroup;
-use super::{Caller, Groups, MAX_GROUPS_PER_OWNER, MAX_MEMBERSHIPS_PER_ACTOR};
+use super::{Caller, Groups, MAX_MEMBERSHIPS_PER_ACTOR};
 use crate::db::DbError;
 use crate::privacy::seams::RelFuture;
 use crate::privacy::{GroupMemberships, RelError, Viewer};
-
-/// Most membership rows read for one user: every membership
-/// [`MAX_MEMBERSHIPS_PER_ACTOR`] allows, plus a stray row (left by an
-/// ownership transfer, docs/decisions/0020; ignored below) in each of the
-/// at most [`MAX_GROUPS_PER_OWNER`] groups they own. So every group a user
-/// belongs to is read.
-const MAX_MEMBERSHIPS_READ: usize = MAX_MEMBERSHIPS_PER_ACTOR + MAX_GROUPS_PER_OWNER;
 
 /// One user's groups, with where the user stands in each.
 struct Belonging {
@@ -37,16 +30,20 @@ impl Belonging {
 }
 
 impl Groups {
-    /// The active groups `actor` owns or is an active member of.
+    /// Every active group `actor` owns or is an active member of. Neither
+    /// read is capped: the limits are checked around writes, and concurrent
+    /// writes (two ownership transfers, say) can briefly exceed them, so a
+    /// capped read could silently drop a group and, with it, a shared one.
     async fn belonging(&self, actor: &Actor) -> Result<Belonging, DbError> {
         let mut groups = BTreeMap::new();
-        for g in self.store.owned_groups(actor, MAX_GROUPS_PER_OWNER).await? {
+        for g in self.store.all_owned_groups(actor).await? {
             groups.insert(g.id.clone(), (g, Standing::Owner));
         }
-        let memberships = self
-            .store
-            .memberships_of(actor, MAX_MEMBERSHIPS_READ)
-            .await?;
+        // Every membership the limit allows, plus a stray row (left by an
+        // ownership transfer, docs/decisions/0020; ignored below) in each
+        // owned group, in one read; more only if there are more.
+        let expected = MAX_MEMBERSHIPS_PER_ACTOR + groups.len() + 1;
+        let memberships = self.store.all_memberships_of(actor, expected).await?;
         let mut roles: BTreeMap<String, String> = memberships.into_iter().collect();
         let ids: Vec<String> = roles.keys().cloned().collect();
         for g in self.store.active_groups(&ids).await? {
