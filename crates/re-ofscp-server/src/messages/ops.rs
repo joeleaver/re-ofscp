@@ -253,7 +253,8 @@ impl Messages {
 
     /// Hand a new message to the notification feed (`notify.rs`): in a
     /// task of its own, so a dropped request cannot cut it short, awaited
-    /// so the entries exist when the create answers.
+    /// so the entries the notifier promises up front (mentions and replies)
+    /// exist when the create answers.
     async fn notify_created(&self, message: StoredMessage, parent_author: Option<Actor>) {
         let work = self.notify.clone().message_created(message, parent_author);
         if let Err(e) = tokio::spawn(work).await {

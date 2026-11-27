@@ -1,16 +1,27 @@
 //! Making feed entries when a channel message is created (§10.1 *When
 //! entries are created*), through the [`Notify`] seam.
 //!
-//! The candidates are the local users the message mentions, the local
-//! author of the message it replies to, and the users whose mode for the
-//! channel is `all`. Each gets at most one entry, of the highest-precedence
-//! type that applies (mention, then reply, then message), and only if, at
-//! that moment, they are not the author, their account exists and is
-//! active, their effective mode for the channel is not `none` (and is `all`
-//! for a `message` entry), and they can read the channel (security
-//! requirement 7).
+//! The candidates come in two sets, made separately:
+//!
+//! - **Direct:** the local users the message mentions (at most
+//!   `MAX_MENTIONS`, `mentions.rs`) and the local author of the message it
+//!   replies to. These are made in the future the create awaits.
+//! - **`all`:** the users whose channel or group setting is `all`, less
+//!   the direct ones. Anyone may hold such a setting for any scope (§10.2),
+//!   so these are made off the request path, in [`Background`], and the
+//!   create never waits on how many there are.
+//!
+//! Each candidate gets at most one entry, of the highest-precedence type
+//! that applies (mention, then reply, then message), and only if, at that
+//! moment, they are not the author, they can read the channel (security
+//! requirement 7), their account exists and is active, and their effective
+//! mode for the channel is not `none` (and is `all` for a `message` entry).
+//! The checks run in that order, each one batched over every candidate
+//! still standing, so a candidate who fails the first costs a share of one
+//! batched lookup and nothing more. Readability is checked again just
+//! before each `notification.created` is sent.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Weak};
 
 use futures_util::stream::{self, StreamExt};
@@ -18,24 +29,27 @@ use ofscp_core::Actor;
 use ofscp_core::ws::NotificationCreated;
 
 use super::settings::{mode, scope};
-use super::store::{NewEntry, kind};
+use super::store::{NewEntry, StoredEntry, kind};
 use super::{NOTIFICATION_CREATED, Notifications, mentions, to_wire};
 use crate::accounts::store::StoreError;
 use crate::db::DbError;
 use crate::messages::model::StoredMessage;
 use crate::messages::{Notify, NotifyFuture};
 
-/// Candidates handled at once.
+/// Entries written at once for one message.
 const CONCURRENCY: usize = 16;
 
-/// Why one candidate's entry was not made.
+/// Why a set of entries was not made.
 #[derive(Debug, thiserror::Error)]
-enum CandidateError {
+enum MakeError {
     #[error(transparent)]
     Db(#[from] DbError),
     #[error(transparent)]
     Accounts(#[from] StoreError),
 }
+
+/// Candidates by handle, with the type of entry each would get.
+type Candidates = BTreeMap<String, &'static str>;
 
 impl Notify for Notifications {
     fn message_created(
@@ -43,8 +57,19 @@ impl Notify for Notifications {
         message: StoredMessage,
         parent_author: Option<Actor>,
     ) -> NotifyFuture {
+        let direct = self.direct_candidates(&message, parent_author.as_ref());
+        // Started before the returned future runs, so it counts as
+        // unfinished (`Background::flush`) once the create has answered.
+        let this = self.clone();
+        let m = message.clone();
+        let skip: BTreeSet<String> = direct.keys().cloned().collect();
+        self.background.spawn(async move {
+            if let Err(e) = this.all_mode_entries(&m, &skip).await {
+                tracing::error!(error = %e, message = %m.id, "making `all` notification entries failed");
+            }
+        });
         Box::pin(async move {
-            if let Err(e) = self.make_entries(&message, parent_author.as_ref()).await {
+            if let Err(e) = self.make(&message, direct).await {
                 tracing::error!(error = %e, message = %message.id, "making notification entries failed");
             }
         })
@@ -52,42 +77,10 @@ impl Notify for Notifications {
 }
 
 impl Notifications {
-    /// Make the entries for new message `m`.
-    async fn make_entries(
-        &self,
-        m: &StoredMessage,
-        parent_author: Option<&Actor>,
-    ) -> Result<(), DbError> {
-        let candidates = self.candidates(m, parent_author).await?;
-        // Collected first: a lazily mapped iterator here makes the future
-        // fail the `Send` bound of a spawned task (a higher-ranked
-        // lifetime), as in `read_markers`.
-        let work: Vec<_> = candidates
-            .into_iter()
-            .map(|(handle, kind)| self.logged_entry_for(m, handle, kind))
-            .collect();
-        stream::iter(work)
-            .buffer_unordered(CONCURRENCY)
-            .collect::<Vec<()>>()
-            .await;
-        Ok(())
-    }
-
-    /// [`Self::entry_for`], logging a failure: one candidate's failure
-    /// leaves the others' entries to be made.
-    async fn logged_entry_for(&self, m: &StoredMessage, handle: String, kind: &'static str) {
-        if let Err(e) = self.entry_for(m, &handle, kind).await {
-            tracing::error!(error = %e, user = %handle, message = %m.id, "making a notification entry failed");
-        }
-    }
-
-    /// Each candidate's handle, with the type of entry they would get.
-    async fn candidates(
-        &self,
-        m: &StoredMessage,
-        parent_author: Option<&Actor>,
-    ) -> Result<BTreeMap<String, &'static str>, DbError> {
-        let mut want: BTreeMap<String, &'static str> = BTreeMap::new();
+    /// The mentioned and replied-to local users of `m`, less its author.
+    /// Reads nothing.
+    fn direct_candidates(&self, m: &StoredMessage, parent_author: Option<&Actor>) -> Candidates {
+        let mut want = Candidates::new();
         let text = m.doc.content.as_ref().map(|c| c.text.as_str());
         for handle in mentions::local_mentions(m.doc.mentions.as_deref(), text, &self.home) {
             want.insert(handle, kind::MENTION);
@@ -95,86 +88,100 @@ impl Notifications {
         if let Some(p) = parent_author.filter(|p| p.is_local_to(&self.home)) {
             want.entry(p.handle().to_owned()).or_insert(kind::REPLY);
         }
-        let mut all = self
+        self.drop_author(m, &mut want);
+        want
+    }
+
+    fn drop_author(&self, m: &StoredMessage, want: &mut Candidates) {
+        if m.author.is_local_to(&self.home) {
+            want.remove(m.author.handle());
+        }
+    }
+
+    /// Make the `message` entries of `m` for the users whose mode is `all`,
+    /// other than those in `skip` (the direct candidates, whose entry, if
+    /// any, outranks a `message` one).
+    async fn all_mode_entries(
+        &self,
+        m: &StoredMessage,
+        skip: &BTreeSet<String>,
+    ) -> Result<(), MakeError> {
+        let mut owners = self
             .settings
             .all_mode_owners(scope::CHANNEL, m.channel_id.as_str())
             .await?;
-        all.extend(
+        owners.extend(
             self.settings
                 .all_mode_owners(scope::GROUP, m.group_id.as_str())
                 .await?,
         );
-        for owner in all {
+        let mut want = Candidates::new();
+        for owner in owners {
             if let Ok(a) = Actor::parse_canonical(&owner)
                 && a.is_local_to(&self.home)
+                && !skip.contains(a.handle())
             {
-                want.entry(a.handle().to_owned()).or_insert(kind::MESSAGE);
+                want.insert(a.handle().to_owned(), kind::MESSAGE);
             }
         }
-        if m.author.is_local_to(&self.home) {
-            want.remove(m.author.handle());
-        }
-        Ok(want)
+        self.drop_author(m, &mut want);
+        self.make(m, want).await
     }
 
-    /// The effective mode of `owner` for channel `channel_id` of
-    /// `group_id` (§10.2): the channel's setting, else the group's, else
-    /// `mentions`.
-    async fn effective_mode(
-        &self,
-        owner: &str,
-        channel_id: &str,
-        group_id: &str,
-    ) -> Result<String, DbError> {
-        // A setting being cleared reads as an empty mode: no setting.
-        let set = |m: Option<String>| m.filter(|m| !m.is_empty());
-        if let Some(m) = set(self
+    /// Make the entries `want` names for `m`, for the candidates every
+    /// rule allows, and announce them.
+    async fn make(&self, m: &StoredMessage, want: Candidates) -> Result<(), MakeError> {
+        if want.is_empty() {
+            return Ok(());
+        }
+        let channel_id = m.channel_id.as_str();
+        let actors: Vec<Actor> = want
+            .keys()
+            .filter_map(|h| Actor::new(h, self.home.clone()).ok())
+            .collect();
+        // 1. Who can read the channel: one batched membership lookup, or
+        //    none when anyone may read it.
+        let readers = self.groups.readers_among(channel_id, &actors).await?;
+        let handles: Vec<String> = readers.iter().map(|a| a.handle().to_owned()).collect();
+        // 2. Whose account is active.
+        let active = self.accounts.active_handles(&handles).await?;
+        let owners: Vec<String> = readers
+            .iter()
+            .filter(|a| active.contains(a.handle()))
+            .map(ToString::to_string)
+            .collect();
+        // 3. Whose effective mode allows the entry.
+        let modes = self
             .settings
-            .mode(owner, scope::CHANNEL, channel_id)
-            .await?)
-        {
-            return Ok(m);
-        }
-        if let Some(m) = set(self.settings.mode(owner, scope::GROUP, group_id).await?) {
-            return Ok(m);
-        }
-        Ok(mode::MENTIONS.to_owned())
+            .effective_modes(&owners, channel_id, m.group_id.as_str())
+            .await?;
+        let work: Vec<_> = readers
+            .into_iter()
+            .filter_map(|actor| {
+                let k = *want.get(actor.handle())?;
+                let mode = modes.get(&actor.to_string())?;
+                let allowed = mode != mode::NONE && (k != kind::MESSAGE || mode == mode::ALL);
+                allowed.then(|| self.insert(m, actor, k))
+            })
+            .collect();
+        let made: Vec<(Actor, StoredEntry)> = stream::iter(work)
+            .buffer_unordered(CONCURRENCY)
+            .filter_map(|made| async move { made })
+            .collect()
+            .await;
+        self.announce(channel_id, made).await
     }
 
-    /// Make `handle`'s entry of `kind` for `m`, if every rule allows it,
-    /// and announce it.
-    async fn entry_for(
+    /// Write `actor`'s entry of `kind` for `m`: `None` if it was not made
+    /// (one exists already, or the write failed, which is logged here so
+    /// the other candidates' entries are still made).
+    async fn insert(
         &self,
         m: &StoredMessage,
-        handle: &str,
+        actor: Actor,
         kind: &'static str,
-    ) -> Result<(), CandidateError> {
-        let Ok(actor) = Actor::new(handle, self.home.clone()) else {
-            return Ok(());
-        };
+    ) -> Option<(Actor, StoredEntry)> {
         let owner = actor.to_string();
-        let mode = self
-            .effective_mode(&owner, m.channel_id.as_str(), m.group_id.as_str())
-            .await?;
-        if mode == mode::NONE || (kind == kind::MESSAGE && mode != mode::ALL) {
-            return Ok(());
-        }
-        if !self
-            .accounts
-            .find_user(handle)
-            .await?
-            .is_some_and(|u| u.is_active())
-        {
-            return Ok(());
-        }
-        if self
-            .groups
-            .readable_channel(&actor, m.channel_id.as_str())
-            .await?
-            .is_none()
-        {
-            return Ok(());
-        }
         let author = m.author.to_string();
         let new = NewEntry {
             owner: &owner,
@@ -185,18 +192,49 @@ impl Notifications {
             author: &author,
             now: m.created_at.as_second(),
         };
-        let Some(stored) = self.feed.insert(&new).await? else {
-            return Ok(());
-        };
+        match self.feed.insert(&new).await {
+            Ok(stored) => stored.map(|s| (actor, s)),
+            Err(e) => {
+                tracing::error!(error = %e, user = %owner, message = %m.id, "making a notification entry failed");
+                None
+            }
+        }
+    }
+
+    /// Send `notification.created` for each entry `made`, to owners who
+    /// can still read the channel. Readability is read again here, after
+    /// the writes, so access lost while the entries were written sends
+    /// nothing; the event carries no counts. An entry left unsent this way
+    /// stays stored, unlisted while the channel is unreadable (`visible`).
+    async fn announce(
+        &self,
+        channel_id: &str,
+        made: Vec<(Actor, StoredEntry)>,
+    ) -> Result<(), MakeError> {
         let Some(hub) = self.hub.get().and_then(Weak::upgrade) else {
             return Ok(());
         };
-        let event = NotificationCreated {
-            notification: to_wire(&stored)?,
-        };
-        match serde_json::to_value(event) {
-            Ok(data) => hub.send_to_actor(&actor, NOTIFICATION_CREATED, data),
-            Err(e) => tracing::error!(error = %e, "serializing notification.created failed"),
+        if made.is_empty() {
+            return Ok(());
+        }
+        let owners: Vec<Actor> = made.iter().map(|(a, _)| a.clone()).collect();
+        let still = self.groups.readers_among(channel_id, &owners).await?;
+        // Nothing is awaited from the read above to the last send.
+        for (actor, stored) in made {
+            if !still.contains(&actor) {
+                continue;
+            }
+            let notification = match to_wire(&stored) {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::error!(error = %e, "a stored notification has no wire form");
+                    continue;
+                }
+            };
+            match serde_json::to_value(NotificationCreated { notification }) {
+                Ok(data) => hub.send_to_actor(&actor, NOTIFICATION_CREATED, data),
+                Err(e) => tracing::error!(error = %e, "serializing notification.created failed"),
+            }
         }
         Ok(())
     }

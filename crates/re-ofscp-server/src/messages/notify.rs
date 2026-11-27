@@ -4,8 +4,11 @@
 //! `Messages::create` runs the returned future in a task of its own and
 //! waits for it, outside the channel's lock: a client that drops its
 //! request mid-way still leaves every entry made, and a client that waits
-//! sees its message's entries in place when the create answers. A failure
-//! there is the notifier's to log; the message stands either way.
+//! sees what the future made in place when the create answers. Work whose
+//! size the author does not control (the feed's `message` entries for
+//! `all` settings) the notifier spawns itself and leaves out of the future,
+//! so it never holds up the create. A failure is the notifier's to log;
+//! the message stands either way.
 
 use std::future::Future;
 use std::pin::Pin;

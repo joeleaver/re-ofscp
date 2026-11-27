@@ -53,26 +53,71 @@ unsigned caller `401`.
 The messages module tells the feed of each **created** channel message
 through the `Notify` seam (`src/messages/notify.rs`), from
 `Messages::create` once `write_new` has returned a new message: edits,
-deletes and `clientMessageId` retries make nothing. The work runs in a task
-of its own, which `create` awaits outside the channel's lock: a dropped
-request still finishes it, and a client sees its entries in place when the
-create answers. A failure there is logged; the message stands.
+deletes and `clientMessageId` retries make nothing. A failure anywhere is
+logged; the message stands.
 
-Candidates are the local users the message mentions, the local author of
-its parent (a reply), and every user whose channel or group setting is
-`all`. Each candidate gets at most one entry (a `@unique` `source_key`
+Candidates come in two sets, made separately:
+
+- **Direct:** the local users the message mentions (at most 100, below)
+  and the local author of its parent (a reply). The author controls how
+  many there are, and the bound keeps it small, so these are made in the
+  seam's future, which `create` runs in a task of its own and awaits
+  outside the channel's lock: a dropped request still finishes it, and a
+  client sees its mention and reply entries in place when the create
+  answers.
+- **`all`:** every user whose channel or group setting is `all`, less the
+  direct candidates (whose entry, if they get one, outranks a `message`
+  entry; if a rule refuses them one, it refuses the `message` entry too).
+  Any local account may hold an `all` setting for any scope (§10.2; the
+  scope is not checked, see *Endpoints*), so their number is not the
+  author's to bound and the create must not wait on it. The seam starts
+  this work in its own spawned task (`src/notifications/background.rs`)
+  before its future runs and does not await it. At most 4 such tasks run
+  at once; the rest wait their turn, so the feed's background work holds a
+  bounded share of the database however many settings exist. Nothing is
+  dropped: a task that waits still runs, and finishes whatever becomes of
+  the request. Tests (and graceful shutdown, for up to 10 s) wait for
+  them with `Notifications::flush`, which returns once every task started
+  so far has finished.
+
+Each candidate gets at most one entry (a `@unique` `source_key`
 `"{owner} {message_id}"` enforces it), of type mention, else reply, else
-message, and only if, checked at that moment:
+message, and only if, checked at that moment, in this order:
 
 1. they are not the author;
-2. their effective mode (channel setting, else group setting, else
-   `mentions`) is not `none`, and is `all` for a `message` entry;
-3. their account exists and is active;
-4. they can read the channel (`Groups::readable_channel`), so a mention
-   never discloses a message to someone who could not read it.
+2. they can read the channel (`Groups::readers_among`: the group and
+   channel read once, every candidate's membership in one batched lookup,
+   none when anyone may read the channel), so a mention never discloses a
+   message to someone who could not read it;
+3. their account exists and is active (`AccountStore::active_handles`, one
+   batched lookup);
+4. their effective mode (channel setting, else group setting, else
+   `mentions`) is not `none`, and is `all` for a `message` entry
+   (`SettingStore::effective_modes`, batched lookups by setting key).
+
+Each check runs once over every candidate still standing, cheapest and
+most selective first, so a candidate who fails one costs a share of one
+batched lookup, not a query of their own. In a channel only members can
+read, `all` settings held by non-members (throwaway accounts included)
+are dropped at step 2. Only candidates who pass every check cost writes:
+those are users who can read the channel and asked for every message,
+and their entries are never skipped.
 
 Each entry made is announced as `notification.created` `{notification}` to
-the owner's connections (`Hub::send_to_actor`).
+the owner's connections (`Hub::send_to_actor`). Readability is read again
+(one batched check) after the entries are written and just before the
+events are sent, with nothing awaited between that read and the sends, so
+access lost while the entries were written sends no event. The event
+carries no counts. What remains is the time between that read and the
+in-process send: a removal committed in it can still be followed by one
+event. An entry left unsent stays stored and, like every entry, is not
+listed, counted or marked while its channel is unreadable (*Reading the
+feed*).
+
+Feed order is the order entries were made (positions, below). A
+`message` entry made in the background can therefore come after the
+mention entry of a later message; `createdAt` is always the source
+message's creation time.
 
 ### Mentions (`src/notifications/mentions.rs`)
 
@@ -90,6 +135,12 @@ silent, the conservative reading:
   (§2.2). If that is not a valid authority, the whole reference is no
   mention, never a bare `@handle`: a malformed qualified mention must not
   notify a local namesake.
+- At most 100 users are mentioned (`MAX_MENTIONS`, the bound on the
+  explicit list): references are deduplicated first, mentions of users of
+  other providers are not counted, and the first 100 distinct local users
+  in order of appearance are the ones mentioned. Without the cap, a 16 KiB
+  text of `@abc @abd …` would name some 3,200 candidates, every one
+  checked while the create waits.
 
 ### Reading the feed (`src/notifications/mod.rs`)
 
@@ -125,16 +176,22 @@ rhypedb has no ordering, counting or projection, so everything is bounded:
   {scope_id}"`; a `PUT` is an upsert. A `DELETE` first claims the row with a
   guarded update (so of two racing clears exactly one reports `cleared:
   true`), then deletes it.
-- **`all` settings of a scope** are listed by offset paging over the
-  scope's indexed rows, 1000 per page. Up to 1000 such settings the list is
-  one snapshot. Past that, a setting of the same scope changed or removed
-  while the pages are read can shift a row into a page already read, and
-  that user gets no `message` entry for that one message. Mentions and
-  replies never depend on this list.
+- **`all` settings of a scope** are listed by ranges of `owner`, which is
+  unique within a scope (`src/db/key_range.rs`). rhypedb promises no order
+  for a filter's results, so offset paging could skip or repeat rows.
+  Instead each range `(after, through]` is read whole in one query (one
+  snapshot); a range that comes back with more than 1000 rows is narrowed
+  at the middle owner read and read again, as `Messages::number_all` walks
+  channel logs. A row's owner never changes, so a setting that is `all`
+  throughout the read lies in exactly one range and is always found,
+  whatever else changes meanwhile; only a setting changed during the read
+  may or may not be seen, as with any read racing a write.
 
 ### Latency
 
-The create waits for its entries, which for a channel with many `all`
-users is many small reads (16 candidates at a time). This keeps the feed
-consistent with what the author's client saw. If it becomes a problem the
-seam can stop awaiting the task without changing anything else.
+The create waits only for its mention and reply entries: at most 101
+candidates, checked in a few batched lookups, then one write sequence per
+entry (16 at a time). `message` entries for `all` settings are made after
+the create has answered, normally within moments; a client that reads its
+feed at once may not see them yet, and sees them in the order they were
+made.

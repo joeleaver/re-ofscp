@@ -3,13 +3,15 @@
 //! `"{owner} {scope_type} {scope_id}"`. Neither a canonical actor, a scope
 //! type nor a local id holds a space, so the key is unambiguous.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use ofscp_core::LocalId;
 use ofscp_core::wire::{NotificationMode, NotificationScope, NotificationSetting};
 use serde::Deserialize;
 
-use crate::db::{Db, DbError, Ql};
+use crate::db::lookup::lookup;
+use crate::db::{Db, DbError, Ql, key_range};
 use crate::messages::locks::ChannelLocks;
 
 /// Settings one user may hold. A user's settings are listed whole, so they
@@ -20,7 +22,8 @@ use crate::messages::locks::ChannelLocks;
 pub const MAX_SETTINGS_PER_USER: usize = 1000;
 /// Most rows a listing reads.
 const LIST_LIMIT: usize = 2 * MAX_SETTINGS_PER_USER;
-/// Rows read per page when listing a scope's `all` settings.
+/// Rows a range holds before it is narrowed, when listing a scope's `all`
+/// settings ([`key_range::read_all`]).
 const SCAN_PAGE: usize = 1000;
 
 /// `scope_type` values.
@@ -92,14 +95,25 @@ pub struct SettingStore {
     db: Arc<Db>,
     /// Per-owner turns at `PUT`, in this process.
     turns: ChannelLocks,
+    /// Rows a range of [`Self::all_mode_owners`] holds before it is
+    /// narrowed.
+    scan_page: usize,
 }
 
 impl SettingStore {
     /// Settings stored in `db`.
     pub fn new(db: Arc<Db>) -> Self {
+        Self::with_scan_page(db, SCAN_PAGE)
+    }
+
+    /// Settings stored in `db`, listing a scope's `all` settings by ranges
+    /// of at most `scan_page` rows (at least 2): small ranges let tests
+    /// reach the narrowing with a handful of rows.
+    pub fn with_scan_page(db: Arc<Db>, scan_page: usize) -> Self {
         Self {
             db,
             turns: ChannelLocks::default(),
+            scan_page: scan_page.max(2),
         }
     }
 
@@ -117,25 +131,6 @@ impl SettingStore {
             .into_iter()
             .map(|r| r.data)
             .collect())
-    }
-
-    /// `owner`'s mode for the scope, if they set one.
-    pub async fn mode(
-        &self,
-        owner: &str,
-        scope_type: &str,
-        scope_id: &str,
-    ) -> Result<Option<String>, DbError> {
-        let q = Ql::new("NotificationSetting.filter(.key == ")
-            .str(&key(owner, scope_type, scope_id))
-            .raw(")");
-        Ok(self
-            .db
-            .fetch::<StoredSetting>(&q)
-            .await?
-            .into_iter()
-            .next()
-            .map(|r| r.data.mode))
     }
 
     /// Store `mode` for `owner`'s scope at `now`, replacing any earlier
@@ -221,44 +216,93 @@ impl SettingStore {
         Ok(claimed)
     }
 
-    /// Every owner whose mode for the scope is `all`.
+    /// The effective mode (§10.2) of each of `owners` for channel
+    /// `channel_id` of `group_id`: their channel setting, else their group
+    /// setting, else [`mode::MENTIONS`]. A setting being cleared (empty
+    /// mode) is no setting. Read in batched point lookups by `key`, the
+    /// group's only for owners with no channel setting.
+    pub async fn effective_modes(
+        &self,
+        owners: &[String],
+        channel_id: &str,
+        group_id: &str,
+    ) -> Result<BTreeMap<String, String>, DbError> {
+        let mut out = self.modes(owners, scope::CHANNEL, channel_id).await?;
+        let rest: Vec<String> = owners
+            .iter()
+            .filter(|o| !out.contains_key(*o))
+            .cloned()
+            .collect();
+        let group = self.modes(&rest, scope::GROUP, group_id).await?;
+        for owner in rest {
+            let m = group
+                .get(&owner)
+                .cloned()
+                .unwrap_or_else(|| mode::MENTIONS.to_owned());
+            out.insert(owner, m);
+        }
+        Ok(out)
+    }
+
+    /// The modes those of `owners` who set one hold for the scope.
+    async fn modes(
+        &self,
+        owners: &[String],
+        scope_type: &str,
+        scope_id: &str,
+    ) -> Result<BTreeMap<String, String>, DbError> {
+        let keys: Vec<String> = owners
+            .iter()
+            .map(|o| key(o, scope_type, scope_id))
+            .collect();
+        let rows: Vec<StoredSetting> =
+            lookup(&self.db, "NotificationSetting.filter(", ".key == ", &keys).await?;
+        Ok(rows
+            .into_iter()
+            .filter(|r| !r.mode.is_empty())
+            .map(|r| (r.owner, r.mode))
+            .collect())
+    }
+
+    /// Every owner whose mode for the scope is `all`, however many.
     ///
-    /// rhypedb cannot order, so this pages by offset over the scope's rows.
-    /// A scope's rows fit in one page up to [`SCAN_PAGE`] settings, and then
-    /// the answer is one snapshot; past that, a setting of the same scope
-    /// changed or removed while the pages are read can shift a row from an
-    /// unread page into one already read, and that owner gets no `message`
-    /// entry for this one message (decision 0023).
+    /// rhypedb promises no order, so the scope's rows are read by ranges of
+    /// `owner` (unique within a scope, as the key is), each range whole in
+    /// one query ([`key_range::read_all`]). A setting that is `all`
+    /// throughout the read is always found; one changed meanwhile may or
+    /// may not be, as with any read racing a write.
     pub async fn all_mode_owners(
         &self,
         scope_type: &str,
         scope_id: &str,
     ) -> Result<Vec<String>, DbError> {
-        let mut out = Vec::new();
-        let mut offset = 0u64;
-        loop {
-            let q = Ql::new("NotificationSetting.filter(.scope_id == ")
-                .str(scope_id)
-                .raw(" && .scope_type == ")
-                .str(scope_type)
-                .raw(" && .mode == ")
-                .str(mode::ALL)
-                .raw(").offset(")
-                .uint(offset)
-                .raw(").limit(")
-                .uint(SCAN_PAGE as u64)
-                .raw(")");
-            let rows = self.db.fetch::<StoredSetting>(&q).await?;
-            let full = rows.len() == SCAN_PAGE;
-            out.extend(rows.into_iter().map(|r| r.data.owner));
-            if !full {
-                break;
-            }
-            offset += SCAN_PAGE as u64;
-        }
-        out.sort();
-        out.dedup();
-        Ok(out)
+        let db = &self.db;
+        key_range::read_all(
+            self.scan_page,
+            String::as_str,
+            |after, through, limit| async move {
+                let q = Ql::new("NotificationSetting.filter(.scope_id == ")
+                    .str(scope_id)
+                    .raw(" && .scope_type == ")
+                    .str(scope_type)
+                    .raw(" && .mode == ")
+                    .str(mode::ALL)
+                    .raw(" && .owner > ")
+                    .str(&after);
+                let q = match through {
+                    Some(t) => q.raw(" && .owner <= ").str(&t),
+                    None => q,
+                };
+                let q = q.raw(").limit(").uint(limit).raw(")");
+                Ok(db
+                    .fetch::<StoredSetting>(&q)
+                    .await?
+                    .into_iter()
+                    .map(|r| r.data.owner)
+                    .collect())
+            },
+        )
+        .await
     }
 }
 

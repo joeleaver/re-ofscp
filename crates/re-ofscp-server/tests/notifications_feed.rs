@@ -12,6 +12,7 @@ use common::messages::{call, post, text};
 use common::notifications::{
     Cast, FEED, SETTINGS, all_entries, counts, entries, feed, mark, prefs, set,
 };
+use re_ofscp_server::notifications::settings::SettingStore;
 use re_ofscp_server::notifications::store::{FEED_CAP, FeedStore, NewEntry, kind};
 use re_ofscp_server::timefmt;
 use serde_json::{Value, json};
@@ -251,6 +252,41 @@ async fn a_deleted_channels_entries_and_settings_are_purged_by_the_sweeper() {
         left,
         [json!({"scopeType": "group", "scopeId": cast.chan.g, "mode": "all"})]
     );
+}
+
+#[tokio::test]
+async fn a_scopes_all_settings_are_listed_whole_across_narrowed_ranges() {
+    let cast = Cast::new().await;
+    let now = SIGNED_AT.unix_timestamp();
+    // Ranges of at most 3 rows: 20 matching rows need many narrowings.
+    let store = SettingStore::with_scan_page(cast.env.state.db.clone(), 3);
+    let mut want = Vec::new();
+    for i in 0..26 {
+        let owner = format!("u{i:02}@a.example");
+        let mode = if i % 4 == 3 { "mentions" } else { "all" };
+        store
+            .put(&owner, "channel", "chn_scanned", mode, now)
+            .await
+            .unwrap();
+        // The same owner's settings of other scopes are not listed.
+        store
+            .put(&owner, "group", "chn_scanned", "all", now)
+            .await
+            .unwrap();
+        store
+            .put(&owner, "channel", "chn_other", "all", now)
+            .await
+            .unwrap();
+        if mode == "all" {
+            want.push(owner);
+        }
+    }
+    let mut got = store
+        .all_mode_owners("channel", "chn_scanned")
+        .await
+        .unwrap();
+    got.sort();
+    assert_eq!(got, want);
 }
 
 #[tokio::test]

@@ -55,8 +55,10 @@ impl Cast {
     }
 }
 
-/// `GET /api/me/notifications{query}` as `by`; panics unless `200`.
+/// `GET /api/me/notifications{query}` as `by`, once every entry left to the
+/// background so far is made; panics unless `200`.
 pub async fn feed(env: &Env, by: &Party, query: &str) -> Value {
+    env.state.notifications.flush().await;
     let (s, body) = call(env, Some(by), "GET", &format!("{FEED}{query}"), None).await;
     assert_eq!(s, StatusCode::OK, "{body}");
     assert_valid(&schema("notifications-response.json"), &body);

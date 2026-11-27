@@ -4,6 +4,7 @@
 //! - [`mentions`]: who a message mentions.
 //! - [`create`]: making entries when a channel message is created (the
 //!   [`crate::messages::Notify`] seam).
+//! - [`background`]: the part of that a create does not wait for.
 //! - [`store`]: the `Notification` rows and each user's feed positions.
 //! - [`settings`]: the `NotificationSetting` rows.
 //! - [`request`]: reading queries and bodies (`400`s).
@@ -14,6 +15,7 @@
 //! requirements 5 and 7): never made, never listed, never counted and never
 //! marked, so nothing tells the user more than the channel would.
 
+pub mod background;
 pub mod create;
 pub mod mentions;
 pub mod request;
@@ -34,6 +36,7 @@ use crate::db::{Db, DbError};
 use crate::groups::Groups;
 use crate::timefmt;
 use crate::ws::Hub;
+use background::Background;
 use request::{ListQuery, Scope};
 use settings::{PutError, SettingStore};
 use store::{FeedStore, Mark, StoredEntry, kind};
@@ -71,6 +74,8 @@ pub struct Notifications {
     /// Where `notification.created` goes; attached once the hub is built
     /// (the hub owns the messages that own this, so it is held weakly).
     hub: OnceLock<Weak<Hub>>,
+    /// `message` entries being made off the request path.
+    background: Background,
 }
 
 impl std::fmt::Debug for Notifications {
@@ -92,6 +97,7 @@ impl Notifications {
             groups,
             accounts,
             hub: OnceLock::new(),
+            background: Background::default(),
         }
     }
 
@@ -101,6 +107,14 @@ impl Notifications {
         if self.hub.set(Arc::downgrade(hub)).is_err() {
             tracing::warn!("notifications are already attached to a hub; ignoring another");
         }
+    }
+
+    /// Wait until every entry a create left to the background so far has
+    /// been made (or has failed, which is logged): for tests, which then
+    /// see the `message` entries of what they posted, and for graceful
+    /// shutdown.
+    pub async fn flush(&self) {
+        self.background.flush().await;
     }
 
     /// `actor`'s entries about channels they can read now.

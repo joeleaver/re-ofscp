@@ -12,12 +12,20 @@
 //! being cut to fit; an `@` straight after the handle that does not start a
 //! valid authority makes the whole reference no mention, rather than a
 //! bare one, so a malformed `@handle@…` never notifies a local namesake.
+//!
+//! At most [`MAX_MENTIONS`] users are mentioned, the explicit list's bound:
+//! a text of thousands of `@` references names only the first
+//! [`MAX_MENTIONS`] distinct local users, so a message costs a bounded
+//! amount of feed work however it is written.
 
 use ofscp_core::{Actor, Authority};
 
+use crate::messages::validate::MAX_MENTIONS;
+
 /// The local handles `mentions` names, or `text` mentions when `mentions`
-/// is absent, deduplicated, in order of first appearance. Mentions of
-/// users of other providers are left out: the feed is provider-local.
+/// is absent, deduplicated, in order of first appearance, and at most
+/// [`MAX_MENTIONS`] of them. Mentions of users of other providers are left
+/// out (the feed is provider-local) and do not count toward the bound.
 pub fn local_mentions(
     mentions: Option<&[Actor]>,
     text: Option<&str>,
@@ -29,6 +37,9 @@ pub fn local_mentions(
     };
     let mut out: Vec<String> = Vec::new();
     for a in actors {
+        if out.len() == MAX_MENTIONS {
+            break;
+        }
         if a.is_local_to(home) && !out.iter().any(|h| h == a.handle()) {
             out.push(a.handle().to_owned());
         }
@@ -172,5 +183,21 @@ mod tests {
             local_mentions(None, Some("@bob @bob @dave@b.example"), &home()),
             ["bob"]
         );
+    }
+
+    #[test]
+    fn parsed_mentions_are_deduplicated_then_capped() {
+        // Thousands of references, as a 16 KiB text can hold.
+        let text: String = (0..3000).map(|i| format!("@u{i:04} ")).collect();
+        let got = local_mentions(None, Some(&text), &home());
+        assert_eq!(got.len(), MAX_MENTIONS);
+        assert_eq!(got[0], "u0000");
+        assert_eq!(got[MAX_MENTIONS - 1], format!("u{:04}", MAX_MENTIONS - 1));
+
+        // Repeats and users of other providers do not use up the bound.
+        let mut text = "@bob ".repeat(500);
+        text.push_str(&"@dave@b.example ".repeat(500));
+        text.push_str("@carol");
+        assert_eq!(local_mentions(None, Some(&text), &home()), ["bob", "carol"]);
     }
 }

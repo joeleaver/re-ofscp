@@ -6,6 +6,7 @@
 //! read here that returns a [`User`] skips it, and the admin listings show
 //! it with the status [`status::PENDING`].
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use base64::Engine as _;
@@ -95,6 +96,12 @@ struct UserRow {
 }
 
 impl UserRow {
+    /// Whether the row is an active account, not a pending registration:
+    /// what [`User::is_active`] answers of [`Self::into_user`].
+    fn is_active_account(&self) -> bool {
+        self.pending != Some(true) && self.status == status::ACTIVE
+    }
+
     fn into_user(self, id: u64) -> Option<User> {
         (self.pending != Some(true)).then_some(User {
             id,
@@ -245,6 +252,19 @@ impl AccountStore {
         let q = Ql::new("User.filter(.handle == ").str(handle).raw(")");
         let rows = self.db.fetch::<UserRow>(&q).await?;
         Ok(rows.into_iter().next().and_then(|r| r.data.into_user(r.id)))
+    }
+
+    /// Those of `handles` that name an active account (not disabled, not a
+    /// pending registration), in batched point lookups by the `@unique`
+    /// handle.
+    pub async fn active_handles(&self, handles: &[String]) -> Result<BTreeSet<String>, StoreError> {
+        let rows: Vec<UserRow> =
+            crate::db::lookup::lookup(&self.db, "User.filter(", ".handle == ", handles).await?;
+        Ok(rows
+            .into_iter()
+            .filter(UserRow::is_active_account)
+            .map(|r| r.handle)
+            .collect())
     }
 
     /// Up to `limit` accounts whose handle contains `contains` (every

@@ -125,6 +125,9 @@ async fn mention_beats_reply_beats_message_one_entry_each() {
     // at most one, of the highest type.
     set(env, &cast.bob, "channel", &cast.chan.c, "all").await;
     let plain = say(&cast, &cast.alice, text("news")).await;
+    // `message` entries are made in the background: let this one land
+    // before the next message's, so the feed's order is known.
+    env.state.notifications.flush().await;
     let mention = say(&cast, &cast.alice, text("@bob news")).await;
     let replied = say(&cast, &cast.alice, reply("more", &parent)).await;
     assert_eq!(
@@ -213,6 +216,7 @@ async fn nobody_who_cannot_read_the_channel_or_has_no_active_account_is_notified
         .await
         .unwrap();
     say(&cast, &cast.alice, text("@carol @nobody hello")).await;
+    env.state.notifications.flush().await;
     let rows = env
         .state
         .db
@@ -287,4 +291,45 @@ async fn notification_created_reaches_only_the_recipient() {
     }
     assert!(carol.silent_for(QUIET).await);
     assert!(alice.silent_for(QUIET).await);
+}
+
+#[tokio::test]
+async fn every_reader_set_to_all_gets_a_message_entry_and_an_event() {
+    let cast = Cast::new().await;
+    let env = &cast.env;
+    let erin = local(env, "erin").await;
+    let frank = local(env, "frank").await;
+    common::groups::join(env, &cast.chan.g, &erin, "member").await;
+    common::groups::join(env, &cast.chan.g, &frank, "member").await;
+    // Outsiders of the private group, set to `all` on its scopes.
+    let dave = local(env, "dave").await;
+    let gina = local(env, "gina").await;
+    for (who, scope, id) in [
+        (&cast.bob, "group", &cast.chan.g),
+        (&erin, "group", &cast.chan.g),
+        (&dave, "group", &cast.chan.g),
+        (&cast.carol, "channel", &cast.chan.c),
+        (&frank, "channel", &cast.chan.c),
+        (&gina, "channel", &cast.chan.c),
+        (&cast.alice, "channel", &cast.chan.c),
+    ] {
+        set(env, who, scope, id, "all").await;
+    }
+    let mut phone = connect(&cast, &cast.bob).await;
+    let mut outsider = connect(&cast, &dave).await;
+
+    let m = say(&cast, &cast.alice, text("news")).await;
+    for who in [&cast.bob, &cast.carol, &erin, &frank] {
+        assert_eq!(all_entries(env, who).await, want(&[("message", &m)]));
+    }
+    // Neither the outsiders nor the author.
+    for who in [&dave, &gina, &cast.alice] {
+        assert!(all_entries(env, who).await.is_empty());
+    }
+    let e = phone.event().await;
+    assert_eq!(e["type"], "notification.created", "{e}");
+    assert_valid(&schema("ws/notification-created.json"), &e);
+    assert_eq!(e["data"]["notification"]["type"], "message");
+    assert_eq!(e["data"]["notification"]["sourceMessageId"], m.as_str());
+    assert!(outsider.silent_for(QUIET).await);
 }

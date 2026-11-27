@@ -16,6 +16,7 @@
 //! a cancelled caller cannot poison a connection.
 
 pub mod doc;
+pub mod key_range;
 pub mod lookup;
 pub mod ql;
 

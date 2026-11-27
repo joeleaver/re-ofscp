@@ -5,6 +5,8 @@ use tracing_subscriber::EnvFilter;
 /// How long startup waits for the replay ledger and the federation policy
 /// before serving (both keep retrying in the background after that).
 const STARTUP_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long shutdown waits for background notification entries.
+const NOTIFICATION_DRAIN: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -111,6 +113,7 @@ async fn main() -> anyhow::Result<()> {
     let number_messages = tokio::spawn(state.messages.clone().number_forever());
     let ws_recheck = tokio::spawn(state.ws.clone().recheck_forever());
     let hub = state.ws.clone();
+    let notifications = state.notifications.clone();
     let app = router(state);
     axum::serve(
         listener,
@@ -122,6 +125,14 @@ async fn main() -> anyhow::Result<()> {
         hub.shutdown().await;
     })
     .await?;
+    // Feed entries the drained requests left to the background
+    // (docs/decisions/0023), given a bounded time to finish.
+    if tokio::time::timeout(NOTIFICATION_DRAIN, notifications.flush())
+        .await
+        .is_err()
+    {
+        tracing::warn!("shutting down before every notification entry was made");
+    }
     ws_recheck.abort();
     stop_replay.abort();
     if let Some(task) = load_policy {
