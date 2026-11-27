@@ -5,7 +5,8 @@
 //! * [`conn`]: one connection, from the `auth.challenge` to its close.
 //! * [`commands`]: the commands of an authenticated connection; the
 //!   messaging ones are in `message_commands`, typing state in `typing`.
-//! * [`live`]: delivering channel events, access checked at publish.
+//! * [`live`]: delivering channel events, access checked at publish by
+//!   [`Hub::publish_to_readers`].
 //! * [`registry`]: live connections, caps, subscriptions and fan-out.
 //! * [`access`]: re-checking access, revocation, federation policy.
 //! * [`lease`]: re-confirming a remote actor's key.
@@ -13,6 +14,7 @@
 //!   timeline, federation policy).
 //! * [`channels`]: channel access from the groups module, and its access
 //!   changes fed into the re-checks.
+//! * [`members`]: emitting `member.updated`.
 //!
 //! Other subsystems talk to connections through [`Hub`]: they publish
 //! events to a topic or an actor, report access changes, and force-close.
@@ -24,6 +26,7 @@ pub mod conn;
 mod handshake;
 pub mod lease;
 pub mod live;
+pub mod members;
 mod message_commands;
 pub mod protocol;
 pub mod registry;
@@ -216,9 +219,9 @@ impl Hub {
     /// of theirs caused it.
     ///
     /// It does not check access itself: a subscription a just-committed
-    /// change revoked stays live until the group follower holds it. Its
-    /// first production caller must close that window first (decision
-    /// 0010, "The window between a commit and its hold").
+    /// change revoked stays live until the group follower holds it.
+    /// Channel events go through [`Hub::publish_to_readers`], which closes that
+    /// window (decision 0010, "The window between a commit and its hold").
     pub fn publish(&self, topic: &str, kind: &str, data: Value) {
         let text: Arc<str> = protocol::event(kind, None, data, self.now()).into();
         self.registry.publish(topic, kind, &text);

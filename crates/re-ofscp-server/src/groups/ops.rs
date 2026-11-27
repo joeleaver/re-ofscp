@@ -23,7 +23,7 @@ use crate::db::DbError;
 /// How often an edit is retried against a fresh read before the request
 /// is answered `409`. Each retry follows another edit's success, so a
 /// `409` means the object really did keep changing.
-const UPDATE_ATTEMPTS: usize = 5;
+pub(super) const UPDATE_ATTEMPTS: usize = 5;
 
 /// How long after writing a pending row its writer may still activate it.
 /// The sweeper deletes pending rows older than [`PENDING_TTL`], and its
@@ -33,7 +33,7 @@ const UPDATE_ATTEMPTS: usize = 5;
 /// server stalling one statement for minutes. The data layer's 10 s
 /// timeout only stops the client waiting and does not rule that out
 /// (docs/decisions/0014). A writer slower than this takes its row back.
-const ACTIVATE_WITHIN: Duration = PENDING_TTL.saturating_sub(Duration::from_secs(300));
+pub(super) const ACTIVATE_WITHIN: Duration = PENDING_TTL.saturating_sub(Duration::from_secs(300));
 const _: () = assert!(
     PENDING_TTL.as_secs() >= 2 * 300,
     "PENDING_TTL must be at least 600 s, leaving ACTIVATE_WITHIN at least 300 s"
@@ -79,13 +79,13 @@ pub struct ReadableGroup {
     pub standing: Standing,
 }
 
-const NO_GROUP: &str = "no such group";
+pub(super) const NO_GROUP: &str = "no such group";
 const NO_CHANNEL: &str = "no such channel";
 const GROUP_HIDDEN: &str = "this group is visible to its members only";
 const GROUP_LIMIT: &str = "you already own the most groups this provider allows";
 const CHANNEL_LIMIT: &str = "this group has the most channels this provider allows";
-const NOT_MANAGER: &str = "you may not manage this group";
-const SLOW_WRITE: &str = "the write took too long to confirm; retry";
+pub(super) const NOT_MANAGER: &str = "you may not manage this group";
+pub(super) const SLOW_WRITE: &str = "the write took too long to confirm; retry";
 
 impl Groups {
     /// The group, if it exists (`404`) and the caller may read it (`403`,
@@ -214,9 +214,15 @@ impl Groups {
         Ok(group.to_wire())
     }
 
-    /// `GET /api/groups/{groupId}`.
+    /// `GET /api/groups/{groupId}`, with the caller's own `membership`
+    /// when they are a member (§5.5).
     pub async fn get_group(&self, caller: &Caller, group_id: &str) -> Result<Group, GroupError> {
-        Ok(self.read_group(caller, group_id).await?.group.to_wire())
+        let g = self.read_group(caller, group_id).await?;
+        let mut wire = g.group.to_wire();
+        if let Caller::Actor(actor) = caller {
+            wire.membership = self.membership(&g.group, actor, &g.standing).await?;
+        }
+        Ok(wire)
     }
 
     /// `PATCH /api/groups/{groupId}`: needs `manage`.
@@ -241,7 +247,8 @@ impl Groups {
             // The lease runs from the clock at claiming, not from the
             // request's `now`, which earlier attempts may have aged; the
             // one write below follows at once.
-            if !self.store.claim(&next, self.now()).await? {
+            let claimed_at = self.now();
+            if !self.store.claim(&next, claimed_at).await? {
                 lost_claim(attempt).await;
                 continue;
             }
@@ -259,6 +266,8 @@ impl Groups {
             if let Some(updated) = written? {
                 return Ok(updated.to_wire());
             }
+            // Wrote nothing: free the revision for the retry (claims.rs).
+            self.store.release(&next, claimed_at).await?;
         }
         Err(GroupError::Conflict("the group kept changing; retry"))
     }
@@ -437,7 +446,8 @@ impl Groups {
             // The lease runs from the clock at claiming, not from the
             // request's `now`, which earlier attempts may have aged; the
             // one write below follows at once.
-            if !self.store.claim(&next, self.now()).await? {
+            let claimed_at = self.now();
+            if !self.store.claim(&next, claimed_at).await? {
                 lost_claim(attempt).await;
                 continue;
             }
@@ -452,6 +462,7 @@ impl Groups {
             if let Some(updated) = written? {
                 return Ok(updated.to_wire());
             }
+            self.store.release(&next, claimed_at).await?;
         }
         Err(GroupError::Conflict("the channel kept changing; retry"))
     }
@@ -491,82 +502,6 @@ impl Groups {
             channel_id: channel_id.to_owned(),
         });
     }
-
-    /// Record `actor` as a member of `group_id` with `role` (the §5.7
-    /// seam). `Ok(false)` if they already belong to the group (the owner
-    /// included). The role `owner` is refused: ownership is the group's
-    /// `owner` field, never a membership. Announces the change.
-    pub async fn add_member(
-        &self,
-        group_id: &str,
-        actor: &Actor,
-        role: &str,
-        now: i64,
-    ) -> Result<bool, GroupError> {
-        // As for channels: the row's age runs from `now`.
-        let started = Instant::now();
-        member_role(role)?;
-        let group = self
-            .store
-            .group(group_id)
-            .await?
-            .ok_or(GroupError::NotFound(NO_GROUP))?;
-        if group.owner == *actor {
-            return Ok(false);
-        }
-        if !self.store.add_member(group_id, actor, role, now).await? {
-            // A row exists. An active one is a membership; a pending one is
-            // another add in flight, or a dead writer's row awaiting expiry.
-            // That is not a membership, so it must not be reported as one.
-            return match self.store.role_of(group_id, actor).await? {
-                Some(_) => Ok(false),
-                None => Err(GroupError::Conflict(
-                    "the membership is being recorded; retry",
-                )),
-            };
-        }
-        // Confirm as for channels: a membership never outlives its group.
-        if self.store.group(group_id).await?.is_none() {
-            self.store.remove_member(group_id, actor).await?;
-            return Err(GroupError::NotFound(NO_GROUP));
-        }
-        if started.elapsed() > ACTIVATE_WITHIN {
-            self.store.remove_member(group_id, actor).await?;
-            return Err(GroupError::Conflict(SLOW_WRITE));
-        }
-        if !self.store.activate_member(group_id, actor).await? {
-            if self.store.group(group_id).await?.is_none() {
-                return Err(GroupError::NotFound(NO_GROUP));
-            }
-            return Err(GroupError::Conflict(
-                "the membership could not be recorded; retry",
-            ));
-        }
-        self.member_changed(group_id, actor);
-        Ok(true)
-    }
-
-    /// Change a member's role (the §5.7 seam). `Ok(false)` if not a
-    /// member. The role `owner` is refused, as for [`Self::add_member`].
-    /// Announces the change.
-    pub async fn set_role(
-        &self,
-        group_id: &str,
-        actor: &Actor,
-        role: &str,
-    ) -> Result<bool, GroupError> {
-        member_role(role)?;
-        let set = self.store.set_role(group_id, actor, role).await;
-        announce_unless(&set, |set| !set, || self.member_changed(group_id, actor));
-        Ok(set?)
-    }
-
-    /// End a membership (the §5.7 seam). Announces the change.
-    pub async fn remove_member(&self, group_id: &str, actor: &Actor) -> Result<(), GroupError> {
-        let removed = self.store.remove_member(group_id, actor).await;
-        announce_unless(&removed, |_| false, || self.member_changed(group_id, actor));
-        Ok(removed?)
-    }
 }
 
 /// Run `announce` after a write that may have changed access: always, unless
@@ -575,7 +510,7 @@ impl Groups {
 /// (the connection dropped after the commit), and live readers must not
 /// keep access it revoked until the next periodic re-check. A spurious
 /// announcement costs only a re-check.
-fn announce_unless<T, E>(
+pub(super) fn announce_unless<T, E>(
     written: &Result<T, E>,
     unchanged: impl FnOnce(&T) -> bool,
     announce: impl FnOnce(),
@@ -587,7 +522,7 @@ fn announce_unless<T, E>(
 
 /// A role a membership may hold: anything but `owner` (which would make
 /// `Standing::Member("owner")`, holding whatever a map grants `owner`).
-fn member_role(role: &str) -> Result<(), GroupError> {
+pub(super) fn member_role(role: &str) -> Result<(), GroupError> {
     if role == roles::OWNER {
         return Err(GroupError::Invalid(Invalid(
             "`owner` is the group's owner field, not a membership role".to_owned(),
@@ -597,7 +532,7 @@ fn member_role(role: &str) -> Result<(), GroupError> {
 }
 
 /// Wait before retrying an edit whose revision claim another edit holds.
-async fn lost_claim(attempt: usize) {
+pub(super) async fn lost_claim(attempt: usize) {
     let factor = u32::try_from(attempt).unwrap_or(u32::MAX);
     tokio::time::sleep(CLAIM_BACKOFF.saturating_mul(factor)).await;
 }

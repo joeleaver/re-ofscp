@@ -275,13 +275,21 @@ Disabling an account closes all of its connections with `4003`.
   the follower also reads the group's channel ids from the database;
   only then does `Hub::access_changed` hold the matching subscriptions.
   An event published to a topic in that window reaches a subscriber whose
-  access the change has already revoked. **Closed by decision 0017** with
-  the first option below: channel events go through `ws::live::HubFanout`,
-  which checks access at publish, and
+  access the change has already revoked. **Closed by decision 0017**
+  (messages) with the first option below: `Hub::publish_to_readers`
+  (`ws/live.rs`) reads the channel's group, channel and subscribers'
+  memberships afresh after the event's commit and delivers only to those
+  who can read the channel now. Message events reach it through
+  `ws::live::HubFanout`; `member.updated` (decision 0020) uses the same
+  path, once per channel of the group. The required tests publish between
+  a revoking commit and the follower's hold and see nothing reach the
+  revoked subscriber:
   `a_revoked_reader_gets_nothing_before_its_subscription_is_held`
-  (`tests/messages_live.rs`) is the required test. Any future publisher
-  must do the same rather than call `Hub::publish` directly. The options
-  were:
+  (`tests/messages_live.rs`) and
+  `an_event_published_before_the_follower_applies_a_revocation_is_not_leaked`
+  (`tests/ws_members.rs`). Any future publisher of channel events must go
+  through `Hub::publish_to_readers` rather than call `Hub::publish`
+  directly. The options were:
   - checking access at publish: the publisher re-runs the
     `TopicAuthorizer` (or the effective-read-access rule) per subscriber
     of the topic, or holds the topic's subscriptions and lets the re-check

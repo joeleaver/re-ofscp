@@ -48,7 +48,11 @@ async fn a_new_group_is_private_and_invite_only_with_effective_permissions() {
     let path = format!("/api/groups/{}", id(&g));
     let (s, got) = call(&env, Some(&alice), "GET", &path, None).await;
     assert_eq!(s, StatusCode::OK);
-    assert_eq!(got, g);
+    // A signed member's read also carries their own membership (§5.3,
+    // decision 0020): the owner is a member with role owner since creation.
+    let mut want = g.clone();
+    want["membership"] = json!({"role": "owner", "joinedAt": g["createdAt"]});
+    assert_eq!(got, want);
 }
 
 #[tokio::test]

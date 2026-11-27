@@ -12,6 +12,8 @@
 //! ends with `unsubscribed {reason:"access_revoked"}` when it turns false
 //! (§7.1 *Losing access*).
 
+use std::collections::BTreeSet;
+
 use re_ofscp_types::groups::{JoinPolicy, PermissionMap, RoleDefinition, Tier};
 
 /// The canonical roles (§5.7). They always exist, whether or not a group's
@@ -51,6 +53,10 @@ pub mod actions {
     pub fn post_kind(kind: &str) -> String {
         format!("post:{kind}")
     }
+
+    /// Set another member's nickname (§5.7). No default grant: only the
+    /// owner holds it unless the group lists other roles.
+    pub const SET_NICKNAME: &str = "members.set-nickname";
 }
 
 /// The defaults the provider MUST use for a missing canonical action (§5.2).
@@ -282,6 +288,67 @@ pub fn reply_rule(standing: &Standing, group: &GroupPolicy, channel: &ChannelPol
     } else {
         ReplyRule::Free
     }
+}
+
+/// A role's permission set (§5.7): the group actions it is listed for, or
+/// every permission for the owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Perms {
+    /// The owner's: every permission, including any not yet defined.
+    All,
+    /// Exactly these group actions.
+    Only(BTreeSet<String>),
+}
+
+impl Perms {
+    /// Whether every permission in `self` is also in `other`.
+    pub fn is_subset_of(&self, other: &Perms) -> bool {
+        match (self, other) {
+            (_, Perms::All) => true,
+            (Perms::All, Perms::Only(_)) => false,
+            (Perms::Only(a), Perms::Only(b)) => a.is_subset(b),
+        }
+    }
+}
+
+/// `perms(role)` (§5.7): the actions of the group's effective permission
+/// map that list `role`. `owner` holds every permission. A role neither
+/// canonical nor catalogued holds none (§5.2: it fails closed), so acting
+/// on it, or granting it, never needs more than the caller has.
+pub fn role_perms(role: &str, group: &GroupPolicy) -> Perms {
+    if role == roles::OWNER {
+        return Perms::All;
+    }
+    if !group.knows_role(role) {
+        return Perms::Only(BTreeSet::new());
+    }
+    Perms::Only(
+        group
+            .permissions
+            .iter()
+            .filter(|(_, listed)| listed.iter().any(|r| r == role))
+            .map(|(action, _)| action.clone())
+            .collect(),
+    )
+}
+
+/// The caller's permission set: the owner's is every permission, a
+/// member's is their role's, an outsider's is empty. A membership row
+/// claiming the role `owner` holds nothing, as in [`may`].
+pub fn standing_perms(standing: &Standing, group: &GroupPolicy) -> Perms {
+    match standing {
+        Standing::Owner => Perms::All,
+        Standing::Member(role) if role != roles::OWNER => role_perms(role, group),
+        Standing::Member(_) | Standing::Outsider => Perms::Only(BTreeSet::new()),
+    }
+}
+
+/// The subset (self-protect) rule (§5.7): the caller may act on a member
+/// holding `target_role`, or grant that role, only when
+/// `perms(target_role) ⊆ perms(caller)`. So the owner may act on anyone,
+/// and nobody else may act on the owner.
+pub fn may_act_on(caller: &Standing, target_role: &str, group: &GroupPolicy) -> bool {
+    role_perms(target_role, group).is_subset_of(&standing_perms(caller, group))
 }
 
 /// How a join request is to be treated (§5.7), once membership exists.

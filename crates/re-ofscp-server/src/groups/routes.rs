@@ -6,6 +6,7 @@
 //! | `GET /api/groups/{g}` | optional | anyone for `public`/`discoverable`, else members |
 //! | `PATCH /api/groups/{g}` | signed | `manage` |
 //! | `DELETE /api/groups/{g}` | signed | owner |
+//! | membership (§5.7) | signed | see `member_routes.rs` |
 //! | `GET /api/groups/{g}/channels` | optional | group readers; unreadable channels omitted |
 //! | `POST /api/groups/{g}/channels` | signed | `manage` |
 //! | `GET /api/groups/{g}/channels/{c}` | optional | effective read access (§11.3) |
@@ -69,7 +70,7 @@ impl<S: Send + Sync> FromRequestParts<S> for Caller {
 }
 
 /// A path id that could be a local id; anything else names nothing.
-fn local_id(id: &str, what: &'static str) -> Result<(), Problem> {
+pub(super) fn local_id(id: &str, what: &'static str) -> Result<(), Problem> {
     let ok = !id.is_empty()
         && id.len() <= MAX_LOCAL_ID
         && id
@@ -82,7 +83,7 @@ fn local_id(id: &str, what: &'static str) -> Result<(), Problem> {
     }
 }
 
-fn group_id(id: &str) -> Result<(), Problem> {
+pub(super) fn group_id(id: &str) -> Result<(), Problem> {
     local_id(id, "no such group")
 }
 
@@ -105,14 +106,20 @@ pub async fn create_group(
     Ok((StatusCode::CREATED, Json(group)).into_response())
 }
 
-/// `GET /api/groups/{groupId}` (§5.5).
+/// `GET /api/groups/{groupId}` (§5.5). The body carries the caller's own
+/// `membership`, so it is never stored by a shared cache.
 pub async fn get_group(
     State(state): State<AppState>,
     caller: Caller,
     Path(g): Path<String>,
-) -> Result<Json<Group>, Problem> {
+) -> Result<Response, Problem> {
     group_id(&g)?;
-    Ok(Json(state.groups.get_group(&caller, &g).await?))
+    let group: Group = state.groups.get_group(&caller, &g).await?;
+    Ok((
+        [(axum::http::header::CACHE_CONTROL, "private, no-cache")],
+        Json(group),
+    )
+        .into_response())
 }
 
 /// `PATCH /api/groups/{groupId}` (§5.5).

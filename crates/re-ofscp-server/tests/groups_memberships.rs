@@ -150,7 +150,7 @@ async fn pending_memberships_and_deleted_groups_share_nothing() {
     assert!(
         groups
             .store
-            .add_member(&g, &bob.id(), "member", now)
+            .add_member(&g, &bob.id(), "member", None, now)
             .await
             .unwrap()
     );

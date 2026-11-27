@@ -6,6 +6,7 @@ pub mod admin;
 pub mod groups;
 pub mod harness;
 pub mod key_setup;
+pub mod members;
 pub mod messages;
 pub mod profiles;
 pub mod races;

@@ -77,7 +77,7 @@ impl Hub {
     }
 
     /// Re-check `held` subscriptions, releasing or ending each.
-    async fn recheck(&self, held: Vec<Held>) {
+    pub(super) async fn recheck(&self, held: Vec<Held>) {
         futures_util::stream::iter(held)
             .for_each_concurrent(RECHECK_CONCURRENCY, |h| async move {
                 match self.check_patiently(&h.actor, &h.topic).await {
