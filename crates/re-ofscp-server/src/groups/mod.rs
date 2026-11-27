@@ -141,13 +141,19 @@ pub enum Caller {
 }
 
 /// Groups, channels and minimal membership.
+///
+/// A clone is the same service, not a copy: it shares the store, the
+/// [`AccessChange`] broadcast and the [`MembershipListener`]s. It lets a
+/// write finish in a task of its own, which outlives a dropped request
+/// (`member_ops.rs`).
+#[derive(Clone)]
 pub struct Groups {
     /// Storage.
     pub store: GroupStore,
     home: Authority,
     clock: Arc<dyn Clock>,
     changes: broadcast::Sender<AccessChange>,
-    listeners: RwLock<Vec<Arc<dyn MembershipListener>>>,
+    listeners: Arc<RwLock<Vec<Arc<dyn MembershipListener>>>>,
 }
 
 impl std::fmt::Debug for Groups {
@@ -165,7 +171,7 @@ impl Groups {
             home,
             clock,
             changes: broadcast::channel(CHANGE_BUFFER).0,
-            listeners: RwLock::new(Vec::new()),
+            listeners: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
