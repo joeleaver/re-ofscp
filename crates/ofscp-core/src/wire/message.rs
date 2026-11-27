@@ -275,6 +275,29 @@ impl MessageUpdate {
     }
 }
 
+/// The body of `PUT …/messages/{messageId}/reactions/{key}`, in a channel
+/// (§7.1) or a private conversation (§7.4): how to show the reaction whose
+/// `key` the path names. The body is optional and so is each field; a
+/// request with no body reads as [`ReactionPut::default`]. Neither field
+/// requires the other. A present field must hold a value: `null` is refused.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReactionPut {
+    /// Its emoji.
+    #[serde(
+        default,
+        deserialize_with = "some",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub unicode: Option<String>,
+    /// A picture of it (HTTPS).
+    #[serde(
+        default,
+        deserialize_with = "some",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub image: Option<String>,
+}
+
 /// A reaction on a message (§5.3). The provider keeps no counts.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
