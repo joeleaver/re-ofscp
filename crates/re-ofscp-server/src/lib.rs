@@ -57,6 +57,18 @@ pub const MAX_SKEW_SECS: i64 = 300;
 /// How often expired nonces are deleted from the persistent ledger.
 pub const LEDGER_PURGE_INTERVAL: Duration = Duration::from_secs(60);
 
+/// The first wait between attempts of [`AppState::restore_replay_until_loaded`];
+/// it doubles up to [`RESTORE_RETRY_MAX`]. Short, because on jkbase the
+/// managed rhypedb starts beside the app and usually listens within a second.
+pub const RESTORE_RETRY_MIN: Duration = Duration::from_millis(100);
+
+/// The longest wait between restore attempts.
+pub const RESTORE_RETRY_MAX: Duration = Duration::from_secs(2);
+
+/// How often a restore that keeps failing is reported at `WARN` (the
+/// attempts in between log at `DEBUG`).
+const RESTORE_WARN_EVERY: Duration = Duration::from_secs(30);
+
 /// Shared application state.
 #[derive(Clone)]
 pub struct AppState {
@@ -332,7 +344,8 @@ impl AppState {
     /// Reload every live nonce from the persistent ledger into the replay
     /// store and end its restart warm-up. Call before serving. On error the
     /// warm-up stays in force (signed requests get `503` for one skew window
-    /// after startup), which is safe.
+    /// after startup), which is safe. One attempt: startup uses
+    /// [`AppState::restore_replay_until_loaded`], which retries.
     pub async fn restore_replay(&self) -> Result<usize, LedgerError> {
         let now = self.verifier.now();
         let restored = self.verifier.ledger().load(now).await?;
@@ -345,6 +358,74 @@ impl AppState {
         let count = store.restore(restored.nonces, now);
         store.end_warm_up();
         Ok(count)
+    }
+
+    /// [`AppState::restore_replay`], retried until the ledger can be read.
+    ///
+    /// At startup the database may not be listening yet (on jkbase the
+    /// managed rhypedb starts beside the app, about a second after it), so a
+    /// single attempt would leave the warm-up in force for a whole skew
+    /// window after every restart. Each failure is retried, waiting from
+    /// [`RESTORE_RETRY_MIN`] doubling to [`RESTORE_RETRY_MAX`], and the
+    /// warm-up ends as soon as a load succeeds, even after serving began:
+    /// until then every signed request the warm-up does not refuse is
+    /// recorded in memory, and [`replay::ReplayStore::restore`] keeps those
+    /// entries, so ending it late is as safe as ending it before serving.
+    ///
+    /// Returns the number restored, or [`LedgerError::NotPersistent`] at
+    /// once for a ledger that persists nothing (its warm-up stays in force
+    /// and expires on its own). Logs the outcome.
+    pub async fn restore_replay_until_loaded(self) -> Result<usize, LedgerError> {
+        let mut wait = RESTORE_RETRY_MIN;
+        let mut last_warn: Option<tokio::time::Instant> = None;
+        loop {
+            match self.restore_replay().await {
+                Ok(n) => {
+                    tracing::info!(restored = n, "replay store restored from the ledger");
+                    return Ok(n);
+                }
+                Err(LedgerError::NotPersistent) => {
+                    tracing::warn!(
+                        "replay ledger does not persist; signed requests get 503 for one skew window"
+                    );
+                    return Err(LedgerError::NotPersistent);
+                }
+                Err(e) => {
+                    let now = tokio::time::Instant::now();
+                    if last_warn.is_none_or(|t| now.duration_since(t) >= RESTORE_WARN_EVERY) {
+                        last_warn = Some(now);
+                        tracing::warn!(
+                            error = %e,
+                            "replay ledger unavailable; signed requests get 503 until it loads \
+                             (at most one skew window after startup)"
+                        );
+                    } else {
+                        tracing::debug!(error = %e, "replay ledger still unavailable; retrying");
+                    }
+                    tokio::time::sleep(wait).await;
+                    wait = (wait * 2).min(RESTORE_RETRY_MAX);
+                }
+            }
+        }
+    }
+
+    /// The replay store's background work for the life of the process:
+    /// [`AppState::restore_replay_until_loaded`], its outcome sent on
+    /// `restored` (startup waits on it before serving), then
+    /// [`AppState::purge_ledger_forever`].
+    ///
+    /// The purge starts only after the restore: the ledger is read in pages
+    /// by offset, and rows deleted meanwhile would shift the pages and skip a
+    /// live nonce. (The ledger's `@unique` key would still refuse that
+    /// nonce's replay, but the in-memory store is meant to hold it too.)
+    pub async fn maintain_replay(
+        self,
+        restored: tokio::sync::oneshot::Sender<Result<usize, LedgerError>>,
+    ) {
+        let outcome = self.clone().restore_replay_until_loaded().await;
+        // Startup may have stopped waiting; the outcome is logged either way.
+        let _ = restored.send(outcome);
+        self.purge_ledger_forever().await;
     }
 
     /// Read the stored federation policy and put it in force. Call before
