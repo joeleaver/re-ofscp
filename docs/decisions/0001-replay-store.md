@@ -127,9 +127,22 @@ The spec says a provider SHOULD persist the store, and we do
     in-memory entry stays, so the nonce is burned either way, and the client
     re-signs.
 - **Startup:** `AppState::restore_replay` reloads every live nonce, in
-  pages, and only then ends the warm-up. If the ledger can't be read within
-  30 s, the warm-up stays in force. That's safe, and it means one skew
-  window of `503`s.
+  pages, and only then ends the warm-up.
+  `AppState::restore_replay_until_loaded` retries it until the ledger can
+  be read (waits of 100 ms doubling to 2 s). Serving waits for it for up to
+  30 s, then starts in warm-up while the retries go on, and the warm-up
+  ends as soon as a load succeeds. Ending it late is safe: until then every
+  signed request the warm-up let through was recorded in memory, and
+  `restore` keeps those entries. A ledger that persists nothing
+  (`NotPersistent`) is not retried, and its warm-up runs its course.
+  - **Why (revised 2026-11-27):** the first version tried once. On jkbase
+    the managed rhypedb starts beside the app and listens about a second
+    after it, so that one attempt was always refused (`Connection refused`
+    in the startup log), and every production restart (seen at v7 and v15)
+    gave a full skew window, about 5 minutes, of `503`s on signed requests.
+    `tests/replay_restart.rs` pins the retry: a provider started while
+    the database is down serves signed requests once the database is up,
+    and one without a ledger still warms up.
 - **Cleanup:** a background task purges expired rows every 60 s, in
   bounded batches (1 000 rows per statement, at most 100 statements per
   run).
@@ -161,9 +174,10 @@ The spec says a provider SHOULD persist the store, and we do
 
 ## Consequences
 
-- **Normal restarts are invisible.** With the ledger reachable at startup,
-  nonces survive a restart and signed requests are served at once. The
-  warm-up only applies when the ledger can't be read.
+- **Normal restarts are invisible.** Once the ledger is reachable (within
+  a second or two of startup on jkbase), nonces survive a restart and
+  signed requests are served at once. The warm-up only lasts while the
+  ledger can't be read, and never beyond one skew window.
 - **Each signed request costs one write.** That's a rhypedb write on
   loopback, done after verification, so only authenticated requests pay it.
 - **Single instance assumed, but the ledger no longer depends on it.**

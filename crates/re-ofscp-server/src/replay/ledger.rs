@@ -5,7 +5,9 @@
 //! *before* the request is accepted, under a `@unique` key, and every live
 //! nonce is read back at startup. With the ledger restored, a restart
 //! forgets nothing, so the warm-up (`503` for one skew window) is skipped.
-//! If the ledger cannot be read at startup, the warm-up applies as before.
+//! Startup retries the read until it succeeds
+//! (`AppState::restore_replay_until_loaded`). Until then the warm-up applies
+//! as before.
 //!
 //! A nonce the ledger cannot write fails closed with `503`: the in-memory
 //! entry stays (the nonce remains burned) and the client re-signs and
