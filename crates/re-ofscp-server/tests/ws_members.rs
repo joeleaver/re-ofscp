@@ -131,9 +131,10 @@ async fn a_demotion_out_of_view_revokes_and_tells_everyone_watching() {
     assert_eq!(s, StatusCode::OK);
     // Mia's subscription ends, and her own connection is told of the
     // change once, though no channel subscription carries it to her any
-    // more. The two may arrive in either order.
+    // more, and once of her changed group entry (§5.7 groups.updated). The
+    // three may arrive in any order.
     let mut seen = Vec::new();
-    while seen.len() < 2 {
+    while seen.len() < 3 {
         let e = c.event().await;
         let kind = e["type"].as_str().unwrap_or_default().to_owned();
         match kind.as_str() {
@@ -142,6 +143,7 @@ async fn a_demotion_out_of_view_revokes_and_tells_everyone_watching() {
                 json!({"channels": [&ch], "reason": "access_revoked"})
             ),
             "member.updated" => assert_eq!(e["data"]["member"]["role"], "member"),
+            "groups.updated" => assert_eq!(e["data"]["groups"][0]["role"], "member"),
             _ => continue,
         }
         assert!(!seen.contains(&kind), "{kind} twice");
@@ -254,7 +256,13 @@ async fn handing_the_group_on_revokes_the_former_owners_view() {
     env.state
         .ws
         .publish(&ch, "message.created", json!({"n": 1}));
+    // Her connection may still be told of the role changes (member.updated)
+    // and of her own changed group entry (groups.updated), but nothing from
+    // the channel she can no longer read.
     while let Ok(e) = tokio::time::timeout(QUIET, c.event()).await {
-        assert_eq!(e["type"], "member.updated", "nothing from the channel: {e}");
+        assert!(
+            e["type"] == "member.updated" || e["type"] == "groups.updated",
+            "nothing from the channel: {e}"
+        );
     }
 }
