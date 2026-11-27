@@ -289,9 +289,12 @@ its owner or as an active member, and only active groups count.
 `share_a_group` compares full actors, so `bob@b` never shares a group on
 the strength of a local `bob`. `groups_visible_to` lists the subject's
 groups that the viewer may read (§5.5: open tiers, or the viewer belongs),
-as object URIs `https://{domain}/api/groups/{id}`. At most 1,000
-memberships and owned groups are read per user. Past that, a lookup fails
-closed: a group left out is neither shared nor listed.
+as object URIs `https://{domain}/api/groups/{id}`. A user's owned groups
+and memberships are read whole, never capped (`read_whole` in
+`groups/store.rs`: a capped read rerun with a doubling cap until one comes
+back short, one read in the normal case). The limits are checked around
+writes and two ownership transfers at once can overshoot them by one, so
+a capped read could silently drop a group that is in fact shared.
 
 ## Follow-ups
 
