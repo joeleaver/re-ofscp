@@ -9,6 +9,7 @@
 //! removes pending rows a crashed or failed writer left behind. So no row
 //! outlives its group, whatever a writer's timing.
 
+use std::future::Future;
 use std::sync::Arc;
 
 use re_ofscp_types::Actor;
@@ -169,6 +170,26 @@ fn decode_groups(rows: Vec<rhypedb_client::Row<GroupRow>>) -> Result<Vec<StoredG
     rows.into_iter().map(|r| r.data.decode()).collect()
 }
 
+/// Every row a capped read returns, however many match: `read(cap)` is
+/// run with `cap` starting at `first` and doubling while a read comes back
+/// full, until one comes back short. A full read may have more behind it,
+/// and a short one has nothing more. With fewer than `first` matches, it is
+/// one read. Each read is whole, so the rows returned are one read's.
+pub(super) async fn read_whole<T, F, Fut>(first: usize, mut read: F) -> Result<Vec<T>, DbError>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: Future<Output = Result<Vec<T>, DbError>>,
+{
+    let mut cap = first.max(1);
+    loop {
+        let rows = read(cap).await?;
+        if rows.len() < cap {
+            return Ok(rows);
+        }
+        cap = cap.saturating_mul(2);
+    }
+}
+
 /// Group, channel and membership storage.
 #[derive(Debug, Clone)]
 pub struct GroupStore {
@@ -235,6 +256,18 @@ impl GroupStore {
             Some(row) => row.data.decode().map(Some),
             None => Ok(None),
         }
+    }
+
+    /// Every active group `owner` owns, however many: never capped, so no
+    /// owned group is ever silently dropped. The limit on owned groups is
+    /// checked before an ownership transfer commits and not recounted
+    /// after, so concurrent transfers can leave an owner past
+    /// [`super::MAX_GROUPS_PER_OWNER`]. Normally one read.
+    pub async fn all_owned_groups(&self, owner: &Actor) -> Result<Vec<StoredGroup>, DbError> {
+        read_whole(super::MAX_GROUPS_PER_OWNER + 1, |cap| {
+            self.owned_groups(owner, cap)
+        })
+        .await
     }
 
     /// The active groups `owner` owns, at most `cap` of them.
@@ -591,5 +624,36 @@ impl GroupStore {
             .str(group_id)
             .raw(").delete()");
         self.db.write_one_object(&q).await.map(|_| ())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    /// `read_whole` over `n` rows starting at `first`: the rows it returned
+    /// and how many reads it took.
+    async fn whole(n: usize, first: usize) -> (usize, usize) {
+        let reads = Cell::new(0);
+        let rows = read_whole(first, |cap| {
+            reads.set(reads.get() + 1);
+            async move { Ok::<_, DbError>((0..n.min(cap)).collect::<Vec<_>>()) }
+        })
+        .await
+        .unwrap();
+        (rows.len(), reads.get())
+    }
+
+    #[tokio::test]
+    async fn a_whole_read_returns_every_row_however_many() {
+        assert_eq!(whole(0, 101).await, (0, 1));
+        assert_eq!(whole(100, 101).await, (100, 1));
+        // Exactly the cap: the full read may hide more, so read again.
+        assert_eq!(whole(101, 101).await, (101, 2));
+        assert_eq!(whole(102, 101).await, (102, 2));
+        assert_eq!(whole(1_000, 101).await, (1_000, 5));
+        assert_eq!(whole(3, 0).await, (3, 3));
     }
 }

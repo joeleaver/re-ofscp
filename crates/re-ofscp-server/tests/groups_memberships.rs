@@ -9,6 +9,8 @@ use axum::http::StatusCode;
 use common::groups::{
     Env, Party, call, create_group, env_with_remotes, group_body, id, join, local, remote,
 };
+use re_ofscp_server::groups::MAX_GROUPS_PER_OWNER;
+use re_ofscp_server::groups::model::new_group;
 use re_ofscp_server::privacy::Viewer;
 use serde_json::{Value, json};
 
@@ -174,6 +176,49 @@ async fn pending_memberships_and_deleted_groups_share_nothing() {
     );
     assert!(
         !groups
+            .share_a_group(&carol.id(), &alice.id())
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn an_owner_past_the_limit_keeps_every_group() {
+    // Two ownership transfers checked against the limit at once can leave
+    // an owner one past it: every owned group still counts, so none is
+    // dropped from a listing or from `sharedGroups`.
+    let env = env_with_remotes(&[]).await;
+    let alice = local(&env, "alice").await;
+    let carol = local(&env, "carol").await;
+    let fields = new_group(serde_json::from_value(group_body("Mine", "public")).unwrap()).unwrap();
+    let now = common::harness::SIGNED_AT.unix_timestamp();
+    let mut last = String::new();
+    for _ in 0..=MAX_GROUPS_PER_OWNER {
+        last = env
+            .state
+            .groups
+            .store
+            .create_group(&alice.id(), &fields, now)
+            .await
+            .unwrap()
+            .id;
+    }
+    join(&env, &last, &carol, "member").await;
+    let groups = &env.state.groups;
+    let own = groups
+        .groups_visible_to(&alice.id(), &Viewer::Actor(alice.id()))
+        .await
+        .unwrap();
+    assert_eq!(own.len(), MAX_GROUPS_PER_OWNER + 1);
+    assert!(own.contains(&uri(&last)));
+    assert!(
+        groups
+            .share_a_group(&alice.id(), &carol.id())
+            .await
+            .unwrap()
+    );
+    assert!(
+        groups
             .share_a_group(&carol.id(), &alice.id())
             .await
             .unwrap()

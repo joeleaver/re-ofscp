@@ -157,6 +157,18 @@ impl GroupStore {
             .collect())
     }
 
+    /// Every one of `actor`'s active memberships as `(group_id, role)`,
+    /// however many (their groups may be active or being deleted): read
+    /// `expected` at a time first, more only when that comes back full
+    /// (`read_whole` in `store.rs`).
+    pub async fn all_memberships_of(
+        &self,
+        actor: &Actor,
+        expected: usize,
+    ) -> Result<Vec<(String, String)>, DbError> {
+        super::store::read_whole(expected, |cap| self.memberships_of(actor, cap)).await
+    }
+
     /// `actor`'s active memberships as `(group_id, role)`, at most `cap`
     /// (their groups may be active or being deleted).
     pub async fn memberships_of(

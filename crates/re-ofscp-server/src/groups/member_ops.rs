@@ -18,7 +18,7 @@ use super::access::{Standing, roles};
 use super::members::StoredMember;
 use super::model::StoredGroup;
 use super::ops::{ACTIVATE_WITHIN, GroupError, NO_GROUP, SLOW_WRITE, announce_unless, member_role};
-use super::{Groups, MAX_GROUPS_PER_OWNER, MAX_MEMBERS_PER_GROUP, MAX_MEMBERSHIPS_PER_ACTOR};
+use super::{Groups, MAX_MEMBERS_PER_GROUP, MAX_MEMBERSHIPS_PER_ACTOR};
 use crate::db::DbError;
 use crate::timefmt;
 
@@ -225,11 +225,12 @@ impl Groups {
 
     /// How many groups `actor` is a member of, counted up to one past
     /// [`MAX_MEMBERSHIPS_PER_ACTOR`]. A row left for them in a group they
-    /// own is not a membership and does not count.
+    /// own is not a membership and does not count; every owned group is
+    /// read (`all_owned_groups`), so no such row can pass for one.
     pub(super) async fn membership_count(&self, actor: &Actor) -> Result<usize, GroupError> {
         let owned: HashSet<String> = self
             .store
-            .owned_groups(actor, MAX_GROUPS_PER_OWNER + 1)
+            .all_owned_groups(actor)
             .await?
             .into_iter()
             .map(|g| g.id)
