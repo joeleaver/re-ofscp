@@ -417,6 +417,18 @@ type Presence {
 // channel's first message; advanced by a compare-and-set on `last_seq`
 // that also requires `state == "open"`.
 //
+// It also counts the channel's messages for exact unread counts (§7.7,
+// lost-conn/ofscp#41; docs/decisions/0022). `message_count` is how many
+// messages the channel holds, tombstones included: a create takes its
+// position and the next count in one compare-and-set, which also requires
+// `counted == 1` and no pending create (`pending_id == ""`). The create
+// leaves its message id and author in `pending_id` / `pending_author`
+// until its message is written, so a create that failed, or a process that
+// stopped, part-way is settled exactly by the next writer or reader: the
+// message exists, or its count and its author's tally are given back.
+// `counted` is absent on logs from before message ordinals, until the
+// channel's messages are numbered (`messages::numbering`).
+//
 // Deleting a channel or its group closes its log (`state: "closed"`,
 // created closed if the channel had none), so no position can be taken
 // after it. The messages sweeper then removes the channel's rows, stamps
@@ -431,6 +443,13 @@ type ChannelLog {
     state: String @indexed
     // 0 until the sweeper's first purge of a closed log.
     purged_at: i64
+    // 1 once every message of the channel has its ordinals; absent before.
+    counted: i64
+    // How many messages the channel holds (counted logs only).
+    message_count: i64
+    // The message and author of the create in flight, or "" for none.
+    pending_id: String
+    pending_author: String
 }
 
 // A message in a channel (§5.3). `doc` holds the body as JSON
@@ -472,6 +491,26 @@ type Message {
     // same body (decision 0017).
     revision: i64
     deleted_at: i64
+    // Exact unread counts (§7.7; docs/decisions/0022). `n` is the message's
+    // 1-based creation ordinal among the channel's messages (replies and
+    // tombstones included), `author_n` its ordinal among its author's
+    // messages in the channel, and `apos` is "{channel_id} {author}
+    // {author_n}", so the reader's own messages can be found by ordinal.
+    // Absent on messages from before ordinals until their channel is
+    // numbered (`messages::numbering`).
+    n: i64
+    author_n: i64
+    apos: String @unique
+}
+
+// How many messages an author has in a channel (§7.7; docs/decisions/0022):
+// `key` is "{channel_id} {author}". Taken by a compare-and-set on `count`
+// with the author's next `Message.author_n`; given back with a create that
+// failed. Purged with the channel's messages.
+type MessageTally {
+    key: String @unique
+    channel_id: String @indexed
+    count: i64
 }
 
 // An edit or a delete, at its own timeline position, for resume replay
@@ -516,5 +555,36 @@ type GroupPointer {
     owner: String @indexed
     group: String
     role: String
+    updated_at: DateTime
+}
+
+// A follow (§7.6, docs/decisions/0022): a channel one of the owner's
+// clients asked to see in their feed. `key` is "{owner} {channel}";
+// `channel` is a local channel's id, or a remote channel's canonical object
+// URI, so each channel is followed at most once. `slot` is "{owner} {i}"
+// for i below the per-user limit, so the `@unique` create itself keeps a
+// user's follows within the limit, however many creates race.
+type Follow {
+    key: String @unique
+    slot: String @unique
+    owner: String @indexed
+    channel: String
+    created_at: DateTime
+}
+
+// A read marker (§7.7, docs/decisions/0022): the newest message the owner
+// has read in a scope (a local channel's id). `key` is "{owner} {scope}";
+// `n` is that message's creation ordinal (`Message.n`), so a marker only
+// moves forward, and `own` is how many of the owner's messages in the scope
+// have an ordinal of at most `n`. The unread count is then
+// `(message_count - n) - (owner's tally - own)`. Purged with the channel's
+// messages when it is deleted.
+type ReadMarker {
+    key: String @unique
+    owner: String @indexed
+    scope_id: String @indexed
+    message_id: String
+    n: i64
+    own: i64
     updated_at: DateTime
 }

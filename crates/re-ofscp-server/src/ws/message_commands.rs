@@ -73,11 +73,19 @@ fn ws_error(e: MessageError) -> WsError {
         MessageError::Invalid(i) => WsError::bad_request(i.0),
         MessageError::BadCursor(c) => WsError::bad_request(c.to_string()),
         MessageError::Conflict(d) => WsError::new("conflict", 409, d),
+        MessageError::Numbering(c) => {
+            tracing::info!(channel = %c, "message command: channel being numbered");
+            WsError::service_unavailable(
+                "the channel is being prepared; retry",
+                crate::messages::numbering::RETRY_AFTER_SECS,
+            )
+        }
         MessageError::Db(DbError::Unavailable(e)) => {
             tracing::error!(error = %e, "message command: database unavailable");
             WsError::service_unavailable("the provider is unavailable; retry", 1)
         }
-        // Other writers kept winning a compare-and-set. A retry is safe
+        // Other writers kept winning a compare-and-set, or another
+        // process's create is pending on the log. A retry is safe
         // even if an edit or delete applied before its event was recorded
         // (a repeated edit changes nothing, a repeated delete is done).
         MessageError::Db(DbError::Contended(e)) => {

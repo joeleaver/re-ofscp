@@ -52,14 +52,20 @@ impl From<MessageError> for Problem {
             MessageError::Invalid(i) => Problem::bad_request().with_detail(i.0),
             MessageError::BadCursor(c) => Problem::bad_request().with_detail(c.to_string()),
             MessageError::Conflict(d) => Problem::conflict().with_detail(d),
+            MessageError::Numbering(c) => {
+                tracing::info!(channel = %c, "message operation: channel being numbered");
+                Problem::service_unavailable(super::numbering::RETRY_AFTER_SECS)
+            }
             MessageError::Db(DbError::Unavailable(e)) => {
                 tracing::error!(error = %e, "message operation: database unavailable");
                 Problem::service_unavailable(1)
             }
-            // Other writers kept winning a compare-and-set. Usually nothing
-            // was written; if an edit or delete had applied before its
-            // event could be recorded, a retry is still safe (a repeated
-            // edit changes nothing, a repeated delete is already done).
+            // Other writers kept winning a compare-and-set, or another
+            // process's create is pending on the log (`ops::foreign_pending`).
+            // Usually nothing was written; if an edit or delete had applied
+            // before its event could be recorded, a retry is still safe (a
+            // repeated edit changes nothing, a repeated delete is already
+            // done).
             MessageError::Db(DbError::Contended(e)) => {
                 tracing::warn!(error = %e, "message operation: contended");
                 Problem::service_unavailable(1)
@@ -265,6 +271,15 @@ async fn remove_reaction(
 mod tests {
     use super::*;
 
+    fn retry_after(p: Problem) -> Option<String> {
+        let r = p.into_response();
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        r.headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    }
+
     #[test]
     fn retryable_database_errors_are_503_and_others_500() {
         for e in [
@@ -272,8 +287,17 @@ mod tests {
             DbError::Contended("busy".into()),
         ] {
             let p = Problem::from(MessageError::Db(e));
-            assert_eq!(p.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(retry_after(p).as_deref(), Some("1"));
         }
+        // Another process's pending create (decision 0022): transient.
+        let p = Problem::from(super::super::ops::foreign_pending("chn_1"));
+        assert_eq!(retry_after(p).as_deref(), Some("1"));
+        // A channel being numbered: back once it is.
+        let p = Problem::from(MessageError::Numbering("chn_1".into()));
+        assert_eq!(
+            retry_after(p),
+            Some(super::super::numbering::RETRY_AFTER_SECS.to_string())
+        );
         let p = Problem::from(MessageError::Db(DbError::Decode("bad".into())));
         assert_eq!(p.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let p = Problem::from(MessageError::Conflict("edited"));

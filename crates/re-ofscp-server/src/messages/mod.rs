@@ -2,7 +2,11 @@
 //! endpoints, reactions, and what live delivery and resume read from it.
 //! The design is docs/decisions/0017-messages.md.
 //!
-//! * `store.rs`, `store_reactions.rs`, `log.rs`: rows in rhypedb.
+//! * `store.rs`, `store_reactions.rs`, `log.rs`, `tally.rs`: rows in
+//!   rhypedb.
+//! * `ordinals.rs`: message ordinals and exact counts for unread counts
+//!   (§7.7; docs/decisions/0022);
+//!   `numbering.rs`: numbering channels from before them.
 //! * `validate.rs`, `sanitize.rs`: checking bodies before storing them.
 //! * `ops.rs`, `reactions.rs`: the operations, with §7.1's order of checks.
 //! * `pager.rs`: paging over timeline, reply and reaction positions.
@@ -25,13 +29,16 @@ pub mod fanout;
 mod locks;
 pub mod log;
 pub mod model;
+pub mod numbering;
 mod ops;
+pub mod ordinals;
 pub mod pager;
 mod reactions;
 pub mod routes;
 pub mod sanitize;
 pub mod store;
 mod store_reactions;
+pub mod tally;
 mod timeline;
 mod typing;
 pub mod uploads;
@@ -77,6 +84,11 @@ pub struct Messages {
     clock: Arc<dyn Clock>,
     home: Authority,
     locks: ChannelLocks,
+    /// Every numbering of a channel from before ordinals takes turns under
+    /// these; the background one takes no write lock (`numbering.rs`).
+    numbering: ChannelLocks,
+    /// Channels handed to the background numbering task.
+    numbering_queue: numbering::Queue,
 }
 
 impl std::fmt::Debug for Messages {
@@ -105,6 +117,8 @@ impl Messages {
             fanout,
             clock,
             locks: ChannelLocks::default(),
+            numbering: ChannelLocks::default(),
+            numbering_queue: numbering::Queue::default(),
         }
     }
 
@@ -119,8 +133,9 @@ impl Messages {
     }
 
     /// One sweeper pass at `now` (unix seconds): purge the rows of deleted
-    /// channels (their logs closed), and a [`PURGE_GRACE`] later purge them
-    /// again and drop the log. Returns how many logs it handled.
+    /// channels (their logs closed), authors' tallies and readers' markers
+    /// included, and a [`PURGE_GRACE`] later purge them again and drop the
+    /// log. Returns how many logs it handled.
     pub async fn sweep(&self, now: i64) -> Result<usize, DbError> {
         let db = self.store.db();
         let cutoff = now.saturating_sub(PURGE_GRACE.as_secs() as i64);
@@ -130,6 +145,10 @@ impl Messages {
             let full = batch.len() == SWEEP_BATCH;
             for closed in batch {
                 self.store.purge_channel(&closed.channel_id).await?;
+                // Readers' markers there go too (decision 0022); a marker
+                // write racing the first purge is caught by the second.
+                crate::read_markers::store::MarkerStore::purge_scope(db, &closed.channel_id)
+                    .await?;
                 match closed.purged_at {
                     None => log::mark_purged(db, &closed.channel_id, now).await?,
                     Some(_) => log::delete_closed(db, &closed.channel_id).await?,

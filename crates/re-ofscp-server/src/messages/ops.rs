@@ -10,12 +10,15 @@ use ofscp_core::ws::{ChannelMessage, MessageDeleted};
 use serde_json::Value;
 
 use super::fanout::{Live, Origin};
-use super::model::StoredMessage;
+use super::model::{MessageDoc, StoredMessage};
+use super::numbering::InlineBudget;
+use super::ordinals::CountError;
 use super::pager::{self, BadCursor, CursorKind, PageRequest};
 use super::store::{Counter, NewMessage, event_kind};
 use super::validate::{self, AttachmentError, Head, Invalid};
-use super::{Messages, edit_window, log};
+use super::{Messages, edit_window, log, tally};
 use crate::db::DbError;
+use crate::db::doc::new_id;
 use crate::groups::Caller;
 use crate::groups::access::{self, ReplyRule, actions};
 use crate::groups::model::StoredChannel;
@@ -41,9 +44,22 @@ pub enum MessageError {
     /// `409`: the change could not be applied; retry.
     #[error("{0}")]
     Conflict(&'static str),
+    /// `503` with `Retry-After`: the channel predates message ordinals and
+    /// is being numbered (`numbering.rs`).
+    #[error("channel {0} is being numbered")]
+    Numbering(String),
     /// The database failed.
     #[error(transparent)]
     Db(#[from] DbError),
+}
+
+impl From<CountError> for MessageError {
+    fn from(e: CountError) -> Self {
+        match e {
+            CountError::Db(e) => Self::Db(e),
+            CountError::Numbering(c) => Self::Numbering(c),
+        }
+    }
 }
 
 impl From<GroupError> for MessageError {
@@ -94,6 +110,26 @@ pub enum Created {
     /// The message an earlier create with the same `clientMessageId`
     /// made, as it now stands (`200`).
     Existing(StoredMessage),
+}
+
+/// A checked create, ready to be written.
+struct Draft<'a> {
+    actor: &'a Actor,
+    group_id: &'a str,
+    channel_id: &'a str,
+    head: &'a Head,
+    parent: Option<StoredMessage>,
+    doc: &'a MessageDoc,
+}
+
+/// A create that found another create pending on the log just after
+/// settling it under the channel lock: only another process can have left
+/// it there. A transient conflict, so `503` with `Retry-After` (as every
+/// [`DbError::Contended`], `routes.rs`), never a guess at the ordinals.
+pub(super) fn foreign_pending(channel_id: &str) -> MessageError {
+    MessageError::Db(DbError::Contended(format!(
+        "channel log {channel_id}: another process's create is pending"
+    )))
 }
 
 fn bad(e: serde_json::Error) -> MessageError {
@@ -199,8 +235,15 @@ impl Messages {
         )
         .await?;
         let doc = validate::new_doc(&head.kind, &req, attachments)?;
-        self.write_new(actor, group_id, channel_id, &head, parent, &doc, origin)
-            .await
+        let draft = Draft {
+            actor,
+            group_id,
+            channel_id,
+            head: &head,
+            parent,
+            doc: &doc,
+        };
+        self.write_new(&draft, origin).await
     }
 
     /// The parent a create's `reference` names, checked (§7.1, §7.2): a
@@ -240,20 +283,69 @@ impl Messages {
     }
 
     /// Write a checked new message and fan it out, under the channel lock.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// The create takes its timeline position and creation ordinal on the
+    /// log, where it stays pending (`log::take_create`), then its author's
+    /// ordinal, then writes the message. Whatever happens after the log
+    /// step, the create is settled: cleared once its message is written,
+    /// its ordinals given back if not, so the counts stay exact (§7.7). A
+    /// settle that itself fails leaves the create pending on the log, and
+    /// the next create, marker or count in the channel settles it
+    /// (`ordinals.rs`).
     async fn write_new(
         &self,
-        actor: &Actor,
-        group_id: &str,
-        channel_id: &str,
-        head: &Head,
-        parent: Option<StoredMessage>,
-        doc: &super::model::MessageDoc,
+        draft: &Draft<'_>,
         origin: Option<&Origin>,
     ) -> Result<Created, MessageError> {
+        let (group_id, channel_id) = (draft.group_id, draft.channel_id);
         let _turn = self.locks.lock(channel_id).await;
-        let seq = self.take_position(group_id, channel_id).await?;
-        let reply = match &parent {
+        self.ensure_log(group_id, channel_id).await?;
+        // A create meets one channel: the whole budget is its own.
+        self.settle_counts(channel_id, &InlineBudget::new()).await?;
+        let pending = log::Pending {
+            message_id: new_id("msg_")?,
+            author: draft.actor.to_string(),
+        };
+        let db = self.store.db();
+        let (seq, n) =
+            match log::take_create(db, channel_id, &pending.message_id, &pending.author).await? {
+                log::CreateTake::Taken { seq, n } => (seq, n),
+                log::CreateTake::Closed => return Err(MessageError::NotFound(NO_CHANNEL)),
+                log::CreateTake::Unsettled => return Err(foreign_pending(channel_id)),
+            };
+        let written = self.write_taken(draft, &pending, seq, n).await;
+        match &written {
+            Ok(Created::New(message)) => {
+                if let Err(e) = log::clear_pending(db, channel_id, &pending.message_id).await {
+                    tracing::warn!(error = %e, channel = channel_id, "settling a create failed");
+                }
+                let live = Live::Created(channel_message(message, Some(seq)));
+                self.fanout
+                    .deliver(group_id, channel_id, live, origin)
+                    .await;
+            }
+            // Not written, or taken back: give the ordinals back.
+            Ok(Created::Existing(_)) | Err(_) => {
+                if let Err(e) = self.settle_pending(channel_id, &pending).await {
+                    tracing::warn!(error = %e, channel = channel_id, "settling a create failed");
+                }
+            }
+        }
+        written
+    }
+
+    /// The rest of [`Self::write_new`], once the create holds position
+    /// `seq` and creation ordinal `n` and is `pending` on the log.
+    async fn write_taken(
+        &self,
+        draft: &Draft<'_>,
+        pending: &log::Pending,
+        seq: i64,
+        n: i64,
+    ) -> Result<Created, MessageError> {
+        let (actor, head, channel_id) = (draft.actor, draft.head, draft.channel_id);
+        let author_n = tally::take(self.store.db(), channel_id, &pending.author).await?;
+        let reply = match &draft.parent {
             Some(p) => Some((
                 &p.id,
                 self.store
@@ -267,14 +359,17 @@ impl Messages {
         };
         let now = self.now();
         let new = NewMessage {
+            id: &pending.message_id,
             channel_id,
-            group_id,
+            group_id: draft.group_id,
             seq,
+            n,
+            author_n,
             client_message_id: head.client_message_id.as_deref(),
             author: actor,
             kind: &head.kind,
             reply,
-            doc,
+            doc: draft.doc,
             now,
             edit_until: edit_window(&head.kind).map(|w| now.saturating_add(w.as_secs() as i64)),
         };
@@ -297,10 +392,6 @@ impl Messages {
             self.store.remove(&message.id).await?;
             return Err(MessageError::NotFound(NO_CHANNEL));
         }
-        let live = Live::Created(channel_message(&message, Some(seq)));
-        self.fanout
-            .deliver(group_id, channel_id, live, origin)
-            .await;
         Ok(Created::New(message))
     }
 
