@@ -7,20 +7,37 @@
 //! - [`ops`]: the operations the endpoints (and later surfaces) call.
 //! - [`routes`]: the §5.5 HTTP endpoints and `GET /api/tiers`.
 //!
-//! Membership is minimal here: the owner is the group's `owner` field and
-//! every other member is a `Membership` row ([`Groups::add_member`],
-//! [`Groups::set_role`], [`Groups::remove_member`]), which full membership
-//! (§5.7), invites (§5.6) and guests (§4.8) build on.
+//! - [`member_routes`]: the §5.7 membership endpoints: joining and join
+//!   requests ([`joining`]), the member list (`roster.rs`, paged by
+//!   [`paging`]), leave, kick, role and nickname changes ([`member_edits`])
+//!   and ownership transfer (`transfer.rs`; docs/decisions/0020).
+//!
+//! The owner is the group's `owner` field and every other member is a
+//! `Membership` row ([`Groups::add_member`], [`Groups::set_role`],
+//! [`Groups::remove_member`]), which invites (§5.6) and guests (§4.8)
+//! also build on.
 
 pub mod access;
 mod claims;
+pub mod joining;
+pub mod member_edits;
+mod member_ops;
+pub mod member_routes;
 mod members;
 pub mod model;
 pub mod ops;
+mod owner_store;
+pub mod paging;
 mod relations;
+mod removal;
+pub mod requests;
+mod roster;
 pub mod routes;
 pub mod store;
+mod transfer;
 pub mod validate;
+
+pub use member_ops::Updated;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,6 +55,15 @@ use store::GroupStore;
 pub const MAX_GROUPS_PER_OWNER: usize = 100;
 /// Most channels in one group; bounds the channel list response.
 pub const MAX_CHANNELS_PER_GROUP: usize = 200;
+/// Most members of one group, the owner aside (provider policy). Bounds
+/// the member list, which is read whole to be ordered (docs/decisions/0020).
+pub const MAX_MEMBERS_PER_GROUP: usize = 10_000;
+/// Most groups one actor may be a member of, owned groups aside (provider
+/// policy). `GET /api/me/groups` lists every hosted membership, so joining
+/// past this is refused rather than leaving groups out of that list.
+pub const MAX_MEMBERSHIPS_PER_ACTOR: usize = 1_000;
+/// Most pending join requests of one group (provider policy).
+pub const MAX_PENDING_REQUESTS_PER_GROUP: usize = 1_000;
 /// How often the sweeper finishes interrupted group deletions.
 pub const SWEEP_INTERVAL: Duration = Duration::from_secs(300);
 /// How long a pending channel or membership may stay unconfirmed before
@@ -162,7 +188,8 @@ impl Groups {
     /// One sweeper pass at `now` (unix seconds): finish the group
     /// deletions a crash or a database fault interrupted, expire the
     /// pending channels and memberships whose writers never confirmed them
-    /// (older than [`PENDING_TTL`]), and delete expired revision claims. A
+    /// (older than [`PENDING_TTL`]), finish interrupted ownership transfers
+    /// (`transfer.rs`), and delete expired revision claims. A
     /// step or a group's purge that fails is logged and left for the next
     /// pass; the rest of the pass goes on.
     pub async fn sweep(&self, now: i64) -> Result<usize, DbError> {
@@ -170,6 +197,9 @@ impl Groups {
         let cutoff = now.saturating_sub(PENDING_TTL.as_secs() as i64);
         if let Err(e) = self.store.expire_pending(cutoff).await {
             tracing::warn!(error = %e, "expiring pending group rows failed");
+        }
+        if let Err(e) = self.finish_transfers().await {
+            tracing::warn!(error = %e, "finishing interrupted ownership transfers failed");
         }
         if let Err(e) = self.store.purge_claims(now).await {
             tracing::warn!(error = %e, "purging expired revision claims failed");

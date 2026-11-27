@@ -320,11 +320,16 @@ pub fn signed_as(
         *b = (rand_u64() >> (i % 8 * 8)) as u8;
     }
     let nonce: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+    // `path` may carry a query string, signed as its own component.
+    let (target, query) = match path.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (path, None),
+    };
     let canonical = CanonicalRequest {
         authority: "providera.com",
         method,
-        path,
-        query: None,
+        path: target,
+        query,
         timestamp,
         nonce: &nonce,
         content_digest: &digest,

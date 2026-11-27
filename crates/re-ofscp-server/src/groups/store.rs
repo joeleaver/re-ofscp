@@ -15,7 +15,7 @@ use re_ofscp_types::Actor;
 use re_ofscp_types::groups::{ChannelType, JoinPolicy, Tier};
 use serde::Deserialize;
 
-use super::model::{ChannelFields, GroupFields, StoredChannel, StoredGroup};
+use super::model::{ChannelFields, GroupFields, PendingTransfer, StoredChannel, StoredGroup};
 use crate::db::doc::{json, new_id};
 use crate::db::{Db, DbError, Ql};
 
@@ -27,10 +27,13 @@ pub(super) mod status {
     pub const DELETING: &str = "deleting";
     /// A channel or membership written but not yet confirmed: invisible.
     pub const PENDING: &str = "pending";
+    /// A membership being removed (`member_ops.rs`): invisible, and no
+    /// longer a membership. The sweeper deletes one its remover left.
+    pub const LEAVING: &str = "leaving";
 }
 
 #[derive(Deserialize)]
-struct GroupRow {
+pub(super) struct GroupRow {
     group_id: String,
     owner: String,
     name: String,
@@ -40,16 +43,38 @@ struct GroupRow {
     doc: String,
     created_at: String,
     updated_at: String,
+    #[serde(default)]
+    owner_display_name: Option<String>,
+    #[serde(default)]
+    owner_joined_at: Option<String>,
+    #[serde(default)]
+    transfer_from: Option<String>,
+    #[serde(default)]
+    transfer_id: Option<String>,
 }
 
 impl GroupRow {
-    fn decode(self) -> Result<StoredGroup, DbError> {
+    pub(super) fn decode(self) -> Result<StoredGroup, DbError> {
         let bad = |what: &str| DbError::Decode(format!("group {}: bad {what}", self.group_id));
         Ok(StoredGroup {
             owner: Actor::parse_canonical(&self.owner).map_err(|_| bad("owner"))?,
             tier: Tier::parse(&self.tier).ok_or_else(|| bad("tier"))?,
             join_policy: JoinPolicy::parse(&self.join_policy).ok_or_else(|| bad("join_policy"))?,
             doc: serde_json::from_str(&self.doc).map_err(|_| bad("doc"))?,
+            owner_joined_at: match self.owner_joined_at.as_deref() {
+                Some(t) => Some(crate::timefmt::unix(t).ok_or_else(|| bad("owner_joined_at"))?),
+                None => None,
+            },
+            // Both are set and cleared together.
+            transfer: match (self.transfer_from.as_deref(), self.transfer_id) {
+                (Some(from), Some(id)) => Some(PendingTransfer {
+                    from: Actor::parse_canonical(from).map_err(|_| bad("transfer_from"))?,
+                    id,
+                }),
+                (None, None) => None,
+                _ => return Err(bad("transfer")),
+            },
+            owner_display_name: self.owner_display_name,
             id: self.group_id,
             name: self.name,
             revision: self.revision,
@@ -97,7 +122,7 @@ struct ChannelIdRow {
     channel_id: String,
 }
 
-fn decode_updated<R, T>(
+pub(super) fn decode_updated<R, T>(
     result: rhypedb_client::QueryResult,
     decode: impl Fn(R) -> Result<T, DbError>,
 ) -> Result<Option<T>, DbError>
@@ -120,7 +145,10 @@ impl GroupStore {
     /// server applies it promptly (claims.rs). A write that
     /// lost a conflict, or met its object deleted, wrote nothing and
     /// returns no rows, and the edit retries from a fresh read.
-    async fn claimed_write(&self, q: &Ql) -> Result<rhypedb_client::QueryResult, DbError> {
+    pub(super) async fn claimed_write(
+        &self,
+        q: &Ql,
+    ) -> Result<rhypedb_client::QueryResult, DbError> {
         match self.db.write_rows(q).await {
             Err(DbError::Contended(_) | DbError::Vanished(_)) => {
                 Ok(rhypedb_client::QueryResult::Objects(Vec::new()))
@@ -178,7 +206,9 @@ impl GroupStore {
                 .unix_seconds(now)
                 .raw(", updated_at: ")
                 .unix_seconds(now)
-                .raw(" })");
+                // Explicit, so that a transfer can guard on it
+                // (`owner_store.rs`).
+                .raw(", owner_display_name: null })");
             match self.db.write_one::<GroupRow>(&q).await {
                 Ok(row) => return row.data.decode(),
                 Err(DbError::Conflict(_)) => continue,
@@ -305,9 +335,9 @@ impl GroupStore {
     }
 
     /// Remove a group being deleted: close its channels' message logs
-    /// (the messages sweeper purges them, decision 0017), then remove its
-    /// channels and memberships (pending or active), then the group row.
-    /// Each step is idempotent, so an interrupted purge is simply run
+    /// (the messages sweeper purges them, decision 0017), then remove its channels,
+    /// memberships (pending or active) and join requests, then the group
+    /// row. Each step is idempotent, so an interrupted purge is simply run
     /// again.
     pub async fn purge_group(&self, group_id: &str) -> Result<(), DbError> {
         crate::messages::log::close_group(&self.db, group_id).await?;
@@ -319,6 +349,10 @@ impl GroupStore {
             .str(group_id)
             .raw(").delete()");
         self.db.execute(&members).await?;
+        let requests = Ql::new("JoinRequest.filter(.group_id == ")
+            .str(group_id)
+            .raw(").delete()");
+        self.db.execute(&requests).await?;
         let group = Ql::new("Group.filter(.group_id == ")
             .str(group_id)
             .raw(" && .status == ")

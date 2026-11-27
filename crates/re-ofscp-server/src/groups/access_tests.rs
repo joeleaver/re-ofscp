@@ -275,3 +275,78 @@ fn reply_only_restricts_listed_roles_but_never_the_owner() {
         ReplyRule::Free
     );
 }
+
+fn policy(permissions: &[(&str, &[&str])], custom: &[&str]) -> GroupPolicy {
+    let map = permissions
+        .iter()
+        .map(|(a, roles)| {
+            (
+                (*a).to_owned(),
+                roles.iter().map(|r| (*r).to_owned()).collect(),
+            )
+        })
+        .collect();
+    let catalogue: Vec<RoleDefinition> = custom
+        .iter()
+        .map(|n| serde_json::from_value(serde_json::json!({ "name": n })).unwrap())
+        .collect();
+    GroupPolicy::new(Tier::Group, JoinPolicy::Open, map, Some(&catalogue))
+}
+
+#[test]
+fn a_roles_permission_set_is_what_the_effective_map_lists_it_for() {
+    let g = policy(&[("pin", &["moderator"])], &["moderator"]);
+    let set = |r: &str| match role_perms(r, &g) {
+        Perms::Only(s) => s.into_iter().collect::<Vec<_>>(),
+        Perms::All => vec!["*".to_owned()],
+    };
+    // Defaults fill the canonical actions.
+    assert_eq!(set("admin"), ["manage", "moderate", "post"]);
+    assert_eq!(set("member"), ["post"]);
+    assert_eq!(set("guest"), Vec::<String>::new());
+    assert_eq!(set("moderator"), ["pin"]);
+    assert_eq!(set("owner"), ["*"]);
+    // A role the group does not know holds nothing, even when listed.
+    let listed_unknown = policy(&[("post", &["ghost"])], &[]);
+    assert_eq!(
+        role_perms("ghost", &listed_unknown),
+        Perms::Only(BTreeSet::new())
+    );
+}
+
+#[test]
+fn the_subset_rule_protects_more_powerful_members() {
+    let g = policy(&[("pin", &["moderator"])], &["moderator"]);
+    let admin = member("admin");
+    // The owner may act on anyone; nobody else on the owner.
+    for r in ["owner", "admin", "member", "guest", "moderator"] {
+        assert!(may_act_on(&Standing::Owner, r, &g), "{r}");
+    }
+    assert!(!may_act_on(&admin, "owner", &g));
+    // An admin holds manage+moderate+post: member and guest are subsets,
+    // a fellow admin is equal, a moderator holds `pin`, which it lacks.
+    assert!(may_act_on(&admin, "admin", &g));
+    assert!(may_act_on(&admin, "member", &g));
+    assert!(may_act_on(&admin, "guest", &g));
+    assert!(!may_act_on(&admin, "moderator", &g));
+    // No hierarchy: a member may not act on an admin, and powers need not
+    // nest (a moderator lacks `post`, a member lacks `pin`).
+    assert!(!may_act_on(&member("member"), "admin", &g));
+    assert!(!may_act_on(&member("moderator"), "member", &g));
+    assert!(!may_act_on(&member("member"), "moderator", &g));
+    // An unknown role holds nothing, so anyone may act on it; an outsider
+    // or an impostor `owner` row may act only on such empty roles.
+    assert!(may_act_on(&Standing::Outsider, "ghost", &g));
+    assert!(may_act_on(&Standing::Outsider, "guest", &g));
+    assert!(!may_act_on(&Standing::Outsider, "member", &g));
+    assert!(!may_act_on(&member("owner"), "member", &g));
+}
+
+#[test]
+fn removing_a_grant_shrinks_the_set_without_hierarchy() {
+    // `manage: [member]` takes manage away from admin (§5.2 exact grants):
+    // an admin then may not act on a member, who holds manage and post.
+    let g = policy(&[("manage", &["member"])], &[]);
+    assert!(!may_act_on(&member("admin"), "member", &g));
+    assert!(may_act_on(&member("member"), "member", &g));
+}

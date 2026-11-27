@@ -161,6 +161,10 @@ pub struct Group {
     pub updated_at: String,
     /// Metadata objects (§5.4).
     pub metadata: Vec<MetadataObject>,
+    /// The caller's own membership: only in an answer to a signed member
+    /// (§5.5). Its absence does not prove the caller is not a member.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub membership: Option<ofscp_core::wire::Membership>,
 }
 
 /// The canonical `Channel` object (§5.2).
@@ -394,10 +398,12 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             metadata: vec![],
+            membership: None,
         };
         let v = serde_json::to_value(&g).unwrap();
         assert_eq!(v["joinPolicy"], "invite");
         assert!(v.get("description").is_none());
         assert_eq!(v["createdAt"], "2026-01-01T00:00:00Z");
+        assert!(v.get("membership").is_none());
     }
 }

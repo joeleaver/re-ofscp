@@ -117,9 +117,9 @@ it sends.
   stands until it is re-probed. Cascades are done by the server (below).
 - `Membership.key` is `"{group_id} {actor}"`, `@unique`, so an actor has at
   most one membership per group without a transaction.
-- The owner is `Group.owner`, not a `Membership` row. §5.7 must keep that
+- The owner is `Group.owner`, not a `Membership` row. §5.7 keeps that
   rule: an ownership transfer creates a membership for the former owner
-  and removes the new owner's. A membership can never hold the role
+  and removes the new owner's (decision 0020, "Ownership transfer"). A membership can never hold the role
   `owner` (`add_member`/`set_role` refuse it, and the access rule grants
   such a row nothing), and the owner is never also a member.
 - The fields only ever read back as a whole (description, permissions,
@@ -294,9 +294,10 @@ closed: a group left out is neither shared nor listed.
 
 - An admin-console (read-only) group list. It needs admin API routes and
   admin-web pages, and fits the next admin-console unit.
-- §5.7 membership, §5.6 invites and §4.8 guests, using the seams above:
+- §5.6 invites and §4.8 guests, using the seams above:
   `Groups::add_member` / `set_role` / `remove_member` (each already
-  announces its change) and `access::join_gate`.
+  announces its change) and `access::join_gate`. §5.7 membership is built
+  on them (decision 0020).
 - Switch the references to rhypedb links with `@on_delete(cascade)` once
   the pinned rhypedb supports linking on create.
 - rhypedb's limited index scan must count only live rows, as its type

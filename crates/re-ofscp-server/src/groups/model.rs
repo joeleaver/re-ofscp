@@ -63,6 +63,42 @@ pub struct StoredGroup {
     pub created_at: String,
     /// RFC 3339 time of the last change.
     pub updated_at: String,
+    /// The owner's group-scoped nickname (§5.7): the owner has no
+    /// membership row to hold it.
+    pub owner_display_name: Option<String>,
+    /// When the owner joined (unix seconds), if they were handed the group:
+    /// their membership's `joinedAt`, kept (lost-conn/ofscp#35). `None` for
+    /// the creator, who joined at `created_at`.
+    pub owner_joined_at: Option<i64>,
+    /// The ownership transfer to the owner not yet finished, if any
+    /// (`transfer.rs`).
+    pub transfer: Option<PendingTransfer>,
+}
+
+/// What an ownership transfer's commit writes about the new owner
+/// (`GroupStore::transfer_owner`).
+#[derive(Debug, Clone, Copy)]
+pub struct Handover<'a> {
+    /// The new owner.
+    pub to: &'a Actor,
+    /// Their nickname, which becomes the owner's.
+    pub display_name: Option<&'a str>,
+    /// Their membership's `joinedAt` (unix seconds), kept as the owner's
+    /// (lost-conn/ofscp#35).
+    pub joined_at: i64,
+    /// The transfer's id (`xfr_…`).
+    pub transfer_id: &'a str,
+}
+
+/// An ownership transfer that has committed (the group names its new
+/// owner) but is not finished: the new owner's old membership row, which
+/// carries the same id, is still to be removed (`transfer.rs`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingTransfer {
+    /// The former owner.
+    pub from: Actor,
+    /// The transfer's id (`xfr_…`).
+    pub id: String,
 }
 
 impl StoredGroup {
@@ -90,6 +126,7 @@ impl StoredGroup {
             created_at: self.created_at.clone(),
             updated_at: self.updated_at.clone(),
             metadata: self.doc.metadata.clone(),
+            membership: None,
         }
     }
 }
@@ -346,6 +383,9 @@ mod tests {
             doc: f.doc,
             created_at: "2026-01-01T12:00:00Z".into(),
             updated_at: "2026-01-01T12:00:00Z".into(),
+            owner_display_name: None,
+            owner_joined_at: None,
+            transfer: None,
         }
     }
 

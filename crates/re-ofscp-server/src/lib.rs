@@ -531,6 +531,7 @@ pub fn router(state: AppState) -> Router {
                 .delete(groups::routes::delete_channel),
         )
         .route("/api/tiers", get(groups::routes::tiers))
+        .merge(groups::member_routes::routes())
         .route("/api/me", get(profiles::routes::me))
         .route(
             "/api/me/profile",

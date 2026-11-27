@@ -177,7 +177,7 @@ async fn pending_rows_are_invisible_and_expire() {
     assert!(
         groups
             .store
-            .add_member(&gid, &bob.id(), "admin", now())
+            .add_member(&gid, &bob.id(), "admin", None, now())
             .await
             .unwrap()
     );
@@ -295,7 +295,7 @@ async fn a_pending_membership_is_not_reported_as_one() {
     assert!(
         groups
             .store
-            .add_member(&gid, &bob.id(), "member", now())
+            .add_member(&gid, &bob.id(), "member", None, now())
             .await
             .unwrap()
     );

@@ -216,6 +216,19 @@ type Group {
     doc: String
     created_at: DateTime
     updated_at: DateTime
+    // The owner's group-scoped nickname (§5.7 `displayNameOverride`): the
+    // owner has no Membership row to hold it. Absent = none.
+    owner_display_name: String
+    // When the owner joined the group (§5.7 `joinedAt`), kept through an
+    // ownership transfer (lost-conn/ofscp#35). Absent = `created_at`: the
+    // creator.
+    owner_joined_at: DateTime
+    // The former owner of an ownership transfer not yet finished
+    // (docs/decisions/0020). Absent = no transfer in progress.
+    transfer_from: String
+    // That transfer's id (`xfr_…`), also on the new owner's old Membership
+    // row. Set and cleared with `transfer_from`.
+    transfer_id: String @indexed
 }
 
 // A channel of a group (spec §5.2, §5.2.1).
@@ -237,7 +250,8 @@ type Channel {
 }
 
 // A non-owner member of a group (spec §5.7). The owner is `Group.owner` and
-// has no row here. `key` is `group_id` + " " + the canonical actor, so one
+// has no row here (a row left for the owner by an ownership transfer is
+// ignored by every read; docs/decisions/0020). `key` is `group_id` + " " + the canonical actor, so one
 // actor holds at most one membership per group. Actors may be remote
 // (§8.2): identity is the full `handle@domain` (security requirement 1).
 type Membership {
@@ -245,9 +259,32 @@ type Membership {
     group_id: String @indexed
     actor: String @indexed
     role: String
-    // "pending" or "active", as for Channel.status.
+    // "pending" or "active", as for Channel.status, or "leaving": being
+    // removed (docs/decisions/0020), and no longer a membership.
     status: String @indexed
     joined_at: DateTime
+    // When the role last changed, or when the row began leaving. Absent =
+    // `joined_at`.
+    updated_at: DateTime
+    // The member's group-scoped nickname (§5.7). Absent = none.
+    display_name_override: String
+    // The ownership transfer to this member in progress, if any (the
+    // group's `transfer_id`; docs/decisions/0020). Absent = none.
+    transfer_id: String
+}
+
+// A pending request to join a group whose policy is `request` (spec §5.7).
+// `key` is `group_id` + " " + the canonical actor, so an actor has at most
+// one pending request per group. Approving or denying deletes the row; a
+// group's purge deletes its requests.
+type JoinRequest {
+    request_id: String @unique
+    key: String @unique
+    group_id: String @indexed
+    actor: String
+    // Absent when the requester sent none.
+    message: String
+    requested_at: DateTime
 }
 
 // A claim on the next revision of a group or channel (docs/decisions/0014):

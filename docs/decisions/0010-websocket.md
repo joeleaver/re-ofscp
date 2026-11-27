@@ -298,6 +298,13 @@ Disabling an account closes all of its connections with `4003`.
   Whichever it is, a test must publish between a revoking commit and the
   follower's hold (with the follower paused) and see nothing delivered.
 
+  **Closed (decision 0020):** the first publisher, `member.updated`, uses
+  `Hub::publish_checked`, the first option: it holds every subscription
+  of the topics, queues the event behind the hold, and releases each only
+  after a re-check finds it readable. `tests/ws_members.rs` publishes
+  after a revoking commit the follower never hears of and sees nothing
+  delivered. Later publishers (the message log) use the same call.
+
 ### Presence
 
 The hub is the default `privacy::Liveness`: an actor is connected while it
