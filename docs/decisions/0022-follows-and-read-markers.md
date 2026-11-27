@@ -186,9 +186,9 @@ their devices.
     the messages sweeper) numbers every channel in one pass over the open
     logs, then numbers whatever requests hand it. Between the channels of
     that pass it numbers what requests handed over meanwhile, so a request
-    waiting on a channel waits for the channel being numbered and those
-    handed over before its own (each numbered once, to the end), not for
-    the rest of the pass. A request (a create, a marker update, a count) that meets
+    waiting on a channel waits for the channel being numbered and the
+    others handed over by then (each numbered once, to the end, in no
+    promised order), not for the rest of the pass. A request (a create, a marker update, a count) that meets
     channels not yet numbered numbers them itself only within a budget of
     1,000 positions over every channel it meets; a channel past what is
     left of it is handed to the background task and the request answers
@@ -220,7 +220,11 @@ their devices.
     `PATCH` reads the scopes' totals before moving any marker, so if
     reading the moved scopes again fails, their entries are built from the
     markers as moved and those totals (exact as of that read; a message
-    posted since reaches the user's connections with its own event). A
+    posted since reaches the user's connections with its own event). Only
+    on that failure path, a concurrent `PATCH` may already have moved the
+    marker further and announced it, so the fallback can announce an
+    older position after a newer one; `GET` gives the stored marker, and
+    the next move announces it. A
     database failure while storing can still follow some moves; those are
     announced before the error is returned.
   - *Bounds.* A request does at most 10 batched reads (plus one per

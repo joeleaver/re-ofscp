@@ -16,9 +16,9 @@
 //!   numbers every channel once ([`Messages::number_all`]), then whatever
 //!   a request hands it. Between the channels of that first pass it
 //!   numbers what requests handed it meanwhile, so a channel a request is
-//!   waiting on waits for the channel being numbered and for those handed
-//!   over before it (each numbered to the end, once), never for the rest
-//!   of the pass. It is not bounded (one pass over each channel), and no
+//!   waiting on waits for the channel being numbered and for the others
+//!   handed over by then (each numbered to the end, once, in no promised
+//!   order), never for the rest of the pass. It is not bounded (one pass over each channel), and no
 //!   request waits on it: a request answers `503` and is retried.
 //! - A request (a create, a marker update, a count) that meets channels
 //!   not yet numbered numbers them itself only within its

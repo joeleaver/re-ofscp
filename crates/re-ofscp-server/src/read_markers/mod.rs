@@ -109,7 +109,7 @@ impl ReadMarkers {
     /// guessed count: the whole answer is `503` with `Retry-After` until it
     /// is numbered. The background task numbers handed-over channels
     /// between the channels of its startup pass, so that wait is for the
-    /// channels handed over before it, never the whole pass
+    /// channels handed over by then, never the whole pass
     /// (`messages/numbering.rs`).
     pub async fn scopes(&self, actor: &Actor) -> Result<Vec<ReadMarker>, MarkerError> {
         let channels = self.groups.readable_member_channels(actor).await?;
@@ -195,7 +195,9 @@ impl ReadMarkers {
     /// read `before` any moved, exact as of that read (every marker's
     /// message was stored by then); a message posted since is announced to
     /// the user's connections with its own event. Never fails, so what
-    /// moved is always announced.
+    /// moved is always announced. On that fallback only, a concurrent
+    /// update may already have moved and announced the marker further, so
+    /// this can announce an older position after it (decision 0022).
     async fn announced(
         &self,
         actor: &Actor,
