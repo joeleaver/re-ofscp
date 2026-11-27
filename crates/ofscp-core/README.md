@@ -38,11 +38,10 @@ The crate does no I/O, starts no async runtime, never reads a clock and
 never draws randomness (time and a `rand_core::CryptoRngCore` are passed
 in). It builds for `wasm32-unknown-unknown`. Its tests reproduce
 the spec's signing, WebSocket-auth and `dmId` vectors byte-for-byte,
-round-trip every REST sample, and round-trip every WebSocket sample and
-validate the re-encoded frame against the spec's schemas. REST payloads the
-spec shows only as a text example (the channel list, the reaction `PUT`
-body) are round-tripped from that example and validated against a schema
-built from the spec's own definitions. The spec is read from a sibling
+round-trip every REST sample (and validate the channel-list and reaction
+`PUT` samples against their schemas), and
+round-trip every WebSocket sample and validate the re-encoded frame against
+the spec's schemas. The spec is read from a sibling
 `../ofscp` checkout (or `OFSCP_SPEC_DIR`).
 
 ## Users
