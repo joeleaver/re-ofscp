@@ -287,6 +287,8 @@ impl Groups {
         // A failed mark may have committed (the group is then hidden): tell
         // live readers now, as every revoking write does. On success the
         // channels and the group are announced below, in that order.
+        // A failed mark may also have taken the group from its owner's
+        // group list (§5.7, decision 0018).
         let marked = self.store.mark_deleting(group_id).await;
         announce_unless(
             &marked,
@@ -295,6 +297,7 @@ impl Groups {
                 self.changed(AccessChange::Group {
                     group_id: group_id.to_owned(),
                 });
+                self.tell_listeners(group_id, &group.owner);
             },
         );
         if !marked? {
@@ -316,14 +319,27 @@ impl Groups {
         self.changed(AccessChange::Group {
             group_id: group_id.to_owned(),
         });
-        match channels {
-            Ok(_) => {
+        self.tell_listeners(group_id, &group.owner);
+        // Group lists (§5.7 *My groups*, decision 0018) find members
+        // through the membership rows, which the purge also removes: each
+        // is ended, and its member named to the listeners, first
+        // (`ending.rs`). Live subscriptions need no per-member change: the
+        // channel changes above already re-check every one.
+        let ended = self.end_memberships(group_id).await;
+        match (channels, ended) {
+            (Ok(_), Ok(true)) => {
                 if let Err(e) = self.store.purge_group(group_id).await {
                     tracing::warn!(error = %e, group_id, "purging a deleted group failed; the sweeper will finish it");
                 }
             }
-            Err(e) => {
-                tracing::warn!(error = %e, group_id, "listing a deleted group's channels failed; the sweeper will purge it");
+            (Err(e), _) | (_, Err(e)) => {
+                tracing::warn!(error = %e, group_id, "listing a deleted group's channels or ending its memberships failed; the sweeper will purge it");
+            }
+            (Ok(_), Ok(false)) => {
+                tracing::warn!(
+                    group_id,
+                    "a deleted group's memberships kept changing; the sweeper will end them and purge it"
+                );
             }
         }
         Ok(())

@@ -223,6 +223,10 @@ type Group {
     // ownership transfer (lost-conn/ofscp#35). Absent = `created_at`: the
     // creator.
     owner_joined_at: DateTime
+    // When the current owner became the owner: written by an ownership
+    // transfer, and the owner's group-list `updatedAt` (§5.7,
+    // docs/decisions/0018). Absent = `created_at`: the creator.
+    owner_since: DateTime
     // The former owner of an ownership transfer not yet finished
     // (docs/decisions/0020). Absent = no transfer in progress.
     transfer_from: String
@@ -259,8 +263,10 @@ type Membership {
     group_id: String @indexed
     actor: String @indexed
     role: String
-    // "pending" or "active", as for Channel.status, or "leaving": being
-    // removed (docs/decisions/0020), and no longer a membership.
+    // "pending" or "active", as for Channel.status; "leaving": being
+    // removed (docs/decisions/0020), and no longer a membership; or
+    // "ended": a membership of a group being deleted, named to group lists
+    // before the purge (docs/decisions/0018).
     status: String @indexed
     joined_at: DateTime
     // When the role last changed, or when the row began leaving. Absent =
@@ -465,4 +471,16 @@ type Reaction {
     unicode: String
     image: String
     created_at: DateTime
+}
+
+// A membership pointer (§5.7 *My groups*, docs/decisions/0018): a remote
+// group one of the owner's clients recorded. Never written for a group this
+// provider hosts. `key` is "{owner} {group}"; `group` is the canonical
+// object URI; `role` is the client's hint, empty when it gave none.
+type GroupPointer {
+    key: String @unique
+    owner: String @indexed
+    group: String
+    role: String
+    updated_at: DateTime
 }

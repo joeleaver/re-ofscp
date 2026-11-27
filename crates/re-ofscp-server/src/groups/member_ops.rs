@@ -139,7 +139,8 @@ impl Groups {
     /// `owner` field, never a membership. A group holding
     /// [`MAX_MEMBERS_PER_GROUP`] members refuses more, and an actor already
     /// in [`MAX_MEMBERSHIPS_PER_ACTOR`] groups may join no more (both
-    /// `403`). Announces the change.
+    /// `403`). Announces the change once the row may be active, on every
+    /// exit from then on, errors included ([`Self::settle_join`]).
     pub async fn add_member(
         &self,
         group_id: &str,
@@ -169,18 +170,53 @@ impl Groups {
         if self.membership_count(actor).await? >= MAX_MEMBERSHIPS_PER_ACTOR {
             return Err(GroupError::Forbidden(MEMBER_OF_TOO_MANY));
         }
-        let added = self
-            .write_member(group_id, actor, role, None, MAX_MEMBERS_PER_GROUP, now)
-            .await?;
-        if !added {
+        if !self
+            .write_pending_member(group_id, actor, role, None, MAX_MEMBERS_PER_GROUP, now)
+            .await?
+        {
             return Ok(false);
         }
+        let activated = match self.store.activate_member(group_id, actor).await {
+            Ok(true) => Ok(()),
+            // Known to have activated nothing: there is nothing to announce.
+            Ok(false) => return Err(self.not_activated(group_id).await),
+            // May have committed: settled (and announced) as if it had.
+            Err(e) => Err(e.into()),
+        };
+        self.settle_join(group_id, actor, activated).await
+    }
+
+    /// The rest of [`Self::add_member`] once its row may be active: the
+    /// activation succeeded, or failed in a way that may have committed.
+    /// Every exit from here announces the change, so group lists and live
+    /// subscriptions never miss a membership that may exist (decision
+    /// 0018). A join that cannot be confirmed (the activation or the
+    /// recount failed) or that took the actor past
+    /// [`MAX_MEMBERSHIPS_PER_ACTOR`] is taken back, which announces again.
+    pub(super) async fn settle_join(
+        &self,
+        group_id: &str,
+        actor: &Actor,
+        activated: Result<(), GroupError>,
+    ) -> Result<bool, GroupError> {
         self.member_changed(group_id, actor);
         // Counted again once active, as for owned groups: of concurrent
         // joins past the limit, each finds the excess and takes itself back.
-        if self.membership_count(actor).await? > MAX_MEMBERSHIPS_PER_ACTOR {
+        let confirmed = match activated {
+            Ok(()) => match self.membership_count(actor).await {
+                Ok(n) if n > MAX_MEMBERSHIPS_PER_ACTOR => {
+                    Err(GroupError::Forbidden(MEMBER_OF_TOO_MANY))
+                }
+                Ok(_) => Ok(()),
+                Err(e) => Err(e),
+            },
+            Err(e) => Err(e),
+        };
+        if let Err(e) = confirmed {
+            // A take-back that fails leaves the join's state unknown: its
+            // error is the answer then.
             self.remove_member(group_id, actor).await?;
-            return Err(GroupError::Forbidden(MEMBER_OF_TOO_MANY));
+            return Err(e);
         }
         // A member has nothing left to ask for.
         self.store.delete_request_of(group_id, actor).await?;
@@ -226,6 +262,30 @@ impl Groups {
         limit: usize,
         now: i64,
     ) -> Result<bool, GroupError> {
+        if !self
+            .write_pending_member(group_id, actor, role, display_name, limit, now)
+            .await?
+        {
+            return Ok(false);
+        }
+        if !self.store.activate_member(group_id, actor).await? {
+            return Err(self.not_activated(group_id).await);
+        }
+        Ok(true)
+    }
+
+    /// [`Self::write_member`] up to its activation: `Ok(true)` once a
+    /// pending row is written and confirmed, ready to be made active.
+    /// Nothing it leaves is active, so it never needs announcing.
+    async fn write_pending_member(
+        &self,
+        group_id: &str,
+        actor: &Actor,
+        role: &str,
+        display_name: Option<&str>,
+        limit: usize,
+        now: i64,
+    ) -> Result<bool, GroupError> {
         // As for channels: the row's age runs from `now`.
         let started = Instant::now();
         if !self
@@ -252,15 +312,17 @@ impl Groups {
             self.store.remove_member(group_id, actor).await?;
             return Err(GroupError::Conflict(SLOW_WRITE));
         }
-        if !self.store.activate_member(group_id, actor).await? {
-            if self.store.group(group_id).await?.is_none() {
-                return Err(GroupError::NotFound(NO_GROUP));
-            }
-            return Err(GroupError::Conflict(
-                "the membership could not be recorded; retry",
-            ));
-        }
         Ok(true)
+    }
+
+    /// The answer when activating a pending membership of `group_id` found
+    /// no pending row (it expired, or the group was purged).
+    async fn not_activated(&self, group_id: &str) -> GroupError {
+        match self.store.group(group_id).await {
+            Ok(None) => GroupError::NotFound(NO_GROUP),
+            Ok(Some(_)) => GroupError::Conflict("the membership could not be recorded; retry"),
+            Err(e) => e.into(),
+        }
     }
 
     /// How many members `group` has besides its owner, pending rows

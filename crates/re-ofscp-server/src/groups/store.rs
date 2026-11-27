@@ -30,6 +30,10 @@ pub(super) mod status {
     /// A membership being removed (`member_ops.rs`): invisible, and no
     /// longer a membership. The sweeper deletes one its remover left.
     pub const LEAVING: &str = "leaving";
+    /// A membership of a group being deleted, ended and named to group
+    /// lists before the purge (`ending.rs`): invisible, and left alone by
+    /// every other write so the sweeper can name it again.
+    pub const ENDED: &str = "ended";
 }
 
 #[derive(Deserialize)]

@@ -44,6 +44,10 @@ pub struct EnvOptions {
     pub groups: Option<Arc<dyn GroupMemberships>>,
     /// Connection liveness for presence.
     pub liveness: Option<Arc<dyn Liveness>>,
+    /// Leave the federation policy unloaded (as before startup loads it).
+    pub no_federation: bool,
+    /// The group-list change backlog (`AppStateBuilder::group_list_backlog`).
+    pub group_list_backlog: Option<usize>,
 }
 
 /// `ADMIN_SETUP_TOKEN` in tests.
@@ -83,9 +87,14 @@ pub async fn env_with(opts: EnvOptions) -> Env {
     if let Some(l) = opts.liveness {
         b = b.liveness(l);
     }
+    if let Some(n) = opts.group_list_backlog {
+        b = b.group_list_backlog(n);
+    }
     let state = b.build().unwrap();
     state.restore_replay().await.unwrap();
-    state.load_federation().await.unwrap();
+    if !opts.no_federation {
+        state.load_federation().await.unwrap();
+    }
     clock.set(SIGNED_AT);
     let app = router(state.clone());
     Env {
