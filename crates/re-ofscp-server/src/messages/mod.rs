@@ -12,6 +12,7 @@
 //! * `pager.rs`: paging over timeline, reply and reaction positions.
 //! * `routes.rs`: the REST endpoints.
 //! * `fanout.rs`: the seam live delivery plugs into.
+//! * `notify.rs`: the seam the notification feed (§10.1) plugs into.
 //! * `timeline.rs`: replaying the timeline after a resume cursor.
 //! * `typing.rs`: typing indicators.
 
@@ -26,9 +27,10 @@ use crate::groups::Groups;
 use crate::signing::Clock;
 
 pub mod fanout;
-mod locks;
+pub(crate) mod locks;
 pub mod log;
 pub mod model;
+pub mod notify;
 pub mod numbering;
 mod ops;
 pub mod ordinals;
@@ -46,6 +48,7 @@ pub mod validate;
 
 pub use fanout::{Fanout, Live, Origin};
 use locks::ChannelLocks;
+pub use notify::{Notify, NotifyFuture};
 pub use ops::{Created, Deleted, MessageError, channel_message, message_deleted};
 pub use reactions::Added;
 use store::MessageStore;
@@ -81,6 +84,7 @@ pub struct Messages {
     groups: Arc<Groups>,
     uploads: Arc<dyn Uploads>,
     fanout: Arc<dyn Fanout>,
+    notify: Arc<dyn Notify>,
     clock: Arc<dyn Clock>,
     home: Authority,
     locks: ChannelLocks,
@@ -101,12 +105,14 @@ impl std::fmt::Debug for Messages {
 
 impl Messages {
     /// The messages of `groups`' channels, stored in `db`, attachments
-    /// checked against `uploads`, live events handed to `fanout`.
+    /// checked against `uploads`, live events handed to `fanout`, new
+    /// messages told to `notify`.
     pub fn new(
         db: Arc<Db>,
         groups: Arc<Groups>,
         uploads: Arc<dyn Uploads>,
         fanout: Arc<dyn Fanout>,
+        notify: Arc<dyn Notify>,
         clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
@@ -115,6 +121,7 @@ impl Messages {
             groups,
             uploads,
             fanout,
+            notify,
             clock,
             locks: ChannelLocks::default(),
             numbering: ChannelLocks::default(),
@@ -133,9 +140,10 @@ impl Messages {
     }
 
     /// One sweeper pass at `now` (unix seconds): purge the rows of deleted
-    /// channels (their logs closed), authors' tallies and readers' markers
-    /// included, and a [`PURGE_GRACE`] later purge them again and drop the
-    /// log. Returns how many logs it handled.
+    /// channels (their logs closed), authors' tallies, readers' markers and
+    /// notification entries and settings included, and a [`PURGE_GRACE`]
+    /// later purge them again and drop the log. Returns how many logs it
+    /// handled.
     pub async fn sweep(&self, now: i64) -> Result<usize, DbError> {
         let db = self.store.db();
         let cutoff = now.saturating_sub(PURGE_GRACE.as_secs() as i64);
@@ -149,6 +157,9 @@ impl Messages {
                 // write racing the first purge is caught by the second.
                 crate::read_markers::store::MarkerStore::purge_scope(db, &closed.channel_id)
                     .await?;
+                // So do its notifications and channel settings (decision
+                // 0023), caught the same way.
+                crate::notifications::purge_channel(db, &closed.channel_id).await?;
                 match closed.purged_at {
                     None => log::mark_purged(db, &closed.channel_id, now).await?,
                     Some(_) => log::delete_closed(db, &closed.channel_id).await?,

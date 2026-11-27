@@ -8,8 +8,8 @@ use re_ofscp_types::{Health, OFSCP_VERSION};
 
 use crate::problem::{self, Problem, ProblemBase};
 use crate::{
-    AppState, accounts, admin, cors, discovery, follows, groups, messages, my_groups, profiles,
-    read_markers, signing, ws,
+    AppState, accounts, admin, cors, discovery, follows, groups, messages, my_groups,
+    notifications, profiles, read_markers, signing, ws,
 };
 
 /// Build the HTTP router.
@@ -107,6 +107,28 @@ pub fn router(state: AppState) -> Router {
                 .patch(read_markers::routes::update)
                 .layer(axum::extract::DefaultBodyLimit::max(
                     read_markers::routes::BODY_LIMIT,
+                )),
+        )
+        .route("/api/me/notifications", get(notifications::routes::list))
+        .route(
+            "/api/me/notifications/seen",
+            post(notifications::routes::seen).layer(axum::extract::DefaultBodyLimit::max(
+                notifications::routes::MARK_BODY_LIMIT,
+            )),
+        )
+        .route(
+            "/api/me/notifications/read",
+            post(notifications::routes::read).layer(axum::extract::DefaultBodyLimit::max(
+                notifications::routes::MARK_BODY_LIMIT,
+            )),
+        )
+        .route(
+            "/api/me/notification-settings",
+            get(notifications::routes::settings)
+                .put(notifications::routes::put_setting)
+                .delete(notifications::routes::clear_setting)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    notifications::routes::SETTING_BODY_LIMIT,
                 )),
         )
         .route(

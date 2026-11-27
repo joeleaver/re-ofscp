@@ -16,6 +16,7 @@ pub mod groups;
 pub mod logpath;
 pub mod messages;
 pub mod my_groups;
+pub mod notifications;
 pub mod outbound;
 pub mod privacy;
 pub mod problem;
@@ -105,6 +106,8 @@ pub struct AppState {
     pub follows: Arc<follows::Follows>,
     /// Read markers and unread counts (§7.7).
     pub read_markers: Arc<read_markers::ReadMarkers>,
+    /// The notification feed and its settings (§10.1, §10.2).
+    pub notifications: Arc<notifications::Notifications>,
     /// The WebSocket layer (§7.1): live connections, fan-out, force-close.
     pub ws: Arc<Hub>,
 }
@@ -322,11 +325,17 @@ impl AppStateBuilder {
             self.clock,
         ));
         let fanout = Arc::new(HubFanout::new(groups.clone()));
+        let notifications = Arc::new(notifications::Notifications::new(
+            db.clone(),
+            groups.clone(),
+            accounts.store.clone(),
+        ));
         let messages = Arc::new(Messages::new(
             db.clone(),
             groups.clone(),
             self.uploads.unwrap_or_else(|| Arc::new(NoUploads)),
             fanout.clone(),
+            notifications.clone(),
             clock,
         ));
         let ws = Arc::new(Hub::new(
@@ -341,6 +350,7 @@ impl AppStateBuilder {
             }),
         ));
         fanout.attach(&ws);
+        notifications.attach(&ws);
         accounts.on_revocation(ws.clone());
         // Subscriptions whose access a group change revokes end at once.
         ws::follow_groups(&runtime, &ws, &groups);
@@ -384,6 +394,7 @@ impl AppStateBuilder {
             my_groups,
             follows,
             read_markers,
+            notifications,
             ws,
         })
     }

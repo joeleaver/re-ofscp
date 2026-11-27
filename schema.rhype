@@ -588,3 +588,44 @@ type ReadMarker {
     own: i64
     updated_at: DateTime
 }
+
+// The notification feed (§10.1, docs/decisions/0023). Each local user's
+// entries are numbered 1, 2, 3… by a compare-and-set on
+// `NotificationFeed.last_n`; only the newest 500 positions are kept (older
+// rows are pruned when a new entry is made, and never read), so a feed is
+// read whole with one bounded query and sorted by `n`.
+type NotificationFeed {
+    owner: String @unique
+    last_n: i64
+}
+
+// One feed entry. `source_key` is "{owner} {message_id}": at most one
+// entry per user per message. `kind` is "mention", "reply" or "message";
+// `seen_at` and `read_at` are unix seconds, 0 while unset. Purged with the
+// channel's messages when the channel is deleted.
+type Notification {
+    id: String @unique
+    source_key: String @unique
+    owner: String @indexed
+    n: i64
+    kind: String
+    message_id: String
+    channel_id: String @indexed
+    group_id: String
+    author: String
+    created_at: i64
+    seen_at: i64
+    read_at: i64
+}
+
+// A notification setting (§10.2): `key` is "{owner} {scope_type}
+// {scope_id}"; `scope_type` is "group" or "channel", `mode` is "all",
+// "mentions" or "none". Channel settings are purged with the channel.
+type NotificationSetting {
+    key: String @unique
+    owner: String @indexed
+    scope_type: String
+    scope_id: String @indexed
+    mode: String
+    updated_at: i64
+}
