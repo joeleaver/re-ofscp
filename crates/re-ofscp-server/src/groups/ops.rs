@@ -313,17 +313,27 @@ impl Groups {
                 self.channel_changed(group_id, channel_id);
             }
         }
+        // Group lists (§5.7 *My groups*, decision 0018) are found through
+        // the membership rows, which the purge also removes: every member,
+        // and the owner, is named now for the same reason.
+        let members = self.store.member_actors(group_id).await;
+        if let Ok(actors) = &members {
+            for member in actors {
+                self.member_changed(group_id, member);
+            }
+            self.member_changed(group_id, &group.owner);
+        }
         self.changed(AccessChange::Group {
             group_id: group_id.to_owned(),
         });
-        match channels {
+        match channels.and_then(|c| members.map(|_| c)) {
             Ok(_) => {
                 if let Err(e) = self.store.purge_group(group_id).await {
                     tracing::warn!(error = %e, group_id, "purging a deleted group failed; the sweeper will finish it");
                 }
             }
             Err(e) => {
-                tracing::warn!(error = %e, group_id, "listing a deleted group's channels failed; the sweeper will purge it");
+                tracing::warn!(error = %e, group_id, "listing a deleted group's channels or members failed; the sweeper will purge it");
             }
         }
         Ok(())

@@ -372,3 +372,19 @@ fn force_close_by_key_actor_remote_policy_and_shutdown() {
     assert_eq!(s2.closing().map(|c| c.code), Some(close::GOING_AWAY));
     assert_eq!(r.admit("e").unwrap_err(), Refused::ShuttingDown);
 }
+
+#[test]
+fn local_actors_lists_connected_local_accounts_only() {
+    let r = Registry::new(limits(), local());
+    let a = r.admit("c1").unwrap().id;
+    let b = r.admit("c2").unwrap().id;
+    let c = r.admit("c3").unwrap().id;
+    let _unauthenticated = r.admit("c3").unwrap().id;
+    r.authenticate(a, &actor("alice@a.example"), "k1").unwrap();
+    r.authenticate(b, &actor("alice@a.example"), "k2").unwrap();
+    r.authenticate(c, &actor("carol@b.example"), "k3").unwrap();
+    assert_eq!(r.local_actors(), vec![actor("alice@a.example")]);
+    r.remove(a);
+    r.remove(b);
+    assert!(r.local_actors().is_empty());
+}

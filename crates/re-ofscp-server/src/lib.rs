@@ -13,6 +13,7 @@ pub mod discovery;
 pub mod federation;
 pub mod groups;
 pub mod messages;
+pub mod my_groups;
 pub mod outbound;
 pub mod privacy;
 pub mod problem;
@@ -98,6 +99,8 @@ pub struct AppState {
     pub federation: Arc<PolicyStore>,
     /// Profiles, presence and privacy settings (§5.1, §6).
     pub profiles: Arc<Profiles>,
+    /// The user's group list: hosted memberships and pointers (§5.7).
+    pub my_groups: Arc<my_groups::MyGroups>,
     /// The WebSocket layer (§7.1): live connections, fan-out, force-close.
     pub ws: Arc<Hub>,
 }
@@ -327,6 +330,14 @@ impl AppStateBuilder {
         accounts.on_revocation(ws.clone());
         // Subscriptions whose access a group change revokes end at once.
         ws::follow_groups(&runtime, &ws, &groups);
+        // Hosted membership changes reach the member's group list (§5.7).
+        my_groups::events::follow(&runtime, &ws, &groups);
+        let my_groups = Arc::new(my_groups::MyGroups::new(
+            my_groups::store::PointerStore::new(db.clone()),
+            groups.clone(),
+            ws.clone(),
+            federation.policy().clone(),
+        ));
         let liveness = self.liveness.unwrap_or_else(|| ws.clone());
         let profiles = Arc::new(Profiles::new(
             config.domain.clone(),
@@ -345,6 +356,7 @@ impl AppStateBuilder {
             discovery,
             federation,
             profiles,
+            my_groups,
             ws,
         })
     }
@@ -546,6 +558,15 @@ pub fn router(state: AppState) -> Router {
             get(profiles::routes::privacy)
                 .put(profiles::routes::update_privacy)
                 .layer(profile_body_limit()),
+        )
+        .route("/api/me/groups", get(my_groups::routes::list))
+        .route(
+            "/api/me/groups/{group_ref}",
+            put(my_groups::routes::put)
+                .delete(my_groups::routes::delete)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    my_groups::routes::BODY_LIMIT,
+                )),
         )
         .route(
             "/api/users/{user_ref}/profile",

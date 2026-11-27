@@ -8,6 +8,7 @@ pub mod harness;
 pub mod key_setup;
 pub mod members;
 pub mod messages;
+pub mod my_groups;
 pub mod profiles;
 pub mod races;
 pub mod remote_peer;

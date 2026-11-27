@@ -6,7 +6,8 @@
 //!   memberships.
 //! - [`ops`]: the operations the endpoints (and later surfaces) call.
 //! - [`routes`]: the §5.5 HTTP endpoints and `GET /api/tiers`.
-//!
+//! - [`listing`]: a user's hosted group-list entries (§5.7 *My groups*,
+//!   served by `crate::my_groups`).
 //! - [`member_routes`]: the §5.7 membership endpoints: joining and join
 //!   requests ([`joining`]), the member list (`roster.rs`, paged by
 //!   [`paging`]), leave, kick, role and nickname changes ([`member_edits`])
@@ -20,6 +21,7 @@
 pub mod access;
 mod claims;
 pub mod joining;
+pub mod listing;
 pub mod member_edits;
 mod member_ops;
 pub mod member_routes;

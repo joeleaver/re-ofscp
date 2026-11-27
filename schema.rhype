@@ -466,3 +466,15 @@ type Reaction {
     image: String
     created_at: DateTime
 }
+
+// A membership pointer (§5.7 *My groups*, docs/decisions/0018): a remote
+// group one of the owner's clients recorded. Never written for a group this
+// provider hosts. `key` is "{owner} {group}"; `group` is the canonical
+// object URI; `role` is the client's hint, empty when it gave none.
+type GroupPointer {
+    key: String @unique
+    owner: String @indexed
+    group: String
+    role: String
+    updated_at: DateTime
+}

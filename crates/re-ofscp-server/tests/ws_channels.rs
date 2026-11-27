@@ -80,6 +80,34 @@ async fn revoked(env: &Env, c: &mut Client, channel: &str) {
     assert!(c.silent_for(QUIET).await);
 }
 
+/// [`revoked`] for a change that also changed the member's group list
+/// (decision 0018): the `unsubscribed` and the `groups.updated` come from
+/// separate tasks, in either order. Returns the `groups.updated` data.
+async fn revoked_and_listed(env: &Env, c: &mut Client, channel: &str) -> Value {
+    let mut listed = None;
+    let mut ended = false;
+    while listed.is_none() || !ended {
+        let e = c.event().await;
+        match e["type"].as_str() {
+            Some("groups.updated") if listed.is_none() => listed = Some(e["data"].clone()),
+            Some("unsubscribed") if !ended => {
+                assert!(e.get("correlationId").is_none(), "{e}");
+                assert_eq!(
+                    e["data"],
+                    json!({"channels": [channel], "reason": "access_revoked"})
+                );
+                ended = true;
+            }
+            _ => panic!("unexpected {e}"),
+        }
+    }
+    env.state
+        .ws
+        .publish(channel, "message.created", json!({"n": 1}));
+    assert!(c.silent_for(QUIET).await);
+    listed.unwrap_or_default()
+}
+
 /// Expect `channel`'s subscription still live: a publish arrives.
 async fn still_live(env: &Env, c: &mut Client, channel: &str) {
     env.state
@@ -208,7 +236,8 @@ async fn a_view_list_or_a_role_change_revokes() {
     // Demoted: `view` now leaves her out.
     let groups = &env.state.groups;
     assert!(groups.set_role(&gid, &mia.id(), "member").await.unwrap());
-    revoked(&env, &mut c, &cid).await;
+    let listed = revoked_and_listed(&env, &mut c, &cid).await;
+    assert_eq!(listed["groups"][0]["role"], "member", "{listed}");
 }
 
 #[tokio::test]
@@ -228,7 +257,9 @@ async fn removing_a_member_revokes_their_subscriptions() {
         .remove_member(&gid, &mia.id())
         .await
         .unwrap();
-    revoked(&env, &mut c, &cid).await;
+    let listed = revoked_and_listed(&env, &mut c, &cid).await;
+    let uri = format!("https://providera.com/api/groups/{gid}");
+    assert_eq!(listed["removed"], json!([uri]), "{listed}");
     let e = o.event().await;
     assert_eq!(e["data"], json!({"n": 1}), "{e}");
 }
@@ -316,7 +347,10 @@ async fn deleting_a_group_names_each_channel_before_the_purge() {
                 assert_eq!(group_id, gid);
                 break;
             }
-            other => panic!("unexpected {other:?}"),
+            // The owner's group list (decision 0018).
+            GroupChange::Member { group_id, actor } => {
+                assert_eq!((group_id, actor), (gid.clone(), owner.id()));
+            }
         }
     }
     named.sort();
