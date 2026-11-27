@@ -336,7 +336,7 @@ impl GroupStore {
 
     /// Remove a group being deleted: close its channels' message logs
     /// (the messages sweeper purges them, decision 0017), then remove its channels,
-    /// memberships (pending or active) and join requests, then the group
+    /// memberships (pending, active or leaving) and join requests, then the group
     /// row. Each step is idempotent, so an interrupted purge is simply run
     /// again.
     pub async fn purge_group(&self, group_id: &str) -> Result<(), DbError> {

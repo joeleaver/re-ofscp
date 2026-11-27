@@ -22,6 +22,14 @@
 //! the statement on the server (docs/decisions/0014). Claims are never
 //! updated, so a filter over them is exact; [`GroupStore::purge_claims`]
 //! deletes the expired ones.
+//!
+//! A holder whose one write wrote nothing (its compare-and-set missed, or
+//! it lost a conflict, or the object was gone) releases its claim
+//! ([`GroupStore::release`]) before it retries. Otherwise a retry that
+//! reads the same revision again (nothing moved it) would find its own
+//! claim still leased and give up, and every edit of the object would wait
+//! out the lease. Releasing is safe because the write's compare-and-set on
+//! the revision, not the claim, is what refuses a stale edit.
 
 use serde::Deserialize;
 use time::OffsetDateTime;
@@ -100,6 +108,23 @@ impl GroupStore {
             }
         }
         Ok(false)
+    }
+
+    /// Release the claim on `key` made at `claimed_at` (the `now` passed
+    /// to [`Self::claim`]), after its holder's one write wrote nothing.
+    /// Only that claim is deleted: one taken over since was made at a later
+    /// time. A claim already gone is fine.
+    pub async fn release(&self, key: &str, claimed_at: i64) -> Result<(), DbError> {
+        let q = Ql::new("GroupClaim.filter(.key == ")
+            .str(key)
+            .raw(" && .created_at == ")
+            .unix_seconds(claimed_at)
+            .raw(").delete()");
+        match self.db.execute(&q).await {
+            // Deleted meanwhile by the purge (claims are never updated).
+            Ok(()) | Err(DbError::Vanished(_) | DbError::Contended(_)) => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     /// Delete claims expired by `now`, in bounded batches (a backlog drains

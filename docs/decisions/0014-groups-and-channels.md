@@ -156,7 +156,10 @@ guard:
   stamped with the clock when it is claimed (not the request's time,
   which earlier attempts may have aged). Its holder writes once, right
   away, in one statement that is never retried; a write that loses a
-  conflict wrote nothing, and the edit starts over. A claim that outlived
+  conflict wrote nothing, and the edit starts over. A holder whose write
+  wrote nothing first releases its claim (deleting the row with that key
+  and its own stamp; decision 0020), so that a retry which reads the same
+  revision again does not find its own claim leased and wait it out. A claim that outlived
   its lease unused is taken to belong to a dead writer, and the next edit takes it over (by deleting exactly that
   row, by id, then claiming again; a row already gone is fine). The
   sweeper deletes expired claims. The design assumes that rhypedb applies

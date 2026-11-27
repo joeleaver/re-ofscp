@@ -307,9 +307,39 @@ impl GroupStore {
         written(self.db.write_one_object_as::<MemberRow>(&q).await?)
     }
 
-    /// Make a membership [`Self::retire_member`] began removing active
-    /// again (a no-op if it is gone).
+    /// Make the membership [`Self::retire_member`] began removing at
+    /// `retired_at` active again (a no-op if it is gone, or is another
+    /// removal's).
     pub(super) async fn restore_member(
+        &self,
+        group_id: &str,
+        actor: &Actor,
+        retired_at: i64,
+    ) -> Result<(), DbError> {
+        let q = Self::retired_row(group_id, actor, retired_at)
+            .raw(").update({ status: ")
+            .str(status::ACTIVE)
+            .raw(" })");
+        self.db.write_one_object(&q).await.map(|_| ())
+    }
+
+    /// Finish removing the membership [`Self::retire_member`] began
+    /// removing at `retired_at`. Never deletes a row written since: a
+    /// removal stalled past `PENDING_TTL` has had its row swept, and the
+    /// actor may have joined again.
+    pub(super) async fn delete_retired_member(
+        &self,
+        group_id: &str,
+        actor: &Actor,
+        retired_at: i64,
+    ) -> Result<(), DbError> {
+        let q = Self::retired_row(group_id, actor, retired_at).raw(").delete()");
+        self.db.write_one_object(&q).await.map(|_| ())
+    }
+
+    /// Delete `actor`'s pending membership of `group_id` (a join still
+    /// being recorded), if any. An active or leaving row is untouched.
+    pub(super) async fn delete_pending_member(
         &self,
         group_id: &str,
         actor: &Actor,
@@ -317,11 +347,20 @@ impl GroupStore {
         let q = Ql::new("Membership.filter(.key == ")
             .str(&member_key(group_id, actor))
             .raw(" && .status == ")
-            .str(status::LEAVING)
-            .raw(").update({ status: ")
-            .str(status::ACTIVE)
-            .raw(" })");
+            .str(status::PENDING)
+            .raw(").delete()");
         self.db.write_one_object(&q).await.map(|_| ())
+    }
+
+    /// The open filter (no closing parenthesis) for `actor`'s row of
+    /// `group_id` as [`Self::retire_member`] left it at `retired_at`.
+    fn retired_row(group_id: &str, actor: &Actor, retired_at: i64) -> Ql {
+        Ql::new("Membership.filter(.key == ")
+            .str(&member_key(group_id, actor))
+            .raw(" && .status == ")
+            .str(status::LEAVING)
+            .raw(" && .updated_at == ")
+            .unix_seconds(retired_at)
     }
 
     /// Mark `actor`'s active membership of `group_id` as the target of

@@ -53,8 +53,11 @@ pub fn join_message(raw: Option<&str>) -> Result<Option<String>, Invalid> {
 
 impl Groups {
     /// `POST /api/groups/{groupId}/join`. `message` is the optional
-    /// request body's, or why the body is malformed; it is looked at only
-    /// for a `request` group the caller may ask to join.
+    /// request body's, or why the body is malformed. It is validated once
+    /// the caller is known to be let in or to be a member already (`400`),
+    /// as every route validates its body only after authorizing; a caller
+    /// refused by an invite-only group gets `403` whatever they sent. It is
+    /// stored only for a `request` group.
     pub async fn join(
         &self,
         actor: &Actor,
@@ -63,17 +66,19 @@ impl Groups {
     ) -> Result<Joined, GroupError> {
         let group = self.settled_group(group_id).await?;
         if let Some(m) = self.member_of(&group, actor).await? {
+            join_message(message?)?;
             return Ok(Joined::Already(m));
         }
-        match access::join_gate(&group.policy()) {
-            JoinGate::InviteOnly => Err(GroupError::Forbidden(INVITE_ONLY)),
-            JoinGate::Open => self.join_open(&group, actor).await,
-            JoinGate::Request => {
-                let message = join_message(message?)?;
-                self.request_to_join(&group, actor, message.as_deref())
-                    .await
-            }
+        let gate = access::join_gate(&group.policy());
+        if gate == JoinGate::InviteOnly {
+            return Err(GroupError::Forbidden(INVITE_ONLY));
         }
+        let message = join_message(message?)?;
+        if gate == JoinGate::Open {
+            return self.join_open(&group, actor).await;
+        }
+        self.request_to_join(&group, actor, message.as_deref())
+            .await
     }
 
     async fn join_open(&self, group: &StoredGroup, actor: &Actor) -> Result<Joined, GroupError> {
@@ -213,10 +218,18 @@ impl Groups {
         if access::join_gate(&group.policy()) == JoinGate::InviteOnly {
             return Err(GroupError::Conflict(NO_LONGER_REQUESTS));
         }
-        self.add_member(&group.id, &request.actor, roles::MEMBER, self.now())
+        let added = self
+            .add_member(&group.id, &request.actor, roles::MEMBER, self.now())
             .await?;
-        self.store.delete_request(&request.id).await?;
+        // The gate again, after the write: a switch to invite-only that
+        // landed after the check above must not admit (as a join recounts
+        // its limits after writing). The new member is taken back.
         let now = self.settled_group(&group.id).await?;
+        if added && access::join_gate(&now.policy()) == JoinGate::InviteOnly {
+            self.remove_member(&group.id, &request.actor).await?;
+            return Err(GroupError::Conflict(NO_LONGER_REQUESTS));
+        }
+        self.store.delete_request(&request.id).await?;
         self.member_of(&now, &request.actor)
             .await?
             .ok_or(GroupError::Conflict(

@@ -15,7 +15,12 @@
 //!    longer commit. If one committed first, B owns the group: the row is
 //!    made active again (the transfer's finisher removes it) and the
 //!    answer is `409`.
-//! 3. **Delete** the row.
+//! 3. **Delete** the row, guarded on it still being the `leaving` row step
+//!    1 wrote (its status and stamp), so a removal that stalled until the
+//!    sweeper removed the row never deletes a row a rejoin wrote since.
+//!
+//! With no active row at step 1, a pending one (a join still being
+//! recorded) is deleted instead.
 //!
 //! A row without a mark at step 1 cannot be the target of a transfer that
 //! still commits: any transfer that checked it had marked it first.
@@ -43,17 +48,29 @@ impl Groups {
 
     /// Steps 1 to 3.
     async fn retire_and_remove(&self, group_id: &str, actor: &Actor) -> Result<(), GroupError> {
-        let retired = self
+        let retired_at = self.now();
+        let Some(retired) = self
             .store
-            .retire_member(group_id, actor, self.now())
-            .await?;
-        if retired.is_some_and(|m| m.transfer_id.is_some())
+            .retire_member(group_id, actor, retired_at)
+            .await?
+        else {
+            return Ok(self.store.delete_pending_member(group_id, actor).await?);
+        };
+        if retired.transfer_id.is_some()
             && let Err(e) = self.fence_transfer(group_id, actor).await
         {
-            self.store.restore_member(group_id, actor).await?;
+            // The fence's error is the answer. A row left `leaving` is no
+            // membership, and the sweeper deletes it after `PENDING_TTL`.
+            if let Err(restore) = self.store.restore_member(group_id, actor, retired_at).await {
+                tracing::warn!(group = %group_id, member = %actor, error = %restore,
+                    "putting back a membership after a failed removal failed");
+            }
             return Err(e);
         }
-        Ok(self.store.remove_member(group_id, actor).await?)
+        Ok(self
+            .store
+            .delete_retired_member(group_id, actor, retired_at)
+            .await?)
     }
 
     /// Step 2: make sure no transfer of `group_id` to `actor` prepared
@@ -68,13 +85,16 @@ impl Groups {
                 return Err(GroupError::Conflict(TRANSFERRED_FIRST));
             }
             let next = claims::group_key(&group.id, group.revision.saturating_add(1));
-            if !self.store.claim(&next, self.now()).await? {
+            let claimed_at = self.now();
+            if !self.store.claim(&next, claimed_at).await? {
                 lost_claim(attempt).await;
                 continue;
             }
             if self.store.fence(&group).await?.is_some() {
                 return Ok(());
             }
+            // Wrote nothing: free the revision for the retry (claims.rs).
+            self.store.release(&next, claimed_at).await?;
         }
         Err(GroupError::Conflict("the group kept changing; retry"))
     }

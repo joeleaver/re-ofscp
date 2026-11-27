@@ -247,7 +247,8 @@ impl Groups {
             // The lease runs from the clock at claiming, not from the
             // request's `now`, which earlier attempts may have aged; the
             // one write below follows at once.
-            if !self.store.claim(&next, self.now()).await? {
+            let claimed_at = self.now();
+            if !self.store.claim(&next, claimed_at).await? {
                 lost_claim(attempt).await;
                 continue;
             }
@@ -265,6 +266,8 @@ impl Groups {
             if let Some(updated) = written? {
                 return Ok(updated.to_wire());
             }
+            // Wrote nothing: free the revision for the retry (claims.rs).
+            self.store.release(&next, claimed_at).await?;
         }
         Err(GroupError::Conflict("the group kept changing; retry"))
     }
@@ -443,7 +446,8 @@ impl Groups {
             // The lease runs from the clock at claiming, not from the
             // request's `now`, which earlier attempts may have aged; the
             // one write below follows at once.
-            if !self.store.claim(&next, self.now()).await? {
+            let claimed_at = self.now();
+            if !self.store.claim(&next, claimed_at).await? {
                 lost_claim(attempt).await;
                 continue;
             }
@@ -458,6 +462,7 @@ impl Groups {
             if let Some(updated) = written? {
                 return Ok(updated.to_wire());
             }
+            self.store.release(&next, claimed_at).await?;
         }
         Err(GroupError::Conflict("the channel kept changing; retry"))
     }

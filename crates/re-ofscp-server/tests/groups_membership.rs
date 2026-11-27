@@ -12,9 +12,11 @@ use common::accounts::{EnvOptions, NOW, env_with};
 use common::groups::{
     Env, Party, call, create_group, env_with_remotes, id, local, remote, request,
 };
-use common::harness::{new_key, send, signed_as};
+use common::harness::{SIGNED_AT, new_key, send, signed_as};
 use common::members::{group_with_policy, join_http, leave, members, roster};
 use common::{assert_valid, schema};
+use re_ofscp_server::db::Ql;
+use re_ofscp_server::groups::PENDING_TTL;
 use re_ofscp_server::signing::{Signer, StaticKeys};
 use re_ofscp_types::Authority;
 use serde_json::{Value, json};
@@ -370,4 +372,62 @@ async fn a_signed_member_sees_their_membership_on_the_group() {
     let req: Request<Body> = request(Some(&bob), "GET", &path, None);
     let res = env.app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.headers()["cache-control"], "private, no-cache");
+}
+
+#[tokio::test]
+async fn a_malformed_join_body_is_400_once_the_caller_is_let_in() {
+    let env = env_with_remotes(&[]).await;
+    let alice = local(&env, "alice").await;
+    let bob = local(&env, "bob").await;
+    let bad = Some(json!({ "message": 5 }));
+    // An open group, and the owner who is a member already: 400.
+    let open = group(&env, &alice, "group", "open").await;
+    let (s, p) = join_http(&env, &bob, &open, bad.clone()).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{p}");
+    assert!(roster(&env, &alice, &open).await.len() == 1, "not admitted");
+    let (s, p) = join_http(&env, &alice, &open, bad.clone()).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{p}");
+    // Refused anyway: 403 before the body is looked at.
+    let closed = group(&env, &alice, "public", "invite").await;
+    let (s, p) = join_http(&env, &bob, &closed, bad).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{p}");
+}
+
+/// A removal that crashed between making a row `leaving` and deleting it
+/// leaves the row behind (docs/decisions/0020, "Leaving during a
+/// transfer"): it blocks a rejoin (`409`) until the sweeper deletes it,
+/// `PENDING_TTL` after it was retired.
+#[tokio::test]
+async fn a_stuck_leaving_row_blocks_a_rejoin_until_swept() {
+    let env = env_with_remotes(&[]).await;
+    let alice = local(&env, "alice").await;
+    let bob = local(&env, "bob").await;
+    let g = group(&env, &alice, "group", "open").await;
+    let (s, _) = join_http(&env, &bob, &g, None).await;
+    assert_eq!(s, StatusCode::CREATED);
+    let retired_at = SIGNED_AT.unix_timestamp();
+    let q = Ql::new("Membership.filter(.group_id == ")
+        .str(&g)
+        .raw(" && .status == \"active\").update({ status: \"leaving\", updated_at: ")
+        .unix_seconds(retired_at)
+        .raw(" })");
+    env.state.db.execute(&q).await.unwrap();
+    assert_eq!(
+        roster(&env, &alice, &g).await.len(),
+        1,
+        "no longer a member"
+    );
+
+    let (s, p) = join_http(&env, &bob, &g, None).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{p}");
+    // Not yet past the TTL: kept.
+    let ttl = PENDING_TTL.as_secs() as i64;
+    env.state.groups.sweep(retired_at + ttl - 1).await.unwrap();
+    let (s, p) = join_http(&env, &bob, &g, None).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{p}");
+    // Past it: swept, and bob joins again.
+    env.state.groups.sweep(retired_at + ttl + 1).await.unwrap();
+    let (s, p) = join_http(&env, &bob, &g, None).await;
+    assert_eq!(s, StatusCode::CREATED, "{p}");
+    assert_eq!(roster(&env, &alice, &g).await.len(), 2);
 }

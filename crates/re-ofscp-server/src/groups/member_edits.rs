@@ -7,9 +7,10 @@
 use re_ofscp_types::Actor;
 
 use super::access::{self, Standing, actions, roles};
+use super::claims;
 use super::member_ops::{NO_MEMBER, Updated, owner_member, row_member};
 use super::model::StoredGroup;
-use super::ops::{GroupError, NOT_MANAGER};
+use super::ops::{GroupError, NOT_MANAGER, UPDATE_ATTEMPTS, lost_claim};
 use super::validate::Invalid;
 use super::{Caller, Groups};
 
@@ -229,12 +230,13 @@ impl Groups {
         })
     }
 
-    /// Set the nickname of `group`'s owner, which lives on the group, and
-    /// on the row a transfer from them may be preparing (ignored while they
-    /// own the group). A transfer whose commit this write races fails its
-    /// guard on the nickname and retries (`owner_store.rs`). If they handed
-    /// the group on before this write, it belongs on the membership row the
-    /// transfer gave them instead.
+    /// Set the nickname of `group`'s owner, which lives on the group. The
+    /// write is a revisioned edit under the next revision's claim
+    /// (claims.rs), so an ownership transfer that read the group before it
+    /// fails its compare-and-set and retries with the new nickname
+    /// (`owner_store.rs`). If the owner hands the group on before this
+    /// write lands, the nickname belongs on the membership row the transfer
+    /// gave them instead.
     async fn write_owner_display_name(
         &self,
         group: &StoredGroup,
@@ -247,30 +249,42 @@ impl Groups {
             });
         }
         let owner = &group.owner;
-        self.store
-            .set_owner_display_name(&group.id, owner, name.as_deref())
-            .await?;
-        // Re-read, finishing any transfer, so the former owner's row (if
-        // they are one now) is final.
-        let now = self.settled_group(&group.id).await?;
-        if now.owner == *owner {
-            self.store
-                .set_member_display_name(&group.id, owner, name.as_deref())
-                .await?;
-            return Ok(Updated {
-                member: owner_member(&now)?,
-                changed: true,
-            });
+        let mut read = group.clone();
+        for attempt in 1..=UPDATE_ATTEMPTS {
+            if read.owner != *owner {
+                // Handed on (and, read through `settled_group`, finished):
+                // the former owner's row is final.
+                let row = self
+                    .store
+                    .set_member_display_name(&read.id, owner, name.as_deref())
+                    .await?
+                    .ok_or(GroupError::NotFound(NO_MEMBER))?;
+                return Ok(Updated {
+                    member: row_member(&row)?,
+                    changed: true,
+                });
+            }
+            let next = claims::group_key(&read.id, read.revision.saturating_add(1));
+            let claimed_at = self.now();
+            if self.store.claim(&next, claimed_at).await? {
+                if let Some(written) = self
+                    .store
+                    .set_owner_display_name(&read, name.as_deref())
+                    .await?
+                {
+                    return Ok(Updated {
+                        member: owner_member(&written)?,
+                        changed: true,
+                    });
+                }
+                // Wrote nothing: free the revision for the retry (claims.rs).
+                self.store.release(&next, claimed_at).await?;
+            } else {
+                lost_claim(attempt).await;
+            }
+            read = self.settled_group(&read.id).await?;
         }
-        let row = self
-            .store
-            .set_member_display_name(&group.id, owner, name.as_deref())
-            .await?
-            .ok_or(GroupError::NotFound(NO_MEMBER))?;
-        Ok(Updated {
-            member: row_member(&row)?,
-            changed: true,
-        })
+        Err(GroupError::Conflict("the group kept changing; retry"))
     }
 }
 

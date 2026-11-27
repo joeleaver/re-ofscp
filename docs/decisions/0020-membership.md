@@ -57,8 +57,11 @@ transactions and no `ORDER BY`.
    a tier such as `private` that makes the group invite-only), approve
    answers `409` ("the group no longer takes join requests") and leaves
    the request pending. That check comes before the already-a-member
-   `200`. Deny works under any policy; under `open` (or `request` again)
-   approve admits as usual.
+   `200`. Approve checks the gate again after admitting, as joins recount
+   their limits after writing: if a switch to invite-only landed between
+   the first check and the write, the new member is taken back and the
+   answer is `409`, the request kept. Deny works under any policy; under
+   `open` (or `request` again) approve admits as usual.
 7. **A member has no pending request.** Becoming a member by any path
    (`add_member`: an open join, an approval, an invitation) deletes the
    actor's pending request, and a request written just as its asker
@@ -84,7 +87,11 @@ transactions and no `ORDER BY`.
 - Authorization comes before body validation (0014). The routes parse a
   body but hand its error to the operation, which answers it (`400`) only
   once the caller is authorized; a caller lacking permission gets
-  `403`/`404` whatever it sends. For a role change the checks run in this
+  `403`/`404` whatever it sends. A join validates its optional body
+  (`{message}`) once the caller is let in (an `open` or `request` group)
+  or is a member already, so a malformed body is `400` there too, though
+  only a `request` group stores the message. An invite-only group answers
+  `403` first. For a role change the checks run in this
   order:
   1. `manage`;
   2. the role exists (canonical or catalogued), else `400`;
@@ -98,7 +105,11 @@ transactions and no `ORDER BY`.
   must hold a superset of the target's set.
 - **Nicknames** are trimmed, at most 64 characters, and blank clears
   them. The owner has no row, so the owner's nickname is
-  `Group.owner_display_name`. It is not part of the group's revision.
+  `Group.owner_display_name`. Writing it is a revisioned edit of the
+  group: it claims the next revision and bumps it (compare-and-set on the
+  revision and the owner), though `updatedAt` stays, since no field of the
+  group itself changed. If the owner hands the group on before the write
+  lands, the nickname goes to the membership row the transfer gave them.
 - **Join messages** are at most 500 characters (provider policy).
 - **Limits.**
   - A group holds at most 10,000 members (`MAX_MEMBERS_PER_GROUP`).
@@ -116,7 +127,9 @@ transactions and no `ORDER BY`.
   (`403`). It cannot take itself back after committing; a group create or
   a join by the same actor racing it recounts after its own write and
   backs out instead, so only a create or join whose recount ran before
-  the commit can overshoot, by one.
+  the commit can overshoot, by one. This small window is accepted as is
+  (`groups/transfer.rs`, `check_transfer_limits`): closing it would need a
+  multi-object transaction.
 - `GET /api/groups/{g}` adds the caller's own `membership` and is sent
   `Cache-Control: private, no-cache`, since the body differs per caller.
 
@@ -160,8 +173,7 @@ transfer id (`xfr_…`; `groups/transfer.rs`):
 4. **Check B's row** is still active. This comes after the read in
    step 2, which is what lets a removal fence the transfer (below).
 5. **Commit**: one compare-and-set of the group under the next revision's
-   claim, guarded on the revision, the owner and the owner's nickname as
-   read in step 2. It sets `owner = B`, B's nickname and `joinedAt` as the
+   claim, guarded on the revision and the owner as read in step 2. It sets `owner = B`, B's nickname and `joinedAt` as the
    owner's, and `transfer_from = A`, `transfer_id`. Both A and B are
    announced (`AccessChange::Member`) even if the write errored.
 6. **Finish**: if B's row (found by key *and* transfer id) holds a
@@ -177,35 +189,52 @@ Recovery and races:
   carrying its transfer id. A later transfer away from B resets B's row
   with no mark, and a rejoin writes a fresh row with none. Finishing
   never writes A's row, so it cannot undo B demoting or kicking A.
-- **Nicknames.** The owner's nickname is not part of the revision, so the
-  commit guards on it instead. At rhypedb 7b78190 an absent field matches
-  neither `== null` nor `!= null`, while an explicit `null` matches
-  `== null`. So a group is created with an explicit `null`, and the
-  commit guards on the nickname read in step 2, or on `== null` when it
-  reads none and the field is present. A nickname A sets after step 2
-  fails the commit, and the retry carries it to A's row. A group created
-  before this change may have no field at all. Its commit cannot guard on
-  it, and the transfer writes nothing to make it present, because such a
-  write could clobber a nickname A sets at that moment. There, the
-  update of A's prepared row (next sentence) is the only thing that keeps
-  a racing nickname. A nickname write by A also updates a
-  row prepared for A. A nickname B sets on their old row after step 4 is
-  carried over by step 6. B's own write, seeing that B now owns the group,
-  finishes the transfer first and then writes the group, so no finisher
-  still running overwrites it.
+- **Nicknames.** Every write of the owner's nickname bumps the revision
+  under its claim, so the commit's guard is the revision alone. A nickname
+  A sets after step 2 fails the commit, and the retry (on the new
+  revision) carries it to A's row. A rename that finds the transfer
+  holding the next revision's claim waits for it; if the transfer then
+  commits, the rename lands on A's new row. An earlier design guarded the
+  commit on the nickname instead, without bumping the revision. A rename
+  between the read and the commit then failed the commit while the
+  revision stayed put, so the retry found its own claim still leased and
+  every group edit, transfer and fence answered `409` for `LEASE_SECS`.
+  - Groups created before `owner_display_name` was written at creation
+    have no such field. Production has such groups, so their path stays:
+    no backfill. A guard on the revision covers them like any other
+    group, so they no longer need a path of their own.
+  - A nickname B sets on their old row after step 4 is carried over by
+    step 6. B's own write, seeing that B now owns the group, finishes the
+    transfer first and then writes the group, so no finisher still running
+    overwrites it.
+- **A claim whose write wrote nothing is released** (claims.rs,
+  `GroupStore::release`), for every claimed edit: group and channel
+  PATCH, transfer commit, fence and owner nickname. A write that misses
+  without the revision moving (it lost a conflict with an unclaimed write,
+  say) would otherwise leave the retry facing its own leased claim. The
+  release deletes only the claim with that key and stamp. It is safe
+  because the compare-and-set on the revision, not the claim, refuses a
+  stale edit.
 - **Leaving during a transfer** (`groups/removal.rs`). Removing a member
   (leave or kick) first makes the row `leaving` in one guarded write,
   which answers the row as it was. A `leaving` row is no membership, can't
   be marked, and fails step 4. If that row carried a mark, the remover
   fences the group: it bumps the revision (claim plus compare-and-set,
   guarded on the owner) so that a transfer that passed step 4, having
-  read an older revision, can no longer commit. Then it deletes the row.
+  read an older revision, can no longer commit. Then it deletes the row,
+  guarded on its status still being `leaving` and its stamp the one the
+  retire wrote. A removal that stalled past `PENDING_TTL`, whose row the
+  sweeper already deleted, so never deletes a row a rejoin wrote since.
+  If the fence fails, the row is put back (guarded the same way). A
+  failure to put it back is logged, and the fence's error is the answer;
+  the sweeper deletes the `leaving` row. With no active row to retire,
+  only a pending one (a join still being recorded) is deleted.
   If the transfer committed first, B owns the group: the row is made
   active again for the finisher, and the removal answers `409`. A row
   without a mark can't be the target of a transfer that still commits,
   because any transfer that passed step 4 marked it first. The sweeper
   deletes `leaving` rows a crashed remover left (older than
-  `PENDING_TTL`).
+  `PENDING_TTL`). Until then such a row blocks a rejoin with `409`.
 - A stray owner row left by an attempt that lost or crashed is ignored
   while its actor owns the group, and the next transfer from them resets
   it.
@@ -213,10 +242,14 @@ Recovery and races:
 ### `member.updated` and the commit→hold window
 
 Decision 0010's window is closed the way decision 0017 closed it for
-messages: `Hub::member_updated` delivers through `Hub::publish_to_readers`,
-once per channel of the group (`GroupStore::channel_ids`). That reads the
-group, the channel and the subscribers' memberships afresh after the
-change's commit and delivers only to those who can read the channel now.
+messages: `Hub::member_updated` delivers through
+`Hub::publish_to_group_readers`, the group-wide form of
+`Hub::publish_to_readers` (`ws/live.rs`). After the change's commit it
+reads the group's active channels, the group and the subscribers' roles
+afresh, the group and the roles once per event rather than once per
+channel, and delivers on each channel only to those who can read it now.
+Both forms decide through the same `Audience` code, so the access rule is
+written once.
 An event published just after a revoking commit therefore never reaches
 the revoked subscriber, whether or not the group follower has applied the
 change yet. It publishes `{groupId, member}` this way and also sends it
@@ -229,7 +262,7 @@ demotions end subscriptions with `access_revoked`.
 - A stray owner row can exist. Every membership read and count ignores
   it, and `GET /api/me/groups` skips rows where the actor owns the group.
 - A leave or kick of someone a transfer has marked bumps the group's
-  revision. The revision is internal, so the only cost is a retry for a
-  group edit racing it.
+  revision, and so does a change of the owner's nickname. The revision is
+  internal, so the only cost is a retry for a group edit racing it.
 - Reading a whole list costs time proportional to the group's size. If a
   limit grows, rhypedb ordering or a materialized order will be needed.

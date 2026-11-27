@@ -236,3 +236,26 @@ async fn concurrent_edits_taking_over_one_expired_claim_never_fail() {
     assert!(!landed.is_empty(), "no edit landed");
     assert_eq!(group_revision(&env, &gid).await, landed.len() as i64);
 }
+
+/// A holder whose write wrote nothing releases its claim (claims.rs), so a
+/// retry can claim the same revision again. A release removes only the
+/// claim it made: one taken over since carries a later stamp.
+#[tokio::test]
+async fn a_released_claim_frees_its_revision_and_only_that_claim() {
+    let env = env().await;
+    let alice = local(&env, "alice").await;
+    let g = create_group(&env, &alice, group_body("G", "group")).await;
+    let gid = id(&g);
+    let store = &env.state.groups.store;
+    let now = SIGNED_AT.unix_timestamp();
+    let key = format!("group:{gid}:1");
+    assert!(store.claim(&key, now).await.unwrap());
+    assert!(!store.claim(&key, now).await.unwrap(), "held");
+    store.release(&key, now).await.unwrap();
+    assert_eq!(claims(&env, &key).await, 0);
+    assert!(store.claim(&key, now).await.unwrap(), "free again");
+    store.release(&key, now - 1).await.unwrap();
+    assert_eq!(claims(&env, &key).await, 1, "another stamp's claim kept");
+    // Releasing a claim that is gone is fine.
+    store.release(&format!("group:{gid}:9"), now).await.unwrap();
+}

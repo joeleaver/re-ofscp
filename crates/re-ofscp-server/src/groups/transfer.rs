@@ -16,9 +16,10 @@
 //!    by every read and count, so a crash here leaves nothing wrong.
 //! 4. **Checks B's row** is still active, after the read in step 2.
 //! 5. **Commits**: one compare-and-set of the group under the next
-//!    revision's claim, guarded on the revision, the owner and the owner's
-//!    nickname read in step 2 (when that field was ever written). It sets `owner = B`, B's nickname and
-//!    `joinedAt` as the owner's, and `transfer_from`/`transfer_id`.
+//!    revision's claim, guarded on the revision and the owner read in
+//!    step 2. A nickname A set since moved the revision, so it fails the
+//!    commit too. It sets `owner = B`, B's nickname and `joinedAt` as the
+//!    owner's, and `transfer_from`/`transfer_id`.
 //! 6. **Finishes** ([`Groups::finish_transfer`]): carries a nickname B set
 //!    on their old row meanwhile to the group, deletes the row carrying
 //!    this transfer's id, and clears the marker. Until then B's row is
@@ -89,12 +90,6 @@ impl Groups {
                 return Err(GroupError::Forbidden(NOT_OWNER));
             }
             self.check_transfer_limits(&group, target).await?;
-            // The commit guards on the owner's nickname, unless it was never
-            // written (a group from before it was written at creation),
-            // which no filter matches; then only the nickname write's own
-            // update of A's row (step 3) keeps it.
-            let guard_nickname = group.owner_display_name.is_some()
-                || self.store.owner_display_name_is_null(gid).await?;
             // Steps 3 and 4.
             self.prepare_former_owner(&group).await?;
             let to = self
@@ -104,7 +99,8 @@ impl Groups {
                 .ok_or(GroupError::NotFound(NO_MEMBER))?;
             // Step 5. The lease runs from the clock at claiming.
             let next = claims::group_key(gid, group.revision.saturating_add(1));
-            if !self.store.claim(&next, self.now()).await? {
+            let claimed_at = self.now();
+            if !self.store.claim(&next, claimed_at).await? {
                 lost_claim(attempt).await;
                 continue;
             }
@@ -112,7 +108,6 @@ impl Groups {
                 .store
                 .transfer_owner(
                     &group,
-                    guard_nickname,
                     &Handover {
                         to: target,
                         display_name: to.display_name.as_deref(),
@@ -128,6 +123,8 @@ impl Groups {
                 self.member_changed(gid, target);
             });
             let Some(handed) = written? else {
+                // Wrote nothing: free the revision for the retry (claims.rs).
+                self.store.release(&next, claimed_at).await?;
                 continue;
             };
             // Step 6, then answer the group as finished (the nickname may

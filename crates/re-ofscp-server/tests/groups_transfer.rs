@@ -77,10 +77,6 @@ async fn stored(env: &Env, g: &str) -> StoredGroup {
 async fn commit_by_hand(env: &Env, g: &str, from: &Party, to: &Party) -> StoredGroup {
     let store = &env.state.groups.store;
     let marked = store.mark_transfer(g, &to.id(), T).await.unwrap().unwrap();
-    store
-        .set_owner_display_name(g, &from.id(), None)
-        .await
-        .unwrap();
     assert!(
         store
             .add_member(g, &from.id(), "admin", None, now())
@@ -93,7 +89,6 @@ async fn commit_by_hand(env: &Env, g: &str, from: &Party, to: &Party) -> StoredG
     store
         .transfer_owner(
             &before,
-            true,
             &Handover {
                 to: &to.id(),
                 display_name: None,
@@ -361,10 +356,6 @@ async fn leaving_or_a_kick_during_a_transfer_fences_it() {
         join(&env, &g, p, "member").await;
     }
     let store = &env.state.groups.store;
-    store
-        .set_owner_display_name(&g, &alice.id(), None)
-        .await
-        .unwrap();
 
     // Without a transfer in flight, leaving does not touch the group.
     let before = stored(&env, &g).await;
@@ -383,7 +374,6 @@ async fn leaving_or_a_kick_during_a_transfer_fences_it() {
     let late = store
         .transfer_owner(
             &read,
-            true,
             &Handover {
                 to: &bob.id(),
                 display_name: None,
@@ -410,7 +400,6 @@ async fn leaving_or_a_kick_during_a_transfer_fences_it() {
     let late = store
         .transfer_owner(
             &read,
-            true,
             &Handover {
                 to: &carol.id(),
                 display_name: None,
@@ -469,8 +458,8 @@ async fn nicknames_set_during_a_transfer_are_kept() {
     );
 
     // Bob, owning, renames himself while his own transfer to carol has
-    // written his row and read the group: the row follows, and the
-    // transfer's commit fails its guard (it retries with the new name).
+    // written his row and read the group: the rename moves the revision,
+    // so the transfer's commit fails (it retries with the new name).
     assert!(
         store
             .add_member(&g, &bob.id(), "admin", None, now())
@@ -481,8 +470,13 @@ async fn nicknames_set_during_a_transfer_are_kept() {
     let read = stored(&env, &g).await;
     let (s, _) = nickname(&env, &bob, &g, "bob", json!({"displayNameOverride": "B"})).await;
     assert_eq!(s, StatusCode::OK);
-    let row = store.member_row(&g, &bob.id()).await.unwrap().unwrap();
-    assert_eq!(row.display_name.as_deref(), Some("B"));
+    let renamed = stored(&env, &g).await;
+    assert_eq!(renamed.owner_display_name.as_deref(), Some("B"));
+    assert_eq!(
+        renamed.revision,
+        read.revision + 1,
+        "a rename is a revision"
+    );
     store
         .mark_transfer(&g, &carol.id(), "xfr_c")
         .await
@@ -491,7 +485,6 @@ async fn nicknames_set_during_a_transfer_are_kept() {
     let late = store
         .transfer_owner(
             &read,
-            true,
             &Handover {
                 to: &carol.id(),
                 display_name: None,
@@ -545,8 +538,9 @@ async fn a_transfer_respects_both_parties_limits() {
 }
 
 /// A group created before `owner_display_name` was written at creation has
-/// no such field, which no filter matches: the commit then cannot guard on
-/// it, and the transfer still goes through and keeps the nicknames.
+/// no such field, which no filter matches. The commit guards only on the
+/// revision, which every group has, so the transfer goes through and keeps
+/// the nicknames.
 #[tokio::test]
 async fn a_group_older_than_the_nickname_field_still_hands_on() {
     #[derive(Deserialize)]
@@ -585,14 +579,6 @@ async fn a_group_older_than_the_nickname_field_still_hands_on() {
         .unix_seconds(now())
         .raw(" })");
     env.state.db.execute(&q).await.unwrap();
-    assert!(
-        !env.state
-            .groups
-            .store
-            .owner_display_name_is_null(g)
-            .await
-            .unwrap()
-    );
     join(&env, g, &bob, "member").await;
     nickname(
         &env,
