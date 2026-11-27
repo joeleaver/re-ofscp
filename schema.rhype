@@ -293,6 +293,40 @@ type JoinRequest {
     requested_at: DateTime
 }
 
+// An invite to a group (spec §5.6; docs/decisions/0019). Only the token's
+// SHA-256 is stored: the token is a bearer secret, shown once by the create.
+// Revoking deletes the row; so does expiry (the sweeper) and the group's
+// purge. `uses` counts an unlimited invite's redemptions (display only); a
+// limited one counts its `GroupInviteUse` slots instead.
+type GroupInvite {
+    invite_id: String @unique
+    token_hash: String @unique
+    group_id: String @indexed
+    // Absent: the whole group, no channel to land in.
+    channel_id: String
+    role: String
+    // Absent: unlimited.
+    max_uses: i64
+    uses: i64
+    // Absent: never expires.
+    expires_at: DateTime @indexed
+    created_by: String
+    created_at: DateTime
+}
+
+// One use of a limited group invite (docs/decisions/0019, 0012): `slot` is
+// the invite id + " " + n, for n < max_uses, so the `@unique` create decides
+// which redemption holds each slot and concurrent redemptions never use
+// more than exist. Created and deleted (given back by a redemption that did
+// not join), never updated; deleted with the invite and the group.
+type GroupInviteUse {
+    slot: String @unique
+    invite_id: String @indexed
+    group_id: String @indexed
+    actor: String
+    used_at: DateTime
+}
+
 // A claim on the next revision of a group or channel (docs/decisions/0014):
 // A guarded update is compare-and-set per object since rhypedb #59, so the
 // claim could be simplified away (decision 0012); until then a `@unique`

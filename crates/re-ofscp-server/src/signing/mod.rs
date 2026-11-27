@@ -138,7 +138,8 @@ pub async fn authenticate(
 }
 
 fn reject(e: &VerifyError, path: &str) -> Response {
-    tracing::info!(reason = %e, path, "rejected signed request");
+    let path = crate::logpath::loggable(path);
+    tracing::info!(reason = %e, path = %path, "rejected signed request");
     Problem::from(e.clone()).into_response()
 }
 

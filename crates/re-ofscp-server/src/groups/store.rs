@@ -339,10 +339,10 @@ impl GroupStore {
     }
 
     /// Remove a group being deleted: close its channels' message logs
-    /// (the messages sweeper purges them, decision 0017), then remove its channels,
-    /// memberships (pending, active or leaving) and join requests, then the group
-    /// row. Each step is idempotent, so an interrupted purge is simply run
-    /// again.
+    /// (the messages sweeper purges them, decision 0017), then remove its
+    /// channels, memberships (pending, active or leaving), join requests and
+    /// invites (with their use slots), then the group row. Each step is
+    /// idempotent, so an interrupted purge is simply run again.
     pub async fn purge_group(&self, group_id: &str) -> Result<(), DbError> {
         crate::messages::log::close_group(&self.db, group_id).await?;
         let channels = Ql::new("Channel.filter(.group_id == ")
@@ -357,6 +357,7 @@ impl GroupStore {
             .str(group_id)
             .raw(").delete()");
         self.db.execute(&requests).await?;
+        self.purge_invites(group_id).await?;
         let group = Ql::new("Group.filter(.group_id == ")
             .str(group_id)
             .raw(" && .status == ")

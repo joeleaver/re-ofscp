@@ -8,6 +8,9 @@
 //! - [`routes`]: the §5.5 HTTP endpoints and `GET /api/tiers`.
 //! - [`listing`]: a user's hosted group-list entries (§5.7 *My groups*,
 //!   served by `crate::my_groups`).
+//! - [`invite_routes`]: the §5.6 invite endpoints; [`invites`] holds their
+//!   operations, [`invite_model`] tokens and terms, `invite_store.rs` the
+//!   rows and use slots (docs/decisions/0019).
 //! - [`member_routes`]: the §5.7 membership endpoints: joining and join
 //!   requests ([`joining`]), the member list (`roster.rs`, paged by
 //!   [`paging`]), leave, kick, role and nickname changes ([`member_edits`])
@@ -23,6 +26,10 @@
 pub mod access;
 mod claims;
 mod ending;
+pub mod invite_model;
+pub mod invite_routes;
+mod invite_store;
+pub mod invites;
 pub mod joining;
 pub mod listing;
 pub mod member_edits;
@@ -235,7 +242,7 @@ impl Groups {
     /// memberships' end first, `finish_deletion` in `ending.rs`), expire the
     /// pending channels and memberships whose writers never confirmed them
     /// (older than [`PENDING_TTL`]), finish interrupted ownership transfers
-    /// (`transfer.rs`), and delete expired revision claims. A
+    /// (`transfer.rs`), and delete expired revision claims and invites. A
     /// step or a group's purge that fails is logged and left for the next
     /// pass; the rest of the pass goes on.
     pub async fn sweep(&self, now: i64) -> Result<usize, DbError> {
@@ -249,6 +256,9 @@ impl Groups {
         }
         if let Err(e) = self.store.purge_claims(now).await {
             tracing::warn!(error = %e, "purging expired revision claims failed");
+        }
+        if let Err(e) = self.purge_expired_invites(now).await {
+            tracing::warn!(error = %e, "purging expired invites failed");
         }
         let mut purged = 0;
         loop {

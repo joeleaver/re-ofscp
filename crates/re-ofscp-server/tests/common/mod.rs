@@ -5,6 +5,7 @@ pub mod accounts;
 pub mod admin;
 pub mod groups;
 pub mod harness;
+pub mod invites;
 pub mod key_setup;
 pub mod members;
 pub mod messages;
