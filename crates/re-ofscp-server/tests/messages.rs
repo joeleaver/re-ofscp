@@ -297,6 +297,24 @@ async fn reply_restricted_members_must_reply_and_references_must_name_a_message_
     let (s, p) = call(env, Some(&cast.bob), "POST", &path, Some(not_reply)).await;
     assert_problem(s, StatusCode::BAD_REQUEST, &p);
 
+    // A channel reply's `reference.provider` must be the channel's own
+    // provider; another one, a non-canonical spelling or `null` is 400
+    // (§7.2; lost-conn/ofscp#34).
+    for provider in [json!("providerb.com"), json!("ProviderA.com"), json!(null)] {
+        let mut foreign = reply("r", article["id"].as_str().unwrap());
+        foreign["reference"]["provider"] = provider;
+        let (s, p) = call(env, Some(&cast.bob), "POST", &path, Some(foreign)).await;
+        assert_problem(s, StatusCode::BAD_REQUEST, &p);
+    }
+    let mut here = reply("r-here", article["id"].as_str().unwrap());
+    here["reference"]["provider"] = json!("providera.com");
+    let r = post(env, &cast.bob, &chan, here).await;
+    assert_eq!(
+        r["reference"],
+        json!({"type": "reply", "id": article["id"]}),
+        "a provider naming this one is the same as none"
+    );
+
     // `replyOnlyTo` lists articles: a reply to a message is 403.
     let (s, p) = call(
         env,

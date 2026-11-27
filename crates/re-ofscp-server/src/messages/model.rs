@@ -106,6 +106,9 @@ impl StoredMessage {
             reference: self.parent_id.clone().map(|id| MessageReference {
                 kind: ReferenceKind::Reply,
                 id,
+                // Absent: the parent is in the same channel, on this
+                // provider (lost-conn/ofscp#34).
+                provider: None,
             }),
             tags: doc.tags.clone(),
             mentions: doc.mentions.clone(),
@@ -169,6 +172,8 @@ impl StoredReaction {
             reference: MessageReference {
                 kind: ReferenceKind::Message,
                 id: self.message_id.clone(),
+                // Absent: the message is on this provider.
+                provider: None,
             },
             created_at: self.created_at,
             metadata: Vec::new(),

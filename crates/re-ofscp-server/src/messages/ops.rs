@@ -217,6 +217,14 @@ impl Messages {
         if reference.kind != ReferenceKind::Reply {
             return Err(Invalid("reference.type must be \"reply\"".to_owned()).into());
         }
+        // A channel reply's parent is in the same channel, so a present
+        // provider must be this one (§7.2; lost-conn/ofscp#34). The
+        // authority arrives canonical: `Authority` refuses any other form.
+        if reference.provider.as_ref().is_some_and(|p| *p != self.home) {
+            return Err(
+                Invalid("reference.provider must be the channel's provider".to_owned()).into(),
+            );
+        }
         let parent = self
             .store
             .message(channel_id, reference.id.as_str())

@@ -9,9 +9,13 @@
   `ws/*.json`
 - **Security requirements:** 1 (identity is `(handle, domain)`),
   5 (effective read access on every surface), 8 (article HTML sanitized)
-- **Oracle questions:** Q1–Q7 below, sent 2026-11-27; unanswered when this
-  was written. Each default is marked, so it can be changed when an answer
-  lands in the spec.
+- **Oracle questions:** Q1–Q7 below, sent and answered 2026-11-27. The
+  oracle confirmed every default except Q5 (typing also needs a post
+  grant, with Joe deciding), and settled Q2 (the `Reaction` branch of
+  `TimelineItem` will be narrowed away) and Q3 (replay sends current
+  state). A spec PR with these clarifications is being drafted; cite it
+  here once it is open. Spec `reference.provider`: lost-conn/ofscp#34
+  (300f6fa).
 
 ## Context
 
@@ -38,9 +42,14 @@ half in `ws/message_commands.rs`, `ws/typing.rs` and `ws/live.rs`.
   compare-and-set alone orders positions; it is retried up to 32 times.
 - A message keeps its creation position. An edit or a delete is a
   `TimelineEvent` row at its own, later position, so a resume replays an
-  edit made to an old message (Q3 default).
+  edit made to an old message (Q3, confirmed).
 - Replies have their own sequence per parent message, and reactions their
   own sequence per message.
+- A reply's `reference.provider` (lost-conn/ofscp#34) must be absent or
+  this provider's canonical authority, since the parent is in the same
+  channel; anything else is `400`, and so is a non-canonical spelling or
+  `null` (ofscp-core's `Authority` refuses both). Stored references
+  serialize without `provider`, which means the same thing.
 
 ### Cursors
 
@@ -50,14 +59,14 @@ half in `ws/message_commands.rs`, `ws/typing.rs` and `ws/live.rs`.
   only on the endpoint that issued them (§7.2).
 - Live timeline events carry the `t` cursor of their position, in the
   same space as REST history, so either one works as `since` or `cursor`
-  (Q3 default).
+  (Q3, confirmed).
 - Positions are sparse. An edit's or delete's position holds no message,
   and a write that failed after taking its position leaves a gap. A page
   asks for batches of exact positions until it is full, the sequence
   ends, or it has looked at 2,000 positions; a page cut short still
   carries `nextCursor`. `limit` defaults to 50 and is clamped to 100.
 
-### Reactions are not timeline items (Q2 default)
+### Reactions are not timeline items (Q2, confirmed)
 
 `defs/messaging.json`'s `TimelineItem` allows a `Reaction`, but §7.1 names
 only `message.created/updated/deleted` as timeline events. History and
@@ -74,7 +83,7 @@ and are not replayed.
   is an article field (`title`, `summary`, `tags`, `cover`) on a message
   that is not an article.
 
-### Deletes and tombstones (Q1, Q6 defaults)
+### Deletes and tombstones (Q1, Q6, confirmed)
 
 - The author, or a member allowed the group's `moderate` action (the owner
   always), may delete. Channel permissions have no moderate key.
@@ -87,7 +96,7 @@ and are not replayed.
 - Visibility comes first (§7.1): someone who cannot read the channel gets
   `404` for every one of these, even its author.
 
-### No-op commands over the WebSocket (Q4, Q7 defaults)
+### No-op commands over the WebSocket (Q4, Q7, confirmed)
 
 A command that changes nothing fans out nothing. The requester alone gets
 the answer as it stands, correlated, without a `cursor` (it is not a
@@ -104,11 +113,14 @@ When something does change, the requesting connection gets exactly one
 copy with the `correlationId`, whether it is subscribed or not. If it is
 subscribed, that copy is its subscribed copy, not a second one.
 
-### Typing (Q5 default)
+### Typing (Q5, as answered)
 
 - `typing.start` and `typing.stop` need effective read access. A missing
-  or unreadable channel is `not_found` (§11.3). There is no answer on
-  success.
+  or unreadable channel is `not_found` (§11.3).
+- They also need some `post:<type>` grant (`message`, `memo` or
+  `article`): a reader who may post nothing gets `forbidden` (`403`). A
+  reply-restricted poster may type.
+- There is no answer on success.
 - `channel.typing` goes to every reader subscribed to the channel, the
   typer's own connections included.
 - A start holds for 6 s unless refreshed. A stop is sent only for a
@@ -178,5 +190,5 @@ use every route exactly as local ones do, by their full `handle@domain`
 - Media uploads (§5.8), replacing `NoUploads`.
 - Notifications and mentions (§10.1). Mentions are validated and stored
   but notify no one yet.
-- Apply the oracle's answers to Q1–Q7 when they land in the spec, and
-  cite the spec PRs here and in code comments.
+- Cite the oracle's clarification spec PR (Q1–Q7) here and in code
+  comments once it is open.

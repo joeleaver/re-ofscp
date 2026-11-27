@@ -191,6 +191,9 @@ async fn the_requester_gets_its_copy_unsubscribed_and_errors_correlated() {
             json!({"channelId": "chn_nope"}),
             "not_found",
         ),
+        // A reader who may post nothing may not type either (Q5).
+        ("typing.start", json!({"channelId": cid}), "forbidden"),
+        ("typing.stop", json!({"channelId": cid}), "forbidden"),
     ];
     for (kind, data, code) in cases {
         let cmd = o.command(kind, data).await;
@@ -422,7 +425,12 @@ async fn a_resume_too_far_back_is_truncated() {
 async fn typing_starts_stops_expires_and_ends_with_the_connection() {
     let env = env_with_remotes(&[]).await;
     let (olive, mia) = (local(&env, "olive").await, local(&env, "mia").await);
-    let (_, cid) = public_channel(&env, &olive, &mia).await;
+    // Members may only reply here; a reply-restricted poster may type (Q5).
+    let gid = id(&create_group(&env, &olive, group_body("G", "public")).await);
+    let channel =
+        json!({"type": "text", "tier": "public", "permissions": {"replyOnly": ["member"]}});
+    let cid = id(&create_channel(&env, &olive, &gid, channel).await);
+    join(&env, &gid, &mia, "member").await;
     let mut o = connect(&env, &olive).await;
     subscribe(&mut o, &cid, None).await;
     let typing = |state: &str| json!({"channelId": cid, "user": mia.actor, "state": state});
