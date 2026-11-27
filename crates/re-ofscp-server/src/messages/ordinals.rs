@@ -22,10 +22,11 @@
 
 use std::collections::BTreeMap;
 
-use futures_util::stream::{self, StreamExt, TryStreamExt};
+use futures_util::stream::{self, StreamExt};
 use ofscp_core::LocalId;
 use serde::Deserialize;
 
+use super::numbering::InlineBudget;
 use super::store::author_position;
 use super::{Messages, log, tally};
 use crate::db::{DbError, Ql};
@@ -90,10 +91,14 @@ pub struct MarkPoint {
 
 impl Messages {
     /// Make `channel_id`'s counts settled: number its messages if it
-    /// predates ordinals (`numbering.rs`), and settle a create left
-    /// pending. The caller holds the channel's lock, so no create of this
-    /// process is part-way.
-    pub(super) async fn settle_counts(&self, channel_id: &str) -> Result<(), CountError> {
+    /// predates ordinals, within the request's `budget` (`numbering.rs`),
+    /// and settle a create left pending. The caller holds the channel's
+    /// lock, so no create of this process is part-way.
+    pub(super) async fn settle_counts(
+        &self,
+        channel_id: &str,
+        budget: &InlineBudget,
+    ) -> Result<(), CountError> {
         let Some(counts) = log::read_counts(self.store.db(), channel_id).await? else {
             // No log, or a closed one: nothing is counted there.
             return Ok(());
@@ -101,7 +106,7 @@ impl Messages {
         if let Some(p) = &counts.pending {
             self.settle_pending(channel_id, p).await?;
         }
-        self.number_for_request(channel_id, &counts).await
+        self.number_for_request(channel_id, &counts, budget).await
     }
 
     /// Settle the create `p` pending on `channel_id`'s log: if its message
@@ -154,14 +159,16 @@ impl Messages {
     /// Where a read marker of `reader` at message `message_id` of
     /// `channel_id` stands: `None` if the channel holds no such message,
     /// or its log is not open (a channel being deleted takes no new
-    /// markers; one set while the close lands is purged with the channel). Numbers the channel first if it predates ordinals. `own`
-    /// is found by a binary search over the reader's ordinals, O(log)
-    /// point lookups.
+    /// markers; one set while the close lands is purged with the
+    /// channel). Numbers the channel first if it predates ordinals, within
+    /// the request's `budget` (`numbering.rs`). `own` is found by a binary
+    /// search over the reader's ordinals, O(log) point lookups.
     pub async fn mark_point(
         &self,
         channel_id: &str,
         message_id: &str,
         reader: &str,
+        budget: &InlineBudget,
     ) -> Result<Option<MarkPoint>, CountError> {
         let db = self.store.db();
         let Some(counts) = log::read_counts(db, channel_id).await? else {
@@ -169,7 +176,7 @@ impl Messages {
         };
         if counts.messages.is_none() {
             let _turn = self.locks.lock(channel_id).await;
-            self.settle_counts(channel_id).await?;
+            self.settle_counts(channel_id, budget).await?;
         }
         let Some(message) = self.store.message(channel_id, message_id).await? else {
             return Ok(None);
@@ -214,11 +221,15 @@ impl Messages {
     /// [`ChannelTotals::Closed`] (a closed log never opens again). A
     /// channel where the reads do not agree (a create ran meanwhile, or one
     /// is pending, or the channel predates ordinals) is settled and read
-    /// under its lock instead, within the bounds `numbering.rs` gives.
+    /// under its lock instead, numbering within the request's `budget`
+    /// (`numbering.rs`). A channel past the budget fails the whole call
+    /// with [`CountError::Numbering`]: the caller must list every scope
+    /// with an exact count (§7.7), so none is left out or guessed.
     pub async fn totals(
         &self,
         channel_ids: &[String],
         reader: &str,
+        budget: &InlineBudget,
     ) -> Result<BTreeMap<String, ChannelTotals>, CountError> {
         let db = self.store.db();
         let before = log::counts(db, channel_ids).await?;
@@ -249,28 +260,45 @@ impl Messages {
                 None => unsettled.push(id.clone()),
             }
         }
-        let settled: Vec<(String, ChannelTotals)> = stream::iter(unsettled)
+        // Every unsettled channel is tried, even after one fails, so that a
+        // request hands over every channel past its budget at once and its
+        // retry finds them all numbered, not one more each time.
+        let settled: Vec<Result<(String, ChannelTotals), CountError>> = stream::iter(unsettled)
             .map(|id| async move {
-                let totals = self.totals_locked(&id, reader).await?;
-                Ok::<_, CountError>((id, totals))
+                let totals = self.totals_locked(&id, reader, budget).await?;
+                Ok((id, totals))
             })
             .buffer_unordered(SETTLE_CONCURRENCY)
-            .try_collect()
-            .await?;
-        out.extend(settled);
-        Ok(out)
+            .collect()
+            .await;
+        let mut numbering = None;
+        for result in settled {
+            match result {
+                Ok((id, totals)) => {
+                    out.insert(id, totals);
+                }
+                Err(CountError::Db(e)) => return Err(e.into()),
+                Err(e @ CountError::Numbering(_)) => numbering = numbering.or(Some(e)),
+            }
+        }
+        match numbering {
+            Some(e) => Err(e),
+            None => Ok(out),
+        }
     }
 
-    /// [`ChannelTotals`] of `channel_id` for `reader`, settled and read
-    /// under the channel's lock, so no create of this process is part-way.
+    /// [`ChannelTotals`] of `channel_id` for `reader`, settled (within
+    /// `budget`) and read under the channel's lock, so no create of this
+    /// process is part-way.
     async fn totals_locked(
         &self,
         channel_id: &str,
         reader: &str,
+        budget: &InlineBudget,
     ) -> Result<ChannelTotals, CountError> {
         let db = self.store.db();
         let _turn = self.locks.lock(channel_id).await;
-        self.settle_counts(channel_id).await?;
+        self.settle_counts(channel_id, budget).await?;
         let counts = match log::standing(db, channel_id).await? {
             None => return Ok(ChannelTotals::NoLog),
             Some(log::Standing::Closed) => return Ok(ChannelTotals::Closed),

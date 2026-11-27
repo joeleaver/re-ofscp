@@ -11,6 +11,7 @@ use serde_json::Value;
 
 use super::fanout::{Live, Origin};
 use super::model::{MessageDoc, StoredMessage};
+use super::numbering::InlineBudget;
 use super::ordinals::CountError;
 use super::pager::{self, BadCursor, CursorKind, PageRequest};
 use super::store::{Counter, NewMessage, event_kind};
@@ -299,7 +300,8 @@ impl Messages {
         let (group_id, channel_id) = (draft.group_id, draft.channel_id);
         let _turn = self.locks.lock(channel_id).await;
         self.ensure_log(group_id, channel_id).await?;
-        self.settle_counts(channel_id).await?;
+        // A create meets one channel: the whole budget is its own.
+        self.settle_counts(channel_id, &InlineBudget::new()).await?;
         let pending = log::Pending {
             message_id: new_id("msg_")?,
             author: draft.actor.to_string(),

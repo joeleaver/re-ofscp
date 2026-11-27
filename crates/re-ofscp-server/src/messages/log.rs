@@ -226,19 +226,26 @@ pub async fn read_counts(db: &Db, channel_id: &str) -> Result<Option<Counts>, Db
     })
 }
 
-/// Up to `limit` open logs after skipping the first `offset`, with their
-/// counts: one page of a pass over every channel. rhypedb returns them in
-/// no set order, and a log closed meanwhile can shift a later one into a
-/// page already read, so the numbering pass that uses this repeats until
-/// a pass finds nothing to do (`numbering.rs`).
-pub async fn open_page(db: &Db, offset: u64, limit: u64) -> Result<Vec<(String, Counts)>, DbError> {
+/// Up to `limit` open logs whose channel id is after `after` and, when
+/// `through` is given, at most `through` (string order), with their
+/// counts. rhypedb returns them in no set order, so fewer than `limit`
+/// means these are all of them, as of one read; the numbering pass covers
+/// every channel with such reads (`numbering.rs`).
+pub async fn open_range(
+    db: &Db,
+    after: &str,
+    through: Option<&str>,
+    limit: u64,
+) -> Result<Vec<(String, Counts)>, DbError> {
     let q = Ql::new("ChannelLog.filter(.state == ")
         .str(state::OPEN)
-        .raw(").offset(")
-        .uint(offset)
-        .raw(").limit(")
-        .uint(limit)
-        .raw(")");
+        .raw(" && .channel_id > ")
+        .str(after);
+    let q = match through {
+        Some(through) => q.raw(" && .channel_id <= ").str(through),
+        None => q,
+    };
+    let q = q.raw(").limit(").uint(limit).raw(")");
     Ok(db
         .fetch::<LogRow>(&q)
         .await?

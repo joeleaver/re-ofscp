@@ -13,19 +13,30 @@
 //!
 //! **Where it runs, and its bounds.**
 //! - A background task started with the server ([`Messages::number_forever`])
-//!   numbers every channel once, then whatever a request hands it. It is
-//!   not bounded (one pass over each channel), and nothing waits on it.
-//! - A request (a create, a marker, a count) that meets a channel not yet
-//!   numbered numbers it itself only if its log has handed out at most
-//!   [`INLINE_LIMIT`] positions: at most `INLINE_LIMIT / BATCH` batched
-//!   reads and `INLINE_LIMIT` writes, [`WRITES`] at a time. A longer
-//!   channel is handed to the background task and the request answers
-//!   `503` with `Retry-After` [`RETRY_AFTER_SECS`] ([`CountError::Numbering`]):
-//!   an exact count is not known yet, and none is guessed.
-//! - Numbering takes its own per-channel lock, never the channel's write
-//!   lock, so edits, deletes and reactions in a channel being numbered go
-//!   on. Numberings of one channel take turns; creates in it are refused
-//!   until it is numbered (above), so no create runs beside one.
+//!   numbers every channel once ([`Messages::number_all`]), then whatever
+//!   a request hands it. Between the channels of that first pass it
+//!   numbers what requests handed it meanwhile, so a channel a request is
+//!   waiting on waits behind at most the one channel being numbered, never
+//!   the whole pass. It is not bounded (one pass over each channel), and
+//!   nothing waits on it.
+//! - A request (a create, a marker update, a count) that meets channels
+//!   not yet numbered numbers them itself only within its
+//!   [`InlineBudget`]: [`INLINE_LIMIT`] positions over every channel it
+//!   meets, so at most `INLINE_LIMIT / BATCH` batched reads (plus one per
+//!   channel) and `INLINE_LIMIT` writes, [`WRITES`] at a time. A channel
+//!   past what is left of the budget is handed to the background task and
+//!   the request answers `503` with `Retry-After` [`RETRY_AFTER_SECS`]
+//!   ([`CountError::Numbering`]): an exact count is not known yet, and
+//!   none is guessed.
+//! - Every numbering of a channel takes the channel's numbering lock, so
+//!   numberings of one channel take turns. The background task takes only
+//!   that lock, never the channel's write lock, so edits, deletes and
+//!   reactions in a long channel go on while it is numbered. A request
+//!   numbers under the channel's write lock as well (it first settles a
+//!   pending create, which needs that lock), so edits, deletes and
+//!   reactions there wait for it, within the budget above. Creates in a
+//!   channel are refused until it is numbered (a create's compare-and-set
+//!   requires `counted == 1`), so no create runs beside a numbering.
 //! - An edit or a delete moves `last_seq` without adding a message, which
 //!   fails the final compare-and-set. That costs only a read of the
 //!   positions taken since, never a restart ([`Numbering`]), so the
@@ -33,6 +44,7 @@
 //!   faster than one batch of point lookups.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures_util::stream::{self, StreamExt, TryStreamExt};
@@ -45,8 +57,8 @@ use super::{Messages, log, tally};
 use crate::db::lookup::lookup;
 use crate::db::{Db, DbError, Ql};
 
-/// The most positions a request numbers itself; longer channels are left
-/// to the background task.
+/// The most positions one request numbers itself, over every channel it
+/// meets ([`InlineBudget`]); the rest are left to the background task.
 pub const INLINE_LIMIT: i64 = 1_000;
 /// `Retry-After` while a channel is being numbered in the background.
 pub const RETRY_AFTER_SECS: u64 = 5;
@@ -57,7 +69,8 @@ const WRITES: usize = 16;
 /// How often a numbering re-reads the positions taken since its last read
 /// before giving up (`503`); each attempt reads only those positions.
 const ATTEMPTS: usize = 32;
-/// Open logs read per page of a pass over every channel.
+/// The most open logs a pass over every channel numbers from one read
+/// ([`Messages::number_all`]).
 const PASS_PAGE: u64 = 100;
 
 #[derive(Deserialize)]
@@ -182,6 +195,39 @@ async fn set_ordinals(
     db.write_one_object(&q).await.map(|_| ())
 }
 
+/// What one request may still number itself, in positions: [`INLINE_LIMIT`]
+/// over every channel it meets (module docs). The channels a request
+/// settles at once share it.
+#[derive(Debug)]
+pub struct InlineBudget {
+    left: AtomicI64,
+}
+
+impl InlineBudget {
+    /// A request's whole budget.
+    pub fn new() -> Self {
+        Self {
+            left: AtomicI64::new(INLINE_LIMIT),
+        }
+    }
+
+    /// Take `positions` from the budget if that many are left. Returns
+    /// whether it took them.
+    fn take(&self, positions: i64) -> bool {
+        self.left
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                (positions <= left).then_some(left - positions)
+            })
+            .is_ok()
+    }
+}
+
+impl Default for InlineBudget {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Channels handed to the background task, each once until it takes them.
 #[derive(Debug, Default)]
 pub(super) struct Queue {
@@ -210,18 +256,20 @@ impl Queue {
 
 impl Messages {
     /// Number `channel_id` for a request, if its log predates ordinals:
-    /// itself when the channel is short, otherwise by handing it to the
-    /// background task and answering [`CountError::Numbering`] (see the
-    /// module docs for the bounds).
+    /// itself when its positions fit what is left of the request's
+    /// `budget`, otherwise by handing it to the background task and
+    /// answering [`CountError::Numbering`] (see the module docs for the
+    /// bounds).
     pub(super) async fn number_for_request(
         &self,
         channel_id: &str,
         counts: &log::Counts,
+        budget: &InlineBudget,
     ) -> Result<(), CountError> {
         if counts.messages.is_some() {
             return Ok(());
         }
-        if counts.last_seq > INLINE_LIMIT {
+        if !budget.take(counts.last_seq) {
             self.numbering_queue.push(channel_id);
             return Err(CountError::Numbering(channel_id.to_owned()));
         }
@@ -257,38 +305,67 @@ impl Messages {
         )))
     }
 
-    /// Number every channel whose log predates ordinals. Repeats its pass
-    /// until one numbers nothing, since a log closed during a pass can
-    /// shift another past it ([`log::open_page`]). A channel that fails is
-    /// logged and left for a later request to hand over again. Returns how
-    /// many channels it numbered.
+    /// Number every channel whose log predates ordinals, in one pass over
+    /// the open logs, numbering what requests hand over between channels.
+    /// A channel that fails is logged and left for a later request to hand
+    /// over again. Returns how many channels the pass numbered.
+    ///
+    /// rhypedb returns rows in no set order and has no ordered paging, so
+    /// the pass reads key ranges rather than offsets ([`log::open_range`]):
+    /// a read of the open logs with `after < channel_id <= through` that
+    /// returns at most [`PASS_PAGE`] of them returned all of them, and the
+    /// pass numbers those and goes on to the range after `through`. A read
+    /// that comes back full narrows `through` to the middle of what it
+    /// returned (strictly fewer logs in range) and reads again, keeping the
+    /// bound it narrowed to come back to. The ranges cover every channel id
+    /// once, each read whole, so a log missed is one closed or opened since
+    /// its range was read: a closed one needs no numbering, and every log
+    /// opened since ordinals is counted from the start. Nothing open from
+    /// before ordinals is skipped, however logs close meanwhile.
     pub async fn number_all(&self) -> Result<usize, DbError> {
         let db = self.store.db();
-        let mut total = 0;
+        let mut numbered = 0;
+        let mut after = String::new();
+        let mut through: Option<String> = None;
+        // Upper bounds narrowed away, the innermost last; `None` is no bound.
+        let mut bounds: Vec<Option<String>> = Vec::new();
         loop {
-            let mut numbered = 0;
-            let mut offset = 0;
-            loop {
-                let page = log::open_page(db, offset, PASS_PAGE).await?;
-                for (channel_id, counts) in &page {
-                    if counts.messages.is_some() {
-                        continue;
-                    }
-                    match self.number(channel_id).await {
-                        Ok(()) => numbered += 1,
-                        Err(e) => {
-                            tracing::warn!(error = %e, channel = %channel_id, "numbering a channel failed");
-                        }
-                    }
-                }
-                if (page.len() as u64) < PASS_PAGE {
-                    break;
-                }
-                offset += PASS_PAGE;
+            let page = log::open_range(db, &after, through.as_deref(), PASS_PAGE + 1).await?;
+            if page.len() as u64 > PASS_PAGE {
+                let mut ids: Vec<&str> = page.iter().map(|(c, _)| c.as_str()).collect();
+                ids.sort_unstable();
+                // At least half of what was read lies above the new bound.
+                let middle = ids[ids.len() / 2 - 1].to_owned();
+                bounds.push(through.replace(middle));
+                continue;
             }
-            total += numbered;
-            if numbered == 0 {
-                return Ok(total);
+            for (channel_id, counts) in &page {
+                if counts.messages.is_some() {
+                    continue;
+                }
+                self.drain_queue().await;
+                match self.number(channel_id).await {
+                    Ok(()) => numbered += 1,
+                    Err(e) => {
+                        tracing::warn!(error = %e, channel = %channel_id, "numbering a channel failed");
+                    }
+                }
+            }
+            match through {
+                None => return Ok(numbered),
+                Some(read) => {
+                    after = read;
+                    through = bounds.pop().flatten();
+                }
+            }
+        }
+    }
+
+    /// Number every channel handed over so far.
+    async fn drain_queue(&self) {
+        for channel_id in self.numbering_queue.take() {
+            if let Err(e) = self.number(&channel_id).await {
+                tracing::warn!(error = %e, channel = %channel_id, "numbering a channel failed");
             }
         }
     }
@@ -302,12 +379,9 @@ impl Messages {
             Err(e) => tracing::warn!(error = %e, "numbering channels from before ordinals failed"),
         }
         loop {
+            // A hand-over after the pass's last drain left a wake-up behind.
+            self.drain_queue().await;
             self.numbering_queue.wake.notified().await;
-            for channel_id in self.numbering_queue.take() {
-                if let Err(e) = self.number(&channel_id).await {
-                    tracing::warn!(error = %e, channel = %channel_id, "numbering a channel failed");
-                }
-            }
         }
     }
 }

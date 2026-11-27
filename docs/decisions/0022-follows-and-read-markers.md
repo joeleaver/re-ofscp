@@ -183,23 +183,52 @@ their devices.
   only on the messages stored, so a numbering cut short is redone by the
   next one, writing the same values.
   - *Where it runs.* A background task started with the server (beside
-    the messages sweeper) numbers every channel: it pages through the open
-    logs, repeating its pass until one numbers nothing (rhypedb pages have
-    no order, so a log closed during a pass can shift another past it),
-    then numbers whatever requests hand it. A request (a create, a marker,
-    a count) that meets a channel not yet numbered numbers it itself only
-    when its log has handed out at most 1,000 positions; a longer one is
-    handed to the background task and the request answers `503` with
-    `Retry-After: 5` until it is done. No count is guessed meanwhile, and
-    no scope is dropped from `GET` to avoid waiting.
-  - *Bounds.* A request does at most 10 batched reads and 1,000 writes
-    numbering a channel, or none. The background task is unbounded (one
-    pass over each channel, once) but nothing waits on it: numbering takes
-    its own per-channel lock, never the channel's write lock, so edits,
-    deletes and reactions go on meanwhile; only creates there wait (with
-    `503`), since a create needs the channel numbered. Numberings of one
-    channel take turns under that lock, and creates are refused until it
-    is numbered, so no create runs beside a numbering.
+    the messages sweeper) numbers every channel in one pass over the open
+    logs, then numbers whatever requests hand it. Between the channels of
+    that pass it numbers what requests handed over meanwhile, so a request
+    waiting on a channel waits behind one channel's numbering, not the
+    whole pass. A request (a create, a marker update, a count) that meets
+    channels not yet numbered numbers them itself only within a budget of
+    1,000 positions over every channel it meets; a channel past what is
+    left of it is handed to the background task and the request answers
+    `503` with `Retry-After: 5` until it is done.
+  - *The pass reads key ranges, not offsets.* rhypedb rows come back in
+    no set order and it has no ordered paging, so offset pages could skip
+    a log whenever another closed mid-pass. The pass instead reads the
+    open logs with `after < channel_id <= through` (string order), at most
+    101 at a time. A read returning at most 100 returned all of that
+    range; the pass numbers those and moves to the next range. A full read
+    narrows `through` to the middle of the ids it returned and reads again,
+    keeping the wider bound to return to. The ranges cover every id once,
+    each read whole, so a log missed was closed (nothing to number) or
+    opened since ordinals (counted from the start): nothing from before is
+    skipped, and one pass suffices.
+  - *No count is guessed, and no scope is dropped.* `GET` must list every
+    readable channel with an exact `unreadCount` (§7.7), so leaving out a
+    channel still being numbered would read as one the user cannot read;
+    the whole answer is `503` instead, a wait of about one channel's
+    numbering (above). `PATCH` finds every marker's point first, numbering
+    within its budget, and moves no marker until all are found: a batch
+    naming a channel still being numbered answers `503` with nothing
+    stored, and its retry moves, reports and announces every scope
+    together. (Moving the others and skipping that scope would drop a
+    marker the user set, with no way in §7.7 to tell them; moving the
+    others and then answering `503`, as first built, stored markers that
+    no device heard of, since the retry finds them not moved.) A database
+    failure while storing can still follow some moves; those are announced
+    (`read.updated`) before the error is returned.
+  - *Bounds.* A request does at most 10 batched reads (plus one per
+    channel) and 1,000 writes numbering, over all its channels together,
+    or none. It numbers under the channel's write lock (it settles a
+    pending create there first, which needs that lock), so edits, deletes
+    and reactions in that channel wait for it, within that budget. The
+    background task is unbounded (one pass over each channel, once) but
+    nothing waits on it: it takes only the channel's numbering lock, never
+    its write lock, so edits, deletes and reactions in a long channel go
+    on meanwhile; only creates there wait (with `503`), since a create
+    needs the channel numbered. Every numbering of one channel takes turns
+    under the numbering lock, and creates are refused until it is
+    numbered, so no create runs beside a numbering.
   - *The final compare-and-set* marks the log counted only if no position
     was taken after the last one the numbering read (`last_seq`
     unchanged): such a position could hold a create's message, which the

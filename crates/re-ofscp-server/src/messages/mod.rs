@@ -84,8 +84,8 @@ pub struct Messages {
     clock: Arc<dyn Clock>,
     home: Authority,
     locks: ChannelLocks,
-    /// Numbering channels from before ordinals takes turns per channel
-    /// under these, apart from the write locks (`numbering.rs`).
+    /// Every numbering of a channel from before ordinals takes turns under
+    /// these; the background one takes no write lock (`numbering.rs`).
     numbering: ChannelLocks,
     /// Channels handed to the background numbering task.
     numbering_queue: numbering::Queue,
