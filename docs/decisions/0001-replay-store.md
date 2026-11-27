@@ -132,13 +132,14 @@ The spec says a provider SHOULD persist the store, and we do
   be read (waits of 100 ms doubling to 2 s). Serving waits for it, and for
   the federation policy load beside it, for up to 30 s in all, then starts
   in warm-up while the retries go on, and the warm-up ends as soon as a
-  load succeeds. The ledger purge (`AppState::maintain_replay`) starts only
+  load succeeds. Ending it late is safe: until then every signed request
+  the warm-up let through was recorded in memory, and `restore` keeps
+  those entries. The ledger purge (`AppState::maintain_replay`) starts only
   after the restore: the load reads pages by offset, and rows deleted
   meanwhile would shift the pages and skip a live nonce. (The `@unique`
-  key would still refuse its replay, but the memory store should hold it.) Ending it late is safe: until then every
-  signed request the warm-up let through was recorded in memory, and
-  `restore` keeps those entries. A ledger that persists nothing
-  (`NotPersistent`) is not retried, and its warm-up runs its course.
+  key would still refuse its replay, but the memory store should hold it.)
+  A ledger that persists nothing (`NotPersistent`) is not retried, and its
+  warm-up runs its course.
   - **Why (revised 2026-11-27):** the first version tried once. On jkbase
     the managed rhypedb starts beside the app and listens about a second
     after it, so that one attempt was always refused (`Connection refused`

@@ -42,6 +42,19 @@ async fn main() -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + STARTUP_WAIT;
     let (restored_tx, restored_rx) = tokio::sync::oneshot::channel();
     let replay = tokio::spawn(state.clone().maintain_replay(restored_tx));
+    let stop_replay = replay.abort_handle();
+    // A panic after startup stopped waiting would otherwise go unlogged.
+    tokio::spawn(async move {
+        if let Err(e) = replay.await
+            && e.is_panic()
+        {
+            tracing::error!(
+                error = %e,
+                "replay maintenance panicked: the ledger purge has stopped, and an \
+                 unfinished restore leaves the warm-up to run its course"
+            );
+        }
+    });
     let wait_replay = async {
         match tokio::time::timeout_at(deadline, restored_rx).await {
             // The outcome is logged by the restore itself.
@@ -106,7 +119,7 @@ async fn main() -> anyhow::Result<()> {
     })
     .await?;
     ws_recheck.abort();
-    replay.abort();
+    stop_replay.abort();
     if let Some(task) = load_policy {
         task.abort();
     }
