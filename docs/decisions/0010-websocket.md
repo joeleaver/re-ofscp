@@ -135,7 +135,7 @@ reasons, RFC 6455 codes otherwise. It is going into the spec as a SHOULD.
     are deduplicated first. A `subscribe` naming more distinct channels
     than the whole cap could not fit even if all were readable, so it is
     answered `subscription_limit` at once, without checking any access:
-    the MAY clause of lost-conn/ofscp#29 (in review). A list within the
+    the MAY clause of lost-conn/ofscp#29 (merged as 4155584). A list within the
     cap is always checked, even if longer than the room left, and the
     readable-only count above decides. A long, well-formed list is never
     `bad_request`.

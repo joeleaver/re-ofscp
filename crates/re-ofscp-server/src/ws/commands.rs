@@ -123,7 +123,7 @@ impl Session {
         // checking any access. A list within the cap goes through the
         // readable-only count below, even if it is longer than the room
         // left (§7.1 *Subscriptions*; the early answer is the MAY clause of
-        // lost-conn/ofscp#29, in review; docs/decisions/0010-websocket.md).
+        // lost-conn/ofscp#29, merged as 4155584; docs/decisions/0010-websocket.md).
         let holds = match hub.registry.hold_new(self.id, &topics, include.clone()) {
             Some(Ok(holds)) => holds,
             Some(Err(OverCap)) => return self.over_cap(&cmd.id),

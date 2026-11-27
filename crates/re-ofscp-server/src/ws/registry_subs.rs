@@ -19,7 +19,7 @@ impl Registry {
     /// The subscription cap counts only readable channels (§7.1), so
     /// [`Registry::grant`] applies it after the checks, all or none. Only
     /// when `topics` names more channels than the whole cap is the answer
-    /// known before any check (lost-conn/ofscp#29, in review): nothing is
+    /// known before any check (lost-conn/ofscp#29, merged as 4155584): nothing is
     /// held and [`OverCap`] is returned. A list no longer than the cap is
     /// held and checked even if it is longer than the room left, since its
     /// readable channels may fit. This also bounds what one `subscribe`
