@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Actor, LocalId};
+use crate::{Actor, Authority, LocalId};
 
 use super::{Attachment, Content, MetadataObject, Paged, Patch, Timestamp, open_enum, some};
 
@@ -37,8 +37,21 @@ pub struct MessageReference {
     /// What kind of pointer.
     #[serde(rename = "type")]
     pub kind: ReferenceKind,
-    /// The message's local id.
+    /// The message's local id, issued by the provider that holds it (§2.2).
     pub id: LocalId,
+    /// The provider holding the message, as a canonical authority (§2.2,
+    /// §5.3; lost-conn/ofscp#34). The message is identified by
+    /// `(provider, id)`. Absent, or equal to the authority of the provider
+    /// holding the message that carries this reference, means that same
+    /// provider: the two must be treated exactly alike. Only a DM reply can
+    /// name another provider (§7.4); a present value must hold an
+    /// authority, so `null` is refused.
+    #[serde(
+        default,
+        deserialize_with = "some",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub provider: Option<Authority>,
 }
 
 /// What the reader may do with a message.
