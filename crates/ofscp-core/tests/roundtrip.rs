@@ -206,6 +206,30 @@ fn an_http_reaction_image_is_refused_by_the_schema() {
     assert!(!schema_errors("reaction-put-request.json", &instance).is_empty());
 }
 
+/// Valid shapes the spec has no sample for: an empty channel list, and
+/// reaction bodies with only an image or with both fields (§7.1: each is
+/// optional and independent). Each passes the schema and round-trips.
+#[test]
+fn unsampled_valid_shapes_validate_and_round_trip() {
+    let list = json!({ "items": [] });
+    assert!(schema_errors("channel-list.json", &list).is_empty());
+    let decoded: ChannelsResponse = serde_json::from_value(list.clone()).unwrap();
+    assert!(decoded.items.is_empty());
+    assert_eq!(serde_json::to_value(&decoded).unwrap(), list);
+
+    for body in [
+        json!({ "image": "https://cdn.example/party.png" }),
+        json!({ "unicode": "🎉", "image": "https://cdn.example/party.png" }),
+    ] {
+        assert!(
+            schema_errors("reaction-put-request.json", &body).is_empty(),
+            "{body} fails the schema"
+        );
+        let decoded: ReactionPut = serde_json::from_value(body.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), body);
+    }
+}
+
 /// What the schema refuses for a field's type, the type refuses too.
 #[test]
 fn reaction_body_refuses_mistyped_fields() {
