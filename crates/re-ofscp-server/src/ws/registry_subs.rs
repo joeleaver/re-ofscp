@@ -6,6 +6,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use re_ofscp_types::Actor;
+
 use super::{AccessChange, ConnId, ConnShared, Ended, Held, Hold, OverCap, Registry, Sub, unindex};
 use crate::ws::protocol::{Close, close};
 
@@ -246,29 +248,68 @@ impl Registry {
     /// Fan out an event of type `kind` on `topic` to its subscribers whose
     /// `include` admits it.
     pub fn publish(&self, topic: &str, kind: &str, text: &Arc<str>) {
+        self.publish_to(topic, kind, text, |_| true, None);
+    }
+
+    /// The authenticated subscribers of `topic`, with their actors.
+    pub fn subscribers(&self, topic: &str) -> Vec<(ConnId, Actor)> {
+        let s = self.lock();
+        let Some(ids) = s.by_topic.get(topic) else {
+            return Vec::new();
+        };
+        ids.iter()
+            .filter_map(|id| Some((*id, s.conns.get(id)?.actor.clone()?)))
+            .collect()
+    }
+
+    /// [`Registry::publish`] to those subscribers `admit` lets through, and
+    /// `origin`'s own copy to its connection in place of the plain one,
+    /// whether or not it is subscribed or admitted (the command that caused
+    /// the event was already checked). Copies of a held subscription wait
+    /// with its other events, so each connection sees the topic in order.
+    pub fn publish_to(
+        &self,
+        topic: &str,
+        kind: &str,
+        text: &Arc<str>,
+        admit: impl Fn(ConnId) -> bool,
+        origin: Option<(ConnId, &Arc<str>)>,
+    ) {
         let mut s = self.lock();
         let s = &mut *s;
-        let Some(ids) = s.by_topic.get(topic) else {
-            return;
-        };
-        for id in ids {
-            let Some(conn) = s.conns.get_mut(id) else {
-                continue;
-            };
-            let Some(sub) = conn.subs.get_mut(topic) else {
-                continue;
-            };
-            if sub.include.as_ref().is_some_and(|inc| !inc.contains(kind)) {
-                continue;
+        let mut origin_sent = false;
+        if let Some(ids) = s.by_topic.get(topic) {
+            for id in ids {
+                let own = origin.filter(|(o, _)| o == id).map(|(_, t)| t);
+                if own.is_none() && !admit(*id) {
+                    continue;
+                }
+                let Some(conn) = s.conns.get_mut(id) else {
+                    continue;
+                };
+                let Some(sub) = conn.subs.get_mut(topic) else {
+                    continue;
+                };
+                if own.is_none() && sub.include.as_ref().is_some_and(|inc| !inc.contains(kind)) {
+                    continue;
+                }
+                origin_sent |= own.is_some();
+                let text = own.unwrap_or(text);
+                if sub.holds == 0 {
+                    conn.shared.deliver(text.clone());
+                } else if sub.held.len() < self.limits.held_max {
+                    sub.held.push(text.clone());
+                } else {
+                    conn.shared
+                        .close(Close::abandon(close::TRY_AGAIN, "too many events held"));
+                }
             }
-            if sub.holds == 0 {
-                conn.shared.deliver(text.clone());
-            } else if sub.held.len() < self.limits.held_max {
-                sub.held.push(text.clone());
-            } else {
-                conn.shared
-                    .close(Close::abandon(close::TRY_AGAIN, "too many events held"));
-            }
+        }
+        if let Some((id, own)) = origin
+            && !origin_sent
+            && let Some(conn) = s.conns.get(&id)
+        {
+            conn.shared.deliver(own.clone());
         }
     }
 }

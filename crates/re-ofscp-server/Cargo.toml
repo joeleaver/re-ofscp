@@ -47,6 +47,7 @@ reqwest = { workspace = true }
 rustls = { workspace = true }
 webpki-roots = { workspace = true }
 url = { workspace = true }
+ammonia = { workspace = true }
 
 [dev-dependencies]
 rhypedb-schema = { workspace = true }

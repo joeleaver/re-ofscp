@@ -40,6 +40,17 @@ pub mod actions {
     pub const MANAGE: &str = "manage";
     /// Channel action: read the channel (§5.2.1).
     pub const VIEW: &str = "view";
+    /// Channel action: add reactions (§5.2.1).
+    pub const REACT: &str = "react";
+    /// Channel restriction: listed roles may post replies only (§5.2.1).
+    pub const REPLY_ONLY: &str = "replyOnly";
+    /// Channel restriction: the message types a reply-restricted actor may
+    /// reply to (§5.2.1). Its list holds message types, not roles.
+    pub const REPLY_ONLY_TO: &str = "replyOnlyTo";
+    /// The channel grant action for posting a message of `kind` (§5.2.1).
+    pub fn post_kind(kind: &str) -> String {
+        format!("post:{kind}")
+    }
 }
 
 /// The defaults the provider MUST use for a missing canonical action (§5.2).
@@ -188,6 +199,88 @@ pub fn can_read_channel(standing: &Standing, group: &GroupPolicy, channel: &Chan
         // overrides the channel tier (§5.2.1); outsiders hold no role.
         Some(view) => granted(standing, group, Some(view)),
         None => true,
+    }
+}
+
+/// The channel's own entry for `action`, if its permission map has one.
+fn channel_entry<'a>(channel: &'a ChannelPolicy, action: &str) -> Option<&'a Vec<String>> {
+    channel.permissions.as_ref().and_then(|p| p.get(action))
+}
+
+/// Whether the caller may post a message of type `kind` (`message`, `memo`
+/// or `article`) in the channel (§5.2.1): the channel's `post:<kind>` when
+/// it lists one, otherwise the group's `post`. It answers only the grant;
+/// read access is checked first, and an unreadable channel is `404`, never
+/// `403` (§5.2.1).
+pub fn may_post(
+    standing: &Standing,
+    group: &GroupPolicy,
+    channel: &ChannelPolicy,
+    kind: &str,
+) -> bool {
+    match channel_entry(channel, &actions::post_kind(kind)) {
+        Some(listed) => granted(standing, group, Some(listed)),
+        None => may(standing, group, actions::POST),
+    }
+}
+
+/// Whether the caller holds a `post:<type>` grant for *some* type in the
+/// channel, custom types included (§7.1 typing; lost-conn/ofscp#37). Types
+/// are open-ended and an unlisted one falls back to the group's `post`
+/// ([`may_post`]), so this is the group's `post` or any `post:<type>`
+/// entry of the channel that grants. Read access is checked first.
+pub fn may_post_any(standing: &Standing, group: &GroupPolicy, channel: &ChannelPolicy) -> bool {
+    let prefix = actions::post_kind("");
+    may(standing, group, actions::POST)
+        || channel
+            .permissions
+            .iter()
+            .flatten()
+            .any(|(action, listed)| {
+                action.starts_with(&prefix) && granted(standing, group, Some(listed))
+            })
+}
+
+/// Whether the caller may add reactions in the channel (§5.2.1): the
+/// channel's `react` when listed, otherwise anyone who may read the
+/// channel (the caller has already passed [`can_read_channel`]).
+pub fn may_react(standing: &Standing, group: &GroupPolicy, channel: &ChannelPolicy) -> bool {
+    match channel_entry(channel, actions::REACT) {
+        Some(listed) => granted(standing, group, Some(listed)),
+        None => true,
+    }
+}
+
+/// What a reply-restricted caller may post (§5.2.1 `replyOnly`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplyRule {
+    /// Not restricted: top-level posts and replies alike.
+    Free,
+    /// Replies only; when `to` is set, only to parents of those types.
+    RepliesOnly {
+        /// `replyOnlyTo`, when the channel lists it.
+        to: Option<Vec<String>>,
+    },
+}
+
+/// Whether the caller is reply-restricted in the channel: a member whose
+/// role (known to the group) is listed in `replyOnly`. The owner never is,
+/// and an outsider holds no role (§5.2.1).
+pub fn reply_rule(standing: &Standing, group: &GroupPolicy, channel: &ChannelPolicy) -> ReplyRule {
+    let restricted = match standing {
+        Standing::Member(role) => {
+            group.knows_role(role)
+                && channel_entry(channel, actions::REPLY_ONLY)
+                    .is_some_and(|roles| roles.iter().any(|r| r == role))
+        }
+        Standing::Owner | Standing::Outsider => false,
+    };
+    if restricted {
+        ReplyRule::RepliesOnly {
+            to: channel_entry(channel, actions::REPLY_ONLY_TO).cloned(),
+        }
+    } else {
+        ReplyRule::Free
     }
 }
 

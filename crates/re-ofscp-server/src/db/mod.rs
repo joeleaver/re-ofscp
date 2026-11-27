@@ -15,6 +15,8 @@
 //! sent once more, for writes too. Every round trip runs in its own task, so
 //! a cancelled caller cannot poison a connection.
 
+pub mod doc;
+pub mod lookup;
 pub mod ql;
 
 use std::sync::Arc;

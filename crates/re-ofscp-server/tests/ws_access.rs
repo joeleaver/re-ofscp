@@ -103,6 +103,7 @@ async fn setup_with(config: WsConfig, log: Log) -> (Provider, Arc<Topics>) {
     let seams = Seams {
         topics: topics.clone(),
         timeline: Arc::new(log),
+        messages: None,
     };
     (Provider::with_alice(config, seams).await, topics)
 }

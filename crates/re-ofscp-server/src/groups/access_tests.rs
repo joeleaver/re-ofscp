@@ -184,3 +184,94 @@ fn a_membership_claiming_the_owner_role_holds_nothing() {
     assert!(!can_read_channel(&impostor, &g, &only_owner));
     assert!(can_read_channel(&Standing::Owner, &g, &only_owner));
 }
+
+fn perms(entries: &[(&str, &[&str])]) -> ChannelPolicy {
+    ChannelPolicy {
+        tier: Tier::Public,
+        permissions: Some(
+            entries
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), v.iter().map(|r| (*r).to_owned()).collect()))
+                .collect(),
+        ),
+    }
+}
+
+#[test]
+fn posting_uses_the_channel_entry_for_the_type_else_the_group_post() {
+    let g = group(Tier::Public);
+    let plain = channel(Tier::Public, None);
+    // Group defaults: post = admin, member.
+    assert!(may_post(&member("member"), &g, &plain, "memo"));
+    assert!(!may_post(&member("guest"), &g, &plain, "message"));
+    assert!(!may_post(&Standing::Outsider, &g, &plain, "message"));
+    assert!(may_post(&Standing::Owner, &g, &plain, "article"));
+
+    let c = perms(&[("post:article", &["admin"]), ("post:message", &["guest"])]);
+    assert!(!may_post(&member("member"), &g, &c, "article"));
+    assert!(may_post(&member("admin"), &g, &c, "article"));
+    // Exact membership: listing guest does not grant member.
+    assert!(may_post(&member("guest"), &g, &c, "message"));
+    assert!(!may_post(&member("member"), &g, &c, "message"));
+    // memo is not listed: the group's post applies.
+    assert!(may_post(&member("member"), &g, &c, "memo"));
+    assert!(may_post(&Standing::Owner, &g, &c, "article"));
+}
+
+#[test]
+fn any_post_grant_counts_custom_types_and_the_group_post() {
+    let g = group(Tier::Public);
+    let plain = channel(Tier::Public, None);
+    // The group's post (admin, member by default) covers every unlisted type.
+    assert!(may_post_any(&member("member"), &g, &plain));
+    assert!(!may_post_any(&member("guest"), &g, &plain));
+    assert!(!may_post_any(&Standing::Outsider, &g, &plain));
+    assert!(may_post_any(&Standing::Owner, &g, &plain));
+    // A channel entry for a custom type grants too, exactly.
+    let c = perms(&[("post:poll", &["guest"]), ("react", &["guest"])]);
+    assert!(may_post_any(&member("guest"), &g, &c));
+    // A non-post entry is no post grant.
+    let r = perms(&[("react", &["guest"])]);
+    assert!(!may_post_any(&member("guest"), &g, &r));
+}
+
+#[test]
+fn reacting_defaults_to_every_reader_and_otherwise_is_exact() {
+    let g = group(Tier::Public);
+    assert!(may_react(
+        &Standing::Outsider,
+        &g,
+        &channel(Tier::Public, None)
+    ));
+    let c = perms(&[("react", &["member"])]);
+    assert!(may_react(&member("member"), &g, &c));
+    assert!(!may_react(&member("admin"), &g, &c));
+    assert!(!may_react(&Standing::Outsider, &g, &c));
+    assert!(may_react(&Standing::Owner, &g, &c));
+}
+
+#[test]
+fn reply_only_restricts_listed_roles_but_never_the_owner() {
+    let g = group(Tier::Public);
+    let c = perms(&[
+        ("replyOnly", &["member", "guest"]),
+        ("replyOnlyTo", &["memo"]),
+    ]);
+    let to = ReplyRule::RepliesOnly {
+        to: Some(vec!["memo".to_owned()]),
+    };
+    assert_eq!(reply_rule(&member("member"), &g, &c), to);
+    assert_eq!(reply_rule(&member("guest"), &g, &c), to);
+    assert_eq!(reply_rule(&member("admin"), &g, &c), ReplyRule::Free);
+    assert_eq!(reply_rule(&Standing::Owner, &g, &c), ReplyRule::Free);
+    assert_eq!(reply_rule(&Standing::Outsider, &g, &c), ReplyRule::Free);
+    let bare = perms(&[("replyOnly", &["member"])]);
+    assert_eq!(
+        reply_rule(&member("member"), &g, &bare),
+        ReplyRule::RepliesOnly { to: None }
+    );
+    assert_eq!(
+        reply_rule(&member("member"), &g, &channel(Tier::Public, None)),
+        ReplyRule::Free
+    );
+}
