@@ -14,9 +14,9 @@ pub fn spec_dir() -> PathBuf {
     )
 }
 
-/// The `$id` prefix of the spec's schemas. A schema written in a test takes
-/// an `$id` under it, so its relative `$ref`s reach the spec's files.
-pub const SCHEMA_ID_BASE: &str = "https://example.invalid/ofscp/schemas/v0.1/";
+/// The `$id` prefix of the spec's schemas, which their relative `$ref`s
+/// resolve against.
+const SCHEMA_ID_BASE: &str = "https://example.invalid/ofscp/schemas/v0.1/";
 
 /// Resolves the schemas' relative `$ref`s to files in the spec checkout.
 struct SpecRetriever;
