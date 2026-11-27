@@ -56,7 +56,10 @@ async fn next_of(c: &mut Client, kind: &str) -> Value {
 }
 
 /// Expect `channel`'s subscription ended for lost access, and nothing
-/// published to it afterwards to arrive.
+/// published to it afterwards to arrive. The member's own connections are
+/// also told of the change to their groups (§5.7 `groups.updated`), in no
+/// set order relative to `unsubscribed`, so that may still arrive; nothing
+/// else may.
 async fn revoked(env: &Env, c: &mut Client, channel: &str) {
     let e = next_of(c, "unsubscribed").await;
     assert_eq!(
@@ -66,7 +69,9 @@ async fn revoked(env: &Env, c: &mut Client, channel: &str) {
     env.state
         .ws
         .publish(channel, "message.created", json!({"n": 1}));
-    assert!(c.silent_for(QUIET).await);
+    for e in c.events_for(QUIET).await {
+        assert_eq!(e["type"], "groups.updated", "{e}");
+    }
 }
 
 /// An open group-tier group owned by `owner`, with one channel visible to

@@ -183,6 +183,15 @@ impl Client {
         tokio::time::timeout(wait, self.ws.next()).await.is_err()
     }
 
+    /// Every event that arrives until none has for `wait`.
+    pub async fn events_for(&mut self, wait: Duration) -> Vec<Value> {
+        let mut got = Vec::new();
+        while let Ok(e) = tokio::time::timeout(wait, self.event()).await {
+            got.push(e);
+        }
+        got
+    }
+
     /// A fresh command id.
     pub fn fresh_id(&mut self) -> String {
         self.next_id += 1;
