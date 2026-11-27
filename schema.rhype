@@ -518,3 +518,27 @@ type GroupPointer {
     role: String
     updated_at: DateTime
 }
+
+// A follow (§7.6, docs/decisions/0021): a channel one of the owner's
+// clients asked to see in their feed. `key` is "{owner} {channel}";
+// `channel` is a local channel's id, or a remote channel's canonical object
+// URI, so each channel is followed at most once.
+type Follow {
+    key: String @unique
+    owner: String @indexed
+    channel: String
+    created_at: DateTime
+}
+
+// A read marker (§7.7, docs/decisions/0021): the newest message the owner
+// has read in a scope (a local channel's id). `key` is "{owner} {scope}";
+// `seq` is that message's creation position, so a marker only moves
+// forward. Purged with the channel's messages when it is deleted.
+type ReadMarker {
+    key: String @unique
+    owner: String @indexed
+    scope_id: String @indexed
+    message_id: String
+    seq: i64
+    updated_at: DateTime
+}

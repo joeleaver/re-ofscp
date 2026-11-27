@@ -252,6 +252,24 @@ impl MessageStore {
             .collect()
     }
 
+    /// The creation position and author of each message created at
+    /// `positions` of `channel_id`'s timeline, without decoding bodies
+    /// (unread counts, §7.7). Positions holding no message are left out.
+    pub async fn authors_at(
+        &self,
+        channel_id: &str,
+        positions: &[i64],
+    ) -> Result<Vec<(i64, String)>, DbError> {
+        #[derive(Deserialize)]
+        struct AuthorRow {
+            seq: i64,
+            author: String,
+        }
+        let keys: Vec<String> = positions.iter().map(|p| position(channel_id, *p)).collect();
+        let rows: Vec<AuthorRow> = lookup(&self.db, "Message.filter(", ".pos == ", &keys).await?;
+        Ok(rows.into_iter().map(|r| (r.seq, r.author)).collect())
+    }
+
     /// The replies at positions `ns` under `parent`.
     pub async fn replies_at(
         &self,

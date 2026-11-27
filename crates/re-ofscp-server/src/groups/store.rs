@@ -18,6 +18,7 @@ use serde::Deserialize;
 
 use super::model::{ChannelFields, GroupFields, PendingTransfer, StoredChannel, StoredGroup};
 use crate::db::doc::{json, new_id};
+use crate::db::lookup::lookup;
 use crate::db::{Db, DbError, Ql};
 
 /// `status` values (`Group`, `Channel`, `Membership`).
@@ -99,6 +100,14 @@ struct ChannelRow {
     doc: String,
     created_at: String,
     updated_at: String,
+}
+
+/// A channel row with its status, for lookups that cannot filter on it.
+#[derive(Deserialize)]
+struct StatusChannelRow {
+    #[serde(flatten)]
+    row: ChannelRow,
+    status: String,
 }
 
 impl ChannelRow {
@@ -569,6 +578,16 @@ impl GroupStore {
             .into_iter()
             .map(|r| r.data.channel_id)
             .collect())
+    }
+
+    /// Those of `ids` that are active channels, in no particular order.
+    pub async fn active_channels(&self, ids: &[String]) -> Result<Vec<StoredChannel>, DbError> {
+        let rows: Vec<StatusChannelRow> =
+            lookup(&self.db, "Channel.filter(", ".channel_id == ", ids).await?;
+        rows.into_iter()
+            .filter(|r| r.status == status::ACTIVE)
+            .map(|r| r.row.decode())
+            .collect()
     }
 
     /// The group of active channel `channel_id`, if there is one. Channel

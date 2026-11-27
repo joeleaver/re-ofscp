@@ -119,7 +119,7 @@ impl Messages {
     }
 
     /// One sweeper pass at `now` (unix seconds): purge the rows of deleted
-    /// channels (their logs closed), and a [`PURGE_GRACE`] later purge them
+    /// channels (their logs closed), readers' markers included, and a [`PURGE_GRACE`] later purge them
     /// again and drop the log. Returns how many logs it handled.
     pub async fn sweep(&self, now: i64) -> Result<usize, DbError> {
         let db = self.store.db();
@@ -130,6 +130,10 @@ impl Messages {
             let full = batch.len() == SWEEP_BATCH;
             for closed in batch {
                 self.store.purge_channel(&closed.channel_id).await?;
+                // Readers' markers there go too (decision 0021); a marker
+                // write racing the first purge is caught by the second.
+                crate::read_markers::store::MarkerStore::purge_scope(db, &closed.channel_id)
+                    .await?;
                 match closed.purged_at {
                     None => log::mark_purged(db, &closed.channel_id, now).await?,
                     Some(_) => log::delete_closed(db, &closed.channel_id).await?,

@@ -11,6 +11,7 @@
 
 use serde::Deserialize;
 
+use crate::db::lookup::lookup;
 use crate::db::{Db, DbError, Ql};
 
 /// `ChannelLog.state` values.
@@ -72,6 +73,22 @@ pub async fn read(db: &Db, channel_id: &str) -> Result<LogState, DbError> {
         },
         Some(_) => LogState::Closed,
     })
+}
+
+/// The last position handed out in each of `channel_ids`' open logs, by
+/// channel id. A channel with no log, or a closed one, is left out: it
+/// has nothing to read (as [`LogState::last`] is `0` for those).
+pub async fn last_positions(
+    db: &Db,
+    channel_ids: &[String],
+) -> Result<std::collections::BTreeMap<String, i64>, DbError> {
+    let rows: Vec<LogRow> =
+        lookup(db, "ChannelLog.filter(", ".channel_id == ", channel_ids).await?;
+    Ok(rows
+        .into_iter()
+        .filter(|r| r.state == state::OPEN)
+        .map(|r| (r.channel_id, r.last_seq))
+        .collect())
 }
 
 /// Create the open log of `channel_id` if it has none. Returns the log as

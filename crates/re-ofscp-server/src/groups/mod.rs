@@ -40,6 +40,7 @@ pub mod model;
 pub mod ops;
 mod owner_store;
 pub mod paging;
+mod readable;
 mod relations;
 mod removal;
 pub mod requests;
