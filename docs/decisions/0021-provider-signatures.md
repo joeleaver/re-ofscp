@@ -91,6 +91,14 @@ before any socket is opened; an actor-signed one must verify like any
 signed `GET` (a successful verification records its nonce and the socket
 then runs the ordinary `authenticate` handshake).
 
+Because an actor-signed upgrade would be verified, it meets the replay
+store's restart warm-up like any other verified request: during the
+warm-up it gets `503` with `Retry-After` instead of a socket (§4.5
+*Restarts*). An unsigned upgrade is not affected (it carries nothing to
+verify), and neither is the in-band `authenticate` handshake, which §4.5
+*Restarts* exempts from the warm-up; so a client refused this way can still
+connect unsigned and authenticate inside the socket.
+
 A provider signature is never an anonymous viewer: a public read that
 would serve an unsigned request still gets `401` when provider-signed
 (§4.5 *Anonymous viewers*, §5.5).

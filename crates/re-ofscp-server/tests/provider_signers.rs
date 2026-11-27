@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::http::StatusCode;
-use common::harness::{SIGNED_AT, SettableClock, new_key, send, signed_as};
+use common::harness::{SIGNED_AT, SettableClock, alice_keys, key, new_key, send, signed_as};
 use common::remote_peer::{DISCOVERY_PATH, RemotePeer, Reply, discovery_doc};
 use ed25519_dalek::SigningKey;
 use re_ofscp_server::federation::{FederationPolicy, Rule, Snapshot};
@@ -27,6 +27,8 @@ use re_ofscp_server::{AppState, Config, router};
 use re_ofscp_types::federation::{FederationMode, RuleList, RuleScope};
 
 const TIMESTAMP: &str = "2026-01-01T12:00:00Z";
+const ALICE: &str = "alice@providera.com";
+const ALICE_KEY_ID: &str = "dk_abc123xyz";
 
 #[tokio::test]
 async fn during_the_warm_up_a_denied_actor_still_gets_403() {
@@ -91,6 +93,60 @@ async fn a_provider_signed_websocket_upgrade_is_refused_before_upgrading() {
         assert!(state.verifier.replay_store().is_empty(now), "no nonce");
     }
     assert_eq!(peer.total_hits(), 0, "no discovery or key fetch");
+}
+
+#[tokio::test]
+async fn an_actor_signed_websocket_upgrade_verifies_then_authenticates_in_band() {
+    // An upgrade signed by a local user's device key is verified like any
+    // signed `GET` (its nonce recorded), the socket opens, and the ordinary
+    // `authenticate` handshake then runs inside it (§4.5, §7.1;
+    // docs/decisions/0021).
+    let provider = common::ws::Provider::with_alice(
+        common::ws::fast_config(),
+        re_ofscp_server::ws::Seams::default(),
+    )
+    .await;
+    let signed = signed_as(
+        &key(),
+        ("x-ofscp-actor", ALICE),
+        ALICE_KEY_ID,
+        "GET",
+        "/api/ws",
+        "",
+        TIMESTAMP,
+    );
+    let mut headers = signed.headers().clone();
+    headers.insert("x-test-ip", "198.51.100.7".parse().unwrap());
+    let client = common::ws::Client::try_connect_with(provider.addr, &headers).await;
+    let mut client = client.unwrap_or_else(|status| panic!("upgrade refused: {status}"));
+    let now = SIGNED_AT.unix_timestamp();
+    assert!(
+        !provider.state.verifier.replay_store().is_empty(now),
+        "the verified upgrade's nonce is recorded"
+    );
+    client
+        .authenticate(ALICE, ALICE_KEY_ID, &key(), provider.now())
+        .await;
+
+    // During the replay store's restart warm-up the same upgrade would be
+    // verified, so it gets `503` (§4.5 *Restarts*); an unsigned upgrade
+    // still opens and authenticates in band.
+    let warming = common::ws::Provider::started_ago(0, None, common::ws::fast_config(), |b| {
+        b.keys(Arc::new(alice_keys()))
+    })
+    .await;
+    let signed = signed_as(
+        &key(),
+        ("x-ofscp-actor", ALICE),
+        ALICE_KEY_ID,
+        "GET",
+        "/api/ws",
+        "",
+        TIMESTAMP,
+    );
+    let refused = common::ws::Client::try_connect_with(warming.addr, signed.headers()).await;
+    assert_eq!(refused.err(), Some(503));
+    warming.alice("198.51.100.8").await;
 }
 
 /// One route of each kind: (method, path, body). A signed-only route, an
